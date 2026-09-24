@@ -273,7 +273,12 @@ mod tests {
     #[test]
     fn proc_option_takes_dest() {
         let cli = parse(&["--proc", "/proc", "--bind", "/usr", "/usr", "sh"]);
-        assert_eq!(cli.ops[0], Op::Proc { dest: PathBuf::from("/proc") });
+        assert_eq!(
+            cli.ops[0],
+            Op::Proc {
+                dest: PathBuf::from("/proc")
+            }
+        );
         assert_eq!(cli.command, ["sh"]);
     }
 
@@ -284,7 +289,9 @@ mod tests {
         let cli = parse(&["--bind", "/usr", "/usr", "sh"]);
         assert_eq!(
             cli.filesystem_ops()[0],
-            Op::Proc { dest: PathBuf::from("/proc") }
+            Op::Proc {
+                dest: PathBuf::from("/proc")
+            }
         );
         assert_eq!(cli.filesystem_ops().len(), 2);
 
@@ -292,7 +299,9 @@ mod tests {
         let cli = parse(&["--proc", "/sys/proc", "--", "sh"]);
         assert_eq!(
             cli.filesystem_ops(),
-            vec![Op::Proc { dest: PathBuf::from("/sys/proc") }]
+            vec![Op::Proc {
+                dest: PathBuf::from("/sys/proc")
+            }]
         );
     }
 }

@@ -133,9 +133,15 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
         // The real uid/gid is mapped onto SANDBOX_ID instead of 0: there is no
         // root (0) in this user namespace at all, and the command's uid/gid
         // (SANDBOX_ID) does not correspond to any host account.
-        write_id_map("/proc/self/uid_map", &format!("{SANDBOX_ID} {real_uid} 1\n"));
+        write_id_map(
+            "/proc/self/uid_map",
+            &format!("{SANDBOX_ID} {real_uid} 1\n"),
+        );
         write_id_map("/proc/self/setgroups", "deny\n");
-        write_id_map("/proc/self/gid_map", &format!("{SANDBOX_ID} {real_gid} 1\n"));
+        write_id_map(
+            "/proc/self/gid_map",
+            &format!("{SANDBOX_ID} {real_gid} 1\n"),
+        );
 
         // The command must also run in its own PID namespace (and get a
         // fresh /proc), like bwrap's --unshare-pid + --proc.
@@ -305,6 +311,26 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
         }
         // Root of the sandbox should be traversable by everyone.
         let _ = fs::set_permissions(&newroot, fs::Permissions::from_mode(0o755));
+
+        // Bind the host FUSE filesystem into the sandbox at /host. This must
+        // happen before chroot, while the host mountpoint path is still
+        // resolvable. (The FUSE server keeps running in the host process.)
+        if let Some(host_mount) = crate::hostfs::host_mount_point() {
+            mkdir_p(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
+            let dest_abs = sandbox_path(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
+            let src_c = CString::new(host_mount.as_os_str().as_bytes()).unwrap();
+            let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
+            if libc::mount(
+                src_c.as_ptr(),
+                dest_c.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            ) != 0
+            {
+                die_with_error("Can't bind mount host filesystem to /host");
+            }
+        }
 
         // Apply the setup operations in order.
         for op in ops {

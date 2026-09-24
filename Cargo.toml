@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
+fuse3 = { version = "0.9.0", features = ["tokio-runtime", "unprivileged"] }
+futures-util = "0.3.34"
 libc = "0.2.189"
-tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time"] }
