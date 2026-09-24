@@ -26,13 +26,17 @@ Like bwrap, the tool:
 1. Sets `PR_SET_NO_NEW_PRIVS`.
 2. Unshares a **user namespace** and a **mount namespace**
    (this is what makes the sandbox work *without* root).
-3. Maps the real uid/gid to 0 inside the new user namespace.
+3. Maps the real uid/gid to an unprivileged id (`65535`) inside the new
+   user namespace — the command therefore runs as a uid/gid that does not
+   exist on the host, never as (namespace) root.
 4. Marks the mount tree as a **slave**, so nothing mounted inside
    propagates back to the host.
 5. Creates a fresh **tmpfs** as the sandbox root.
 6. Applies `--bind` and `--symlink` operations **in the order they were
    given** (order matters, exactly like bwrap).
-7. `chroot`s into the sandbox root and `execvp`s the command.
+7. Drops **all capabilities** (permitted, effective, inheritable, ambient
+   and the bounding set — like `bwrap --cap-drop ALL`) and `chroot`s into
+   the sandbox root, then `execvp`s the command.
 
 The sandbox root starts empty: only what you bind in exists. The standard
 bubblewrap example works the same way here:
@@ -138,9 +142,12 @@ Exit status: the connector forwards the sandbox's status; a killed
 command yields `128+signal`.
 
 Note on trust: the proxy (`P`) and the command share one user namespace,
-so a hostile command runs as uid 0 there and could, in principle, kill
-`P` (cutting its own network access — it gains nothing else). Fully
-separating them would require an additional namespace split.
+so `P`'s files are visible to the command's (non-root) uid — but the
+command runs with **no capabilities at all**, so it cannot exercise the
+namespace privileges that `P` keeps (loopback setup, ...). In the worst
+case a hostile command could kill `P` (cutting its own network access —
+it gains nothing else). Fully separating them would require an additional
+namespace split.
 
 ## Requirements
 

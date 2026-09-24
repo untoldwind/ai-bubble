@@ -90,6 +90,18 @@ pub(crate) fn check_new_userns(old_userns: Option<(u64, u64)>) {
     }
 }
 
+/// The uid/gid the sandboxed command runs as inside the user namespace.
+/// This id is deliberately *not* mapped from any host account: only the
+/// caller's own real uid/gid is mapped, and it is mapped onto this id, so
+/// the command never runs as root — not even as the (namespace-local)
+/// root 0.
+pub(crate) const SANDBOX_ID: libc::c_uint = 65535;
+
+/// Highest capability number on the Linux versions this supports; passing
+/// unknown values to PR_CAPBSET_DROP only yields a harmless EINVAL, which
+/// is tolerated, so a slightly stale constant is safe.
+const CAP_LAST: libc::c_ulong = 40; // CAP_CHECKPOINT_RESTORE
+
 /// Non-isolated entry point: new user + mount namespaces with fresh id
 /// mappings, then the sandbox filesystem and exec.
 pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
@@ -117,11 +129,83 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
         // Set up the id mappings in the same order as bwrap: uid_map, then
         // setgroups deny, then gid_map. The setgroups deny is required before
         // gid_map unless the writer has CAP_SETGID in the parent namespace.
-        write_id_map("/proc/self/uid_map", &format!("0 {real_uid} 1\n"));
+        //
+        // The real uid/gid is mapped onto SANDBOX_ID instead of 0: there is no
+        // root (0) in this user namespace at all, and the command's uid/gid
+        // (SANDBOX_ID) does not correspond to any host account.
+        write_id_map("/proc/self/uid_map", &format!("{SANDBOX_ID} {real_uid} 1\n"));
         write_id_map("/proc/self/setgroups", "deny\n");
-        write_id_map("/proc/self/gid_map", &format!("0 {real_gid} 1\n"));
+        write_id_map("/proc/self/gid_map", &format!("{SANDBOX_ID} {real_gid} 1\n"));
 
         mount_and_exec(ops, command);
+    }
+}
+
+/// Drop every capability, from every set and the bounding set — the
+/// equivalent of bubblewrap's `--cap-drop ALL`.
+///
+/// Must run while the process still holds CAP_SETPCAP (i.e. before the
+/// exec'd command loses its capabilities). Because the command then execs
+/// as a non-root uid (SANDBOX_ID), execve would clear the permitted and
+/// effective sets anyway; dropping the bounding set additionally makes it
+/// impossible to regain any capability, even via file capabilities.
+pub(crate) unsafe fn drop_all_capabilities() {
+    unsafe {
+        // Remove every capability from the bounding set so it can never be
+        // regained. EINVAL for caps the kernel doesn't know is tolerable.
+        for cap in 0..=CAP_LAST {
+            if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0
+                && io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
+            {
+                die_with_error("Can't drop capability from bounding set");
+            }
+        }
+
+        // Clear ambient capabilities (they would otherwise survive exec).
+        if libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        ) != 0
+        {
+            let err = io::Error::last_os_error().raw_os_error();
+            if err != Some(libc::EINVAL) && err != Some(libc::ENOTSUP) {
+                die_with_error("Can't clear ambient capabilities");
+            }
+        }
+
+        // Explicitly empty permitted/effective/inheritable (caps v1: one
+        // 32-bit set each), so nothing is left even before execve.
+        #[repr(C)]
+        struct CapHeader {
+            version: libc::c_int,
+            pid: libc::c_int,
+        }
+        #[repr(C)]
+        struct CapData {
+            effective: libc::c_uint,
+            permitted: libc::c_uint,
+            inheritable: libc::c_uint,
+        }
+        let hdr = CapHeader {
+            version: 0x19980330, // _LINUX_CAPABILITY_VERSION_1
+            pid: 0,
+        };
+        let data = CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        };
+        if libc::syscall(
+            libc::SYS_capset,
+            &hdr as *const CapHeader,
+            &data as *const CapData,
+        ) != 0
+        {
+            die_with_error("Can't clear capability sets");
+        }
     }
 }
 
@@ -261,6 +345,11 @@ pub unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
         if libc::chdir(CString::new("/").unwrap().as_ptr()) != 0 {
             die_with_error("Can't chdir to / in sandbox");
         }
+
+        // All privileged work is done; run the command with as little
+        // authority as possible: no capabilities at all, and as a uid/gid
+        // that does not exist on the host.
+        drop_all_capabilities();
 
         let argv: Vec<CString> = command
             .iter()

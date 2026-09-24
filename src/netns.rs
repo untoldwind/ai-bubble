@@ -94,15 +94,22 @@ unsafe fn isolated_parent(netdir: &Path, net: &NetConfig, ops: &[Op], command: &
 
         // P and C share this user namespace, so the maps must be set up exactly
         // once, here. C unshares only the mount namespace and inherits the
-        // already-mapped ids.
+        // already-mapped ids. As in sandbox::setup_and_exec, the real uid/gid
+        // is mapped onto SANDBOX_ID (not 0), so the command never runs as root.
         let old_userns = userns_id();
         if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWUTS) != 0 {
             die_with_error("Can't unshare user/network namespaces");
         }
         crate::sandbox::check_new_userns(old_userns);
-        write_id_map("/proc/self/uid_map", &format!("0 {real_uid} 1\n"));
+        write_id_map(
+            "/proc/self/uid_map",
+            &format!("{} {real_uid} 1\n", crate::sandbox::SANDBOX_ID),
+        );
         write_id_map("/proc/self/setgroups", "deny\n");
-        write_id_map("/proc/self/gid_map", &format!("0 {real_gid} 1\n"));
+        write_id_map(
+            "/proc/self/gid_map",
+            &format!("{} {real_gid} 1\n", crate::sandbox::SANDBOX_ID),
+        );
 
         // The loopback interface starts DOWN; bring it up so the proxy at
         // 127.0.0.2 (and any local servers) are reachable.
