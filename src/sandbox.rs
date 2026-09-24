@@ -137,7 +137,50 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
         write_id_map("/proc/self/setgroups", "deny\n");
         write_id_map("/proc/self/gid_map", &format!("{SANDBOX_ID} {real_gid} 1\n"));
 
-        mount_and_exec(ops, command);
+        // The command must also run in its own PID namespace (and get a
+        // fresh /proc), like bwrap's --unshare-pid + --proc.
+        pidns_and_exec(ops, command);
+    }
+}
+
+/// Unshare a fresh PID namespace and run the sandbox setup + exec there.
+///
+/// `unshare(CLONE_NEWPID)` only takes effect for *later* forks: the calling
+/// process stays in the old PID namespace. Like bwrap (which passes
+/// CLONE_NEWPID in the clone() flags, making the setup process the first
+/// process of the new namespace), we therefore fork here: the child is the
+/// first process (PID 1) of the new PID namespace and does the entire
+/// sandbox setup and exec inside it. Only then can a fresh procfs instance
+/// be mounted that shows just the sandbox's processes.
+///
+/// A PID namespace always needs a PID 1; making the command itself PID 1
+/// corresponds to bwrap's `--as-pid-1` mode.
+///
+/// The parent keeps waiting for the child and forwards its exit status.
+pub(crate) unsafe fn pidns_and_exec(ops: &[Op], command: &[String]) -> ! {
+    unsafe {
+        if libc::unshare(libc::CLONE_NEWPID) != 0 {
+            die_with_error("Can't unshare PID namespace");
+        }
+        let pid = libc::fork();
+        if pid < 0 {
+            die_with_error("Can't fork sandboxed command");
+        }
+        if pid == 0 {
+            mount_and_exec(ops, command);
+        }
+
+        // Parent: supervise the PID-1 child and forward its exit status.
+        let mut status: libc::c_int = 0;
+        loop {
+            let r = libc::waitpid(pid, &mut status, 0);
+            if r == pid {
+                exit_with_status(status);
+            }
+            if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                die_with_error("Can't wait for sandboxed command");
+            }
+        }
     }
 }
 
@@ -211,12 +254,15 @@ pub(crate) unsafe fn drop_all_capabilities() {
 
 /// Build the tmpfs sandbox filesystem and exec COMMAND.
 ///
+/// Must run as PID 1 of a fresh PID namespace (see pidns_and_exec) so that
+/// a fresh procfs instance (`Op::Proc`) is bound to it.
+///
 /// Unshares the mount namespace. This requires CAP_SYS_ADMIN over the user
 /// namespace owning the *current* mount namespace, so the isolated path
 /// must reach this in the child that inherited the fresh user namespace
 /// created by `netns::isolated_parent` (the new mount namespace is then
 /// owned by that same user namespace).
-pub unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
+pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
     unsafe {
         if libc::unshare(libc::CLONE_NEWNS) != 0 {
             die_with_error("Can't unshare mount namespace");
@@ -289,6 +335,32 @@ pub unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     ) != 0
                     {
                         die_with_error(&format!("Can't bind mount {src} -> {}", dest.display()));
+                    }
+                }
+                Op::Proc { dest } => {
+                    if dest
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        die(&format!("Invalid proc mount point {}", dest.display()));
+                    }
+                    mkdir_p(&newroot, dest);
+                    let dest_abs = sandbox_path(&newroot, dest);
+                    let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
+                    // Mount a *fresh* procfs, like bwrap's --proc does when a
+                    // new PID namespace exists: this instance shows only the
+                    // sandbox's processes. (We are inside the new PID
+                    // namespace here — pidns_and_exec forked before the setup
+                    // — which is what binds the instance to it.)
+                    if libc::mount(
+                        CString::new("proc").unwrap().as_ptr(),
+                        dest_c.as_ptr(),
+                        CString::new("proc").unwrap().as_ptr(),
+                        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
+                        std::ptr::null(),
+                    ) != 0
+                    {
+                        die_with_error(&format!("Can't mount proc on {}", dest.display()));
                     }
                 }
                 Op::Symlink { src, dest } => {

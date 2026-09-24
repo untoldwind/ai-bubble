@@ -10,7 +10,8 @@
 //!            listens on 127.0.0.2:3128 (HTTP CONNECT) and forwards the
 //!            child's exit status.
 //!         └─ C — unshares the mount namespace, builds the tmpfs sandbox
-//!                and execs COMMAND.
+//!                and execs COMMAND in its own PID namespace (see
+//!                sandbox::pidns_and_exec).
 //!
 //! The network namespace is shared by P and C, so COMMAND can reach the
 //! proxy transparently at 127.0.0.2, while it stays fully isolated from
@@ -32,7 +33,7 @@ use std::path::{Path, PathBuf};
 use crate::cli::{NetConfig, Op};
 use crate::proxy::{PROXY_ADDR, PROXY_URL};
 use crate::sandbox::{
-    die, die_with_error, exit_with_status, mount_and_exec, userns_id, write_id_map,
+    die, die_with_error, exit_with_status, pidns_and_exec, userns_id, write_id_map,
 };
 
 /// Temporary host directory holding the proxy socket. It is bind-mounted
@@ -146,7 +147,8 @@ unsafe fn isolated_parent(netdir: &Path, net: &NetConfig, ops: &[Op], command: &
             die_with_error("Can't fork sandboxed command");
         }
         if child_pid == 0 {
-            mount_and_exec(&child_ops, command);
+            // PID 1 of its own PID namespace (see pidns_and_exec).
+            pidns_and_exec(&child_ops, command);
         }
 
         // Serve CONNECT requests while the command runs.

@@ -10,6 +10,9 @@ Currently supported options:
   (read-write, non-recursive; use `--rbind`-style recursion is not yet supported)
 - `--symlink SRC DEST` — create a symlink at `DEST` pointing to `SRC`
   (mirrors bwrap: fails if `DEST` exists and is not the identical symlink)
+- `--proc DEST` — mount a **fresh procfs instance** at `DEST`
+  (like bwrap: `MS_NOSUID|MS_NOEXEC|MS_NODEV`). If no `--proc` is given,
+  a fresh procfs is mounted at `/proc` automatically
 - `--isolated-net` — run the command in a fresh **network namespace**
   (no interfaces besides loopback, which rs-bubble brings up) while the
   rs-bubble process stays on the host and acts as a **TCP proxy**
@@ -29,12 +32,19 @@ Like bwrap, the tool:
 3. Maps the real uid/gid to an unprivileged id (`65535`) inside the new
    user namespace — the command therefore runs as a uid/gid that does not
    exist on the host, never as (namespace) root.
-4. Marks the mount tree as a **slave**, so nothing mounted inside
+4. Unshares a fresh **PID namespace** and forks: the command becomes
+   **PID 1** of the new namespace (like bwrap's `--unshare-pid` +
+   `--as-pid-1`), while the rs-bubble process supervises it and forwards
+   its exit status.
+5. Marks the mount tree as a **slave**, so nothing mounted inside
    propagates back to the host.
-5. Creates a fresh **tmpfs** as the sandbox root.
-6. Applies `--bind` and `--symlink` operations **in the order they were
-   given** (order matters, exactly like bwrap).
-7. Drops **all capabilities** (permitted, effective, inheritable, ambient
+6. Creates a fresh **tmpfs** as the sandbox root.
+7. Applies the filesystem ops (`--proc`, `--bind`, `--symlink`) **in the
+   order they were given** (order matters, exactly like bwrap). Because
+   the PID namespace is created before the mounts (the mounting process
+   is PID 1 of it), a fresh procfs instance only ever shows the
+   sandbox's own processes — never host processes.
+8. Drops **all capabilities** (permitted, effective, inheritable, ambient
    and the bounding set — like `bwrap --cap-drop ALL`) and `chroot`s into
    the sandbox root, then `execvp`s the command.
 
@@ -65,6 +75,12 @@ Notes:
   destination lies inside an earlier bind mount, it must already exist there
   (creating it would touch the host filesystem, which is read-only inside
   the namespace).
+- The fresh procfs is mounted with `MS_NOSUID|MS_NOEXEC|MS_NODEV`. Unlike
+  bwrap, the `/proc/sys`, `/proc/sysrq-trigger`, `/proc/irq` and `/proc/bus`
+  "cover" mounts are not applied; the command runs with no capabilities at
+  all, which already keeps it from writing there.
+- The command is PID 1 of its PID namespace. Orphaned children are
+  re-parented to the command itself (as with bwrap's `--as-pid-1`).
 - The temporary host directory backing the tmpfs root is cleaned up when
   the process exits, but the empty staging directory may remain in `/tmp`.
 
@@ -158,6 +174,6 @@ namespace split.
 
 ## Status
 
-Starter project — only `--bind` and `--symlink` are implemented. Natural
-next steps would be `--ro-bind`, `--proc`, `--dev`, `--tmpfs`,
-`--die-with-parent`, and `--unshare-all`.
+Starter project — `--bind`, `--symlink`, `--proc`, `--isolated-net` and
+`--allow-net` are implemented. Natural next steps would be `--ro-bind`,
+`--dev`, `--tmpfs`, `--die-with-parent`, and `--unshare-all`.

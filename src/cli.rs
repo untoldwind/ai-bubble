@@ -28,6 +28,7 @@ pub struct NetConfig {
 pub enum Op {
     Bind { src: String, dest: PathBuf },
     Symlink { src: String, dest: PathBuf },
+    Proc { dest: PathBuf },
 }
 
 /// A minimal reimplementation of bubblewrap's basic functionality.
@@ -88,6 +89,27 @@ impl Cli {
             allow: self.allow_net.clone(),
         }
     }
+
+    /// The filesystem setup operations, with `/proc` ensured.
+    ///
+    /// The sandboxed command runs in its own PID namespace, so a *fresh*
+    /// procfs instance (which only shows the sandbox's processes, like bwrap
+    /// with `--unshare-pid --proc /proc`) is what the child needs. If the
+    /// user passed `--proc DEST` explicitly, that is used instead.
+    ///
+    /// The default is *prepended*, so explicit `--bind`s targeting paths
+    /// below `/proc` still layer on top of it.
+    pub fn filesystem_ops(&self) -> Vec<Op> {
+        if self.ops.iter().any(|op| matches!(op, Op::Proc { .. })) {
+            self.ops.clone()
+        } else {
+            std::iter::once(Op::Proc {
+                dest: PathBuf::from("/proc"),
+            })
+            .chain(self.ops.iter().cloned())
+            .collect()
+        }
+    }
 }
 
 /// Pull the `--bind`/`--symlink` operations (with their two values each)
@@ -123,6 +145,15 @@ fn extract_ops(argv: &[String]) -> (Vec<Op>, Vec<String>) {
                     }
                 });
                 i += 3;
+            }
+            "--proc" => {
+                let Some(dest) = argv.get(i + 1) else {
+                    crate::sandbox::die("--proc takes one argument");
+                };
+                ops.push(Op::Proc {
+                    dest: PathBuf::from(dest),
+                });
+                i += 2;
             }
             _ => {
                 if !a.starts_with('-') || a.len() == 1 {
@@ -237,5 +268,31 @@ mod tests {
         assert!(cli.isolated_net);
         assert_eq!(cli.ops.len(), 2);
         assert_eq!(cli.command, ["sh"]);
+    }
+
+    #[test]
+    fn proc_option_takes_dest() {
+        let cli = parse(&["--proc", "/proc", "--bind", "/usr", "/usr", "sh"]);
+        assert_eq!(cli.ops[0], Op::Proc { dest: PathBuf::from("/proc") });
+        assert_eq!(cli.command, ["sh"]);
+    }
+
+    #[test]
+    fn default_proc_is_prepended_once() {
+        // Without --proc: a fresh procfs at /proc is prepended, in front of
+        // the user's ops so they can layer on top of it.
+        let cli = parse(&["--bind", "/usr", "/usr", "sh"]);
+        assert_eq!(
+            cli.filesystem_ops()[0],
+            Op::Proc { dest: PathBuf::from("/proc") }
+        );
+        assert_eq!(cli.filesystem_ops().len(), 2);
+
+        // With an explicit --proc: used verbatim, no extra default.
+        let cli = parse(&["--proc", "/sys/proc", "--", "sh"]);
+        assert_eq!(
+            cli.filesystem_ops(),
+            vec![Op::Proc { dest: PathBuf::from("/sys/proc") }]
+        );
     }
 }

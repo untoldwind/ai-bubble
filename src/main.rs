@@ -4,7 +4,8 @@
 //!
 //! * `cli`     — argument parsing only (clap derive); no side effects.
 //! * `sandbox` — the privileged filesystem part: user/mount namespaces,
-//!   tmpfs root, bind mounts, symlinks, exec. Never touches the network.
+//!   tmpfs root, bind mounts, symlinks, proc, exec. Never touches the
+//!   network.
 //! * `netns`   — the `--isolated-net` process tree: forks, user/network
 //!   namespaces, id maps, loopback setup, waitpid lifecycle.
 //! * `proxy`   — pure async networking (tokio): the host-side connector on
@@ -25,7 +26,7 @@ fn main() {
     }
 
     let net = args.net();
-    let ops = args.ops.clone();
+    let ops = args.filesystem_ops();
 
     unsafe {
         if net.isolated {
