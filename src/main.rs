@@ -2,7 +2,8 @@ use clap::Parser;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -108,7 +109,7 @@ fn main() {
         if net.isolated {
             run_isolated(&ops, &command, &net);
         } else {
-            setup_and_exec(&ops, &command, false);
+            setup_and_exec(&ops, &command);
         }
     }
 }
@@ -189,12 +190,33 @@ fn parse_cli(argv: &[String]) -> (Vec<Op>, Vec<String>, NetConfig) {
 /// Fork: the child isolates its network namespace, mounts the proxy socket
 /// directory at /net and runs the command; the parent stays on the host,
 /// proxies TCP connections and forwards the child's exit status.
+/// Address of the in-sandbox HTTP CONNECT proxy and its URL form for
+/// the http_proxy family of environment variables.
+const PROXY_ADDR: &str = "127.0.0.2:3128";
+const PROXY_URL: &str = "http://127.0.0.2:3128";
+
+/// Process tree with --isolated-net:
+///
+///   original (host netns) — the "connector": answers proxy requests with
+///                           real TCP connections, waits for P, reports P's
+///                           exit status.
+///     └─ P — unshares user+network+UTS namespaces, brings up loopback,
+///            listens on 127.0.0.2:3128 (HTTP CONNECT) and forwards the
+///            child's exit status.
+///         └─ C — unshares the mount namespace, builds the tmpfs sandbox
+///                and execs COMMAND.
+///
+/// The network namespace is shared by P and C, so COMMAND can reach the
+/// proxy transparently at 127.0.0.2, while it stays fully isolated from
+/// the host network (the namespace has no interfaces besides loopback).
+/// P's outbound connections to real targets are made by the original
+/// process over Unix-domain sockets, which cross network namespaces via
+/// the filesystem (the socket directory is bind-mounted at /net).
 unsafe fn run_isolated(ops: &[Op], command: &[String], net: &NetConfig) -> ! {
     unsafe {
     // Temporary host directory holding the proxy socket. It is bind-mounted
-    // at /net inside the sandbox so that the (fully network-isolated) child
-    // can reach the proxy: AF_UNIX sockets work across network namespaces
-    // when their socket file is visible on the filesystem.
+    // at /net inside the sandbox so that the (network-isolated) child can
+    // reach the connector.
     let mut tmpl: Vec<u8> = b"/tmp/rs-bubble-net.XXXXXX".to_vec();
     tmpl.push(0);
     let tmpl_ptr = CString::from_vec_with_nul(tmpl).unwrap();
@@ -207,34 +229,159 @@ unsafe fn run_isolated(ops: &[Op], command: &[String], net: &NetConfig) -> ! {
         Ok(l) => l,
         Err(e) => die(&format!("Can't create proxy socket: {e}")),
     };
+    // The command must not inherit the listening socket.
+    let _ = libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
 
-    // Fork. This must happen before any proxy thread exists.
+    // Fork P. This must happen before any proxy thread exists.
     let pid = libc::fork();
     if pid < 0 {
         die_with_error("Can't fork");
     }
     if pid == 0 {
-        // Child: close the listener, mount the socket directory and exec.
         drop(listener);
+        isolated_parent(&netdir, net, ops, command);
+    }
+
+    // Connector loop: serve proxy connections and watch for P's exit.
+    let allow = net.allow.clone();
+    let mut pollfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut status: libc::c_int = 0;
+    let mut reaped = false;
+    loop {
+        let r = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        if r == pid {
+            reaped = true;
+            break;
+        }
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                die_with_error("Can't wait for sandboxed command");
+            }
+        }
+        let ready = libc::poll(&mut pollfd, 1, 200);
+        if ready < 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            die_with_error("Can't poll proxy socket");
+        }
+        if ready > 0 && pollfd.revents & libc::POLLIN != 0 {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let allow = allow.clone();
+                    thread::spawn(move || handle_proxy_conn(stream, &allow));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    }
+    if !reaped {
+        // Final blocking wait in case we broke out of the loop early.
+        loop {
+            let r = libc::waitpid(pid, &mut status, 0);
+            if r == pid {
+                break;
+            }
+            if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                die_with_error("Can't wait for sandboxed command");
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&netdir);
+    exit_with_status(status);
+    }
+}
+
+/// P: owns the sandbox network namespace and runs the HTTP CONNECT proxy on
+/// 127.0.0.2. Forks C for the filesystem sandbox and exec, then reports C's
+/// exit status.
+unsafe fn isolated_parent(netdir: &Path, net: &NetConfig, ops: &[Op], command: &[String]) -> ! {
+    unsafe {
+    // Prevent gaining privileges via execve of setuid binaries. C inherits
+    // this, which is what matters (C is the process that execs).
+    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+        die_with_error("Can't set PR_SET_NO_NEW_PRIVS");
+    }
+
+    // Capture the real uid/gid BEFORE unsharing (see setup_and_exec).
+    let (real_uid, real_gid) = (libc::getuid(), libc::getgid());
+
+    // P and C share this user namespace, so the maps must be set up exactly
+    // once, here. C unshares only the mount namespace and inherits the
+    // already-mapped ids.
+    let old_userns = userns_id();
+    if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWUTS) != 0 {
+        die_with_error("Can't unshare user/network namespaces");
+    }
+    let new_userns = userns_id();
+    if new_userns.is_none() || new_userns == old_userns {
+        die(
+            "unshare() returned success, but the user namespace was not created.\n\
+             Your environment (seccomp filter, sandbox or LSM) may be blocking \
+             CLONE_NEWUSER.",
+        );
+    }
+    write_id_map("/proc/self/uid_map", &format!("0 {real_uid} 1\n"));
+    write_id_map("/proc/self/setgroups", "deny\n");
+    write_id_map("/proc/self/gid_map", &format!("0 {real_gid} 1\n"));
+
+    // The loopback interface starts DOWN; bring it up so the proxy at
+    // 127.0.0.2 (and any local servers) are reachable.
+    bring_up_loopback();
+
+    let proxy_listener = match TcpListener::bind(PROXY_ADDR) {
+        Ok(l) => l,
+        Err(e) => die(&format!("Can't bind proxy listener on {PROXY_ADDR}: {e}")),
+    };
+    let _ = libc::fcntl(
+        proxy_listener.as_raw_fd(),
+        libc::F_SETFD,
+        libc::FD_CLOEXEC,
+    );
+
+    // Make standard tools (curl, wget, git, ...) use the proxy.
+    for (key, val) in [
+        ("http_proxy", PROXY_URL),
+        ("HTTP_PROXY", PROXY_URL),
+        ("https_proxy", PROXY_URL),
+        ("HTTPS_PROXY", PROXY_URL),
+        ("all_proxy", PROXY_URL),
+        ("ALL_PROXY", PROXY_URL),
+        ("RS_BUBBLE_PROXY", "/net/sock"),
+    ] {
+        std::env::set_var(key, val);
+    }
+
+    let child_pid = libc::fork();
+    if child_pid < 0 {
+        die_with_error("Can't fork sandboxed command");
+    }
+    if child_pid == 0 {
         let mut child_ops: Vec<Op> = vec![Op::Bind {
             src: netdir.display().to_string(),
             dest: PathBuf::from("/net"),
         }];
         child_ops.extend(ops.iter().cloned());
-        // Convenience pointer for programs inside the sandbox. set_var is
-        // unsafe in edition 2024; we are in an unsafe fn.
-        std::env::set_var("RS_BUBBLE_PROXY", "/net/sock");
-        setup_and_exec(&child_ops, command, true);
+        sandbox_mount_and_exec(&child_ops, command);
     }
 
-    // Parent: serve proxy connections while the child runs.
+    // Serve CONNECT requests while the command runs.
     let allow = net.allow.clone();
+    let dir = netdir.to_path_buf();
     thread::spawn(move || {
-        for stream in listener.incoming() {
+        for stream in proxy_listener.incoming() {
             match stream {
                 Ok(stream) => {
                     let allow = allow.clone();
-                    thread::spawn(move || handle_proxy_conn(stream, &allow));
+                    let dir = dir.clone();
+                    thread::spawn(move || handle_connect_proxy(stream, &dir, &allow));
                 }
                 Err(_) => break,
             }
@@ -243,24 +390,25 @@ unsafe fn run_isolated(ops: &[Op], command: &[String], net: &NetConfig) -> ! {
 
     let mut status: libc::c_int = 0;
     loop {
-        let r = libc::waitpid(pid, &mut status, 0);
-        if r == pid {
+        let r = libc::waitpid(child_pid, &mut status, 0);
+        if r == child_pid {
             break;
         }
-        if r < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
+        if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            die_with_error("Can't wait for sandboxed command");
         }
-        die_with_error("Can't wait for sandboxed command");
     }
+    exit_with_status(status);
+    }
+}
 
-    let _ = fs::remove_dir_all(&netdir);
+fn exit_with_status(status: libc::c_int) -> ! {
     if libc::WIFEXITED(status) {
         exit(libc::WEXITSTATUS(status));
     } else if libc::WIFSIGNALED(status) {
         exit(128 + libc::WTERMSIG(status));
     }
     exit(1);
-    }
 }
 
 /// Bring up the loopback interface in the current network namespace.
@@ -290,27 +438,107 @@ fn bring_up_loopback() {
     }
 }
 
-/// One proxy connection: the sandboxed client sends `host:port\n`, then the
-/// connection becomes a raw bidirectional pipe to the real TCP target on the
-/// host side.
-fn handle_proxy_conn(stream: UnixStream, allow: &[String]) {
-    let mut stream = stream;
+/// One proxy connection from P's CONNECT proxy or a raw /net/sock client:
+/// the client sends `host:port\n`, the connector replies with a single
+/// status byte (`K` = connected, `E` = failed/denied) and then the
+/// connection becomes a raw bidirectional pipe to the real TCP target on
+/// the host side.
+fn handle_proxy_conn(mut stream: UnixStream, allow: &[String]) {
     let target = match read_proxy_target(&mut stream) {
         Some(t) => t,
         None => return,
     };
     if !target_allowed(&target, allow) {
         eprintln!("rs-bubble proxy: connection to {target} denied");
+        let _ = stream.write_all(b"E");
         return;
     }
     let tcp = match TcpStream::connect(&target) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("rs-bubble proxy: can't connect to {target}: {e}");
+            let _ = stream.write_all(b"E");
             return;
         }
     };
+    if stream.write_all(b"K").is_err() {
+        return;
+    }
     transfer(stream, tcp);
+}
+
+/// Handle one HTTP CONNECT request arriving on 127.0.0.2 inside the sandbox
+/// network namespace. The actual connection is made by the connector process
+/// (host network namespace) over the Unix socket.
+fn handle_connect_proxy(mut tcp: TcpStream, netdir: &Path, allow: &[String]) {
+    let target = match read_connect_target(&mut tcp) {
+        Some(t) => t,
+        None => {
+            let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            return;
+        }
+    };
+    if !target_allowed(&target, allow) {
+        eprintln!("rs-bubble proxy: CONNECT to {target} denied");
+        let _ = tcp.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        return;
+    }
+    let mut unix = match UnixStream::connect(netdir.join("sock")) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("rs-bubble proxy: can't reach connector: {e}");
+            let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            return;
+        }
+    };
+    let mut line = target.clone().into_bytes();
+    line.push(b'\n');
+    if unix.write_all(&line).is_err() {
+        let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        return;
+    }
+    // Wait for the connector's status byte before answering the client.
+    let mut status = [0u8; 1];
+    if unix.read_exact(&mut status).is_err() || status[0] != b'K' {
+        let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        return;
+    }
+    let _ = tcp.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+    transfer(unix, tcp);
+}
+
+/// Read one HTTP CONNECT request and return the `host:port` target.
+fn read_connect_target(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if buf.len() > 8192 {
+            return None;
+        }
+        match stream.read(&mut byte) {
+            Ok(0) => return None,
+            Ok(_) => {
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let first = text.lines().next()?;
+    let mut parts = first.split_whitespace();
+    let method = parts.next()?;
+    if !method.eq_ignore_ascii_case("CONNECT") {
+        return None;
+    }
+    let target = parts.next()?;
+    if target.is_empty() || target.contains('\0') {
+        return None;
+    }
+    Some(target.to_string())
 }
 
 /// Read one line (the proxy target) from the connection.
@@ -380,7 +608,9 @@ fn transfer(mut unix: UnixStream, mut tcp: TcpStream) {
     let _ = host_to_sandbox.join();
 }
 
-unsafe fn setup_and_exec(ops: &[Op], command: &[String], isolated_net: bool) -> ! {
+/// Non-isolated entry point: new user + mount namespaces with fresh id
+/// mappings, then the sandbox filesystem and exec.
+unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
     unsafe {
     // Prevent gaining privileges via execve of setuid binaries.
     if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -393,18 +623,12 @@ unsafe fn setup_and_exec(ops: &[Op], command: &[String], isolated_net: bool) -> 
     // real_uid/real_gid the same way).
     let (real_uid, real_gid) = (libc::getuid(), libc::getgid());
 
-    // Unshare the user and mount namespaces. After this we have
-    // CAP_SYS_ADMIN in the new user namespace and can mount freely.
-    // With isolated networking we also unshare the network namespace
-    // (giving CAP_NET_ADMIN over it, used to bring up loopback) and the
-    // UTS namespace so the sandbox has its own hostname.
+    // Unshare the user namespace. After this we have CAP_SYS_ADMIN in the
+    // new user namespace and can mount freely. (The mount namespace is
+    // unshared in sandbox_mount_and_exec, shared by both entry points.)
     let old_userns = userns_id();
-    let mut unshare_flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
-    if isolated_net {
-        unshare_flags |= libc::CLONE_NEWNET | libc::CLONE_NEWUTS;
-    }
-    if libc::unshare(unshare_flags) != 0 {
-        die_with_error("Can't unshare user/mount/network namespaces");
+    if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+        die_with_error("Can't unshare user namespace");
     }
     // Verify the user namespace was really created. Some sandboxes (seccomp
     // supervisors, gVisor, LSMs) silently strip CLONE_NEWUSER from the flags,
@@ -426,10 +650,21 @@ unsafe fn setup_and_exec(ops: &[Op], command: &[String], isolated_net: bool) -> 
     write_id_map("/proc/self/setgroups", "deny\n");
     write_id_map("/proc/self/gid_map", &format!("0 {real_gid} 1\n"));
 
-    // In an isolated network namespace the loopback interface starts DOWN;
-    // bring it up so local servers inside the sandbox work.
-    if isolated_net {
-        bring_up_loopback();
+    sandbox_mount_and_exec(ops, command);
+    }
+}
+
+/// Build the tmpfs sandbox filesystem and exec COMMAND.
+///
+/// Unshares the mount namespace. This requires CAP_SYS_ADMIN over the user
+/// namespace owning the *current* mount namespace, so the isolated path
+/// must reach this in the child that inherited the fresh user namespace
+/// created by isolated_parent (the new mount namespace is then owned by
+/// that same user namespace).
+unsafe fn sandbox_mount_and_exec(ops: &[Op], command: &[String]) -> ! {
+    unsafe {
+    if libc::unshare(libc::CLONE_NEWNS) != 0 {
+        die_with_error("Can't unshare mount namespace");
     }
 
     // Make our mount tree a slave of the parent, so nothing we mount
@@ -626,6 +861,33 @@ mod tests {
         assert!(target_allowed("localhost:1234", &allow));
         // Empty list allows everything.
         assert!(target_allowed("anything.example:9999", &[]));
+    }
+
+    #[test]
+    fn read_connect_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_connect_target(&mut s)
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .unwrap();
+        assert_eq!(t.join().unwrap().as_deref(), Some("example.com:443"));
+    }
+
+    #[test]
+    fn read_connect_rejects_get() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            read_connect_target(&mut s)
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        assert_eq!(t.join().unwrap(), None);
     }
 
     #[test]

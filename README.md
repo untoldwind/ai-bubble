@@ -66,48 +66,81 @@ Notes:
 
 ## Isolated networking
 
-With `--isolated-net` the sandboxed command gets a completely isolated
-network stack (only a freshly brought-up loopback; the sandbox also gets
-its own UTS namespace). Since `execve` replaces the process, rs-bubble
-forks first: the **child** does the isolation and runs the command, the
-**parent** stays on the host, runs the TCP proxy, and forwards the
-child's exit status (a killed child results in exit status `128+signal`).
+With `--isolated-net` the sandboxed command gets a network namespace that
+is completely isolated from the host (only a freshly brought-up loopback
+interface; the sandbox also gets its own UTS namespace) — while the
+rs-bubble process tree provides a proxy **inside** that namespace, so the
+command can reach the outside world transparently.
 
-The child reaches the proxy through a Unix socket: rs-bubble creates a
-temporary host directory containing the socket and bind-mounts it at
-`/net` inside the sandbox. Filesystem Unix-domain sockets work across
-network namespaces, so this is the single controlled channel out of the
-isolated network namespace — no root, no host `CAP_NET_ADMIN`, no veth
-pairs needed. The socket path is also exported as `$RS_BUBBLE_PROXY`
-(`/net/sock`).
+### Architecture
 
-The proxy protocol is deliberately simple: connect to the socket, send
-the target as one line `host:port\n`, and the connection becomes a raw
-bidirectional pipe to that TCP target (name resolution and the actual
-connection happen on the host side, so DNS also stays outside).
+Since `execve` replaces the process, rs-bubble forks into three roles:
+
+- **connector** (stays in the host network namespace): answers proxy
+  requests with real TCP connections (name resolution included, so DNS
+  also stays outside), and forwards the final exit status.
+- **proxy** (`P`): unshares user + network + UTS namespaces, brings up
+  loopback, and listens on **`127.0.0.2:3128`** as an **HTTP CONNECT
+  proxy**. It forks the actual sandboxed command.
+- **sandbox** (`C`): unshares the mount namespace, builds the tmpfs
+  root and execs COMMAND.
+
+The proxy and the command share the network namespace, which means any
+TCP connection to `127.0.0.2` inside the sandbox lands on the proxy —
+no veth pairs, no root, no host `CAP_NET_ADMIN` needed. The connector
+dials real targets from the host side over Unix-domain sockets (which
+cross network namespaces via the filesystem); the socket directory is
+bind-mounted at `/net` inside the sandbox.
+
+The sandbox is still network-isolated: the namespace has no interfaces
+besides loopback and no routes to the host, so direct connections
+(anything that ignores the proxy) simply fail. Targets must pass the
+`--allow-net` filter in the connector.
+
+### Usage
 
 ```sh
 rs-bubble --isolated-net --allow-net example.com:443 \
   --bind /usr /usr --symlink usr/lib /lib -- /bin/sh
 ```
 
-Inside the sandbox:
+Standard tools automatically use the proxy, because the sandbox sets:
+
+- `http_proxy` / `HTTP_PROXY` = `http://127.0.0.2:3128`
+- `https_proxy` / `HTTPS_PROXY` = same
+- `all_proxy` / `ALL_PROXY` = same
+- `RS_BUBBLE_PROXY` = `/net/sock` (raw protocol, see below)
+
+For example, inside the sandbox:
+
+```sh
+curl -si https://example.com/ | head -1
+```
+
+### Raw protocol on /net/sock
+
+For tools that don't speak HTTP CONNECT, connect a Unix socket to
+`/net/sock`, send the target as one line `host:port\n`, read one status
+byte (`K` = connected, `E` = failed or denied), and the connection
+becomes a raw bidirectional pipe:
 
 ```sh
 exec 3<>/net/sock
 printf 'example.com:443\n' >&3
-# fd 3 is now a raw connection to example.com:443 via the host proxy
+head -c 1 <&3   # 'K' if the connector connected
 ```
 
-Connections to targets not on the `--allow-net` list are rejected (with
-an empty reply and a message on the host's stderr). With no
-`--allow-net`, every target is allowed.
+`--allow-net HOST[:PORT]` (repeatable) restricts both proxy paths;
+entries without a port allow any port on that host. Without it, every
+target is allowed.
 
-Note: regular tools like `curl` speak plain TCP and cannot use the proxy
-directly; they would need a wrapper (or a `LD_PRELOAD` shim) that dials
-the socket first. Transparent networking for unmodified programs would
-require user-space networking such as `slirp4netns` or `pasta` — a
-natural next step.
+Exit status: the connector forwards the sandbox's status; a killed
+command yields `128+signal`.
+
+Note on trust: the proxy (`P`) and the command share one user namespace,
+so a hostile command runs as uid 0 there and could, in principle, kill
+`P` (cutting its own network access — it gains nothing else). Fully
+separating them would require an additional namespace split.
 
 ## Requirements
 
