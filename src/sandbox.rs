@@ -54,6 +54,28 @@ pub(crate) fn mkdir_p(newroot: &Path, dest: &Path) {
     }
 }
 
+/// Make sure `dest` exists under `newroot` before mounting something on it.
+///
+/// On a tmpfs root the directory is simply created (like bwrap). In
+/// hostfs-root mode the FUSE filesystem is read-only, so the directory must
+/// already be provided by the mirror; anything else is a hard error with a
+/// hint.
+fn ensure_dir(newroot: &Path, dest: &Path) {
+    if crate::hostfs::root_mode() {
+        let full = sandbox_path(newroot, dest);
+        match fs::metadata(&full) {
+            Ok(_) => {}
+            Err(_) => die(&format!(
+                "Mount point {} does not exist in the hostfs root; \
+                 add a mirror pattern for it (or a parent directory) to hostfs.mirror",
+                dest.display()
+            )),
+        }
+    } else {
+        mkdir_p(newroot, dest);
+    }
+}
+
 /// Write a map file for the current process, following bwrap's order
 /// (uid_map, then setgroups, then gid_map) and semantics.
 pub(crate) fn write_id_map(file: &str, data: &str) {
@@ -316,34 +338,49 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
             die_with_error("Can't make mount tree private");
         }
 
-        // Create a fresh tmpfs to serve as the sandbox root.
-        let mut tmpl: Vec<u8> = b"/tmp/rs-bubble.XXXXXX".to_vec();
-        tmpl.push(0);
-        let tmpl_ptr = CString::from_vec_with_nul(tmpl).unwrap();
-        let root_path = libc::mkdtemp(tmpl_ptr.into_raw() as *mut libc::c_char);
-        if root_path.is_null() {
-            die_with_error("Can't create temporary sandbox root");
-        }
-        let newroot = PathBuf::from(CStr::from_ptr(root_path).to_string_lossy().into_owned());
+        // In hostfs-root mode the FUSE filesystem itself is the sandbox
+        // root: the ops are mounted on top of it and the process chroots
+        // into it below. No tmpfs root is created.
+        let newroot: PathBuf = if crate::hostfs::root_mode() {
+            match crate::hostfs::host_mount_point() {
+                Some(mountpoint) => mountpoint.clone(),
+                None => die("hostfs root requested but no host filesystem is mounted"),
+            }
+        } else {
+            // Create a fresh tmpfs to serve as the sandbox root.
+            let mut tmpl: Vec<u8> = b"/tmp/rs-bubble.XXXXXX".to_vec();
+            tmpl.push(0);
+            let tmpl_ptr = CString::from_vec_with_nul(tmpl).unwrap();
+            let root_path = libc::mkdtemp(tmpl_ptr.into_raw() as *mut libc::c_char);
+            if root_path.is_null() {
+                die_with_error("Can't create temporary sandbox root");
+            }
+            let newroot = PathBuf::from(CStr::from_ptr(root_path).to_string_lossy().into_owned());
 
-        let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
-        if libc::mount(
-            CString::new("tmpfs").unwrap().as_ptr(),
-            newroot_c.as_ptr(),
-            CString::new("tmpfs").unwrap().as_ptr(),
-            0,
-            std::ptr::null(),
-        ) != 0
-        {
-            die_with_error("Can't mount tmpfs sandbox root");
-        }
-        // Root of the sandbox should be traversable by everyone.
-        let _ = fs::set_permissions(&newroot, fs::Permissions::from_mode(0o755));
+            let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
+            if libc::mount(
+                CString::new("tmpfs").unwrap().as_ptr(),
+                newroot_c.as_ptr(),
+                CString::new("tmpfs").unwrap().as_ptr(),
+                0,
+                std::ptr::null(),
+            ) != 0
+            {
+                die_with_error("Can't mount tmpfs sandbox root");
+            }
+            // Root of the sandbox should be traversable by everyone.
+            let _ = fs::set_permissions(&newroot, fs::Permissions::from_mode(0o755));
+            newroot
+        };
 
         // Bind the host FUSE filesystem into the sandbox at /host. This must
         // happen before chroot, while the host mountpoint path is still
         // resolvable. (The FUSE server keeps running in the host process.)
-        if let Some(host_mount) = crate::hostfs::host_mount_point() {
+        // In hostfs-root mode the FUSE filesystem *is* the root, so there is
+        // no /host.
+        if let Some(host_mount) = crate::hostfs::host_mount_point()
+            .filter(|_| !crate::hostfs::root_mode())
+        {
             mkdir_p(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
             let dest_abs = sandbox_path(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
             let src_c = CString::new(host_mount.as_os_str().as_bytes()).unwrap();
@@ -376,9 +413,11 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                         die_with_error(&format!("Can't find source {src}"));
                     }
                     let dest_abs = sandbox_path(&newroot, dest);
-                    // Bind targets must exist; create missing directories on the
-                    // tmpfs root (bwrap does the same for its new root).
-                    mkdir_p(&newroot, dest);
+                    // Bind targets must exist; create missing directories on
+                    // the tmpfs root (bwrap does the same for its new root).
+                    // In hostfs-root mode they must already exist in the
+                    // mirror (the FUSE filesystem is read-only).
+                    ensure_dir(&newroot, dest);
                     let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
                     if libc::mount(
                         src_c.as_ptr(),
@@ -398,7 +437,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     {
                         die(&format!("Invalid proc mount point {}", dest.display()));
                     }
-                    mkdir_p(&newroot, dest);
+                    ensure_dir(&newroot, dest);
                     let dest_abs = sandbox_path(&newroot, dest);
                     let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
                     // Mount a *fresh* procfs, like bwrap's --proc does when a
@@ -424,7 +463,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     {
                         die(&format!("Invalid tmpfs mount point {}", dest.display()));
                     }
-                    mkdir_p(&newroot, dest);
+                    ensure_dir(&newroot, dest);
                     let dest_abs = sandbox_path(&newroot, dest);
                     mount_tmpfs(&dest_abs, perms.unwrap_or(TmpfsPerms::DEFAULT), *size, dest);
                 }
@@ -435,7 +474,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     {
                         die(&format!("Invalid dev mount point {}", dest.display()));
                     }
-                    mkdir_p(&newroot, dest);
+                    ensure_dir(&newroot, dest);
                     let dev_abs = sandbox_path(&newroot, dest);
                     // Like bwrap's --dev: a fresh mode-0755 tmpfs, populated
                     // with the standard device nodes and symlinks below.
@@ -558,7 +597,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                         p => p,
                     };
                     if let Some(p) = parent {
-                        mkdir_p(&newroot, p);
+                        ensure_dir(&newroot, p);
                     }
                     let dest_abs = sandbox_path(&newroot, dest);
                     let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
@@ -581,7 +620,16 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                                 )),
                             }
                         } else {
-                            die_with_error(&format!("Can't make symlink at {}", dest.display()));
+                            let hint = if crate::hostfs::root_mode() {
+                                " (the hostfs root is read-only; the symlink must already \
+                                 exist in a mirrored path)"
+                            } else {
+                                ""
+                            };
+                            die_with_error(&format!(
+                                "Can't make symlink at {}{hint}",
+                                dest.display()
+                            ));
                         }
                     }
                 }
@@ -589,6 +637,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
         }
 
         // Enter the sandbox and run the command.
+        let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
         if libc::chdir(newroot_c.as_ptr()) != 0 {
             die_with_error("Can't chdir to sandbox root");
         }

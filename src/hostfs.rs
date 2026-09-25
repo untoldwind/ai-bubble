@@ -21,13 +21,18 @@
 //! (the sandbox) forks it first, waits for a readiness byte on a pipe, and only
 //! then proceeds with the namespace setup. When the parent dies, the FUSE
 //! server unmounts and exits.
+//!
+//! The spec's `hostfs.emptyDirs` entries are exposed as empty, unwritable
+//! directories that take precedence over the mirror — mount points for the
+//! sandbox to stack `/dev`, `/proc`, tmpfs (or, with `hostfs.root`, its
+//! whole root) on top of.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::io::{Read, Seek, SeekFrom};
 use std::num::NonZeroU32;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -44,6 +49,20 @@ use crate::sandbox::die_with_error;
 
 /// The sandbox-absolute path the host filesystem is mounted at.
 pub const SANDBOX_MOUNT_POINT: &str = "/host";
+
+/// Whether the host filesystem should become the sandbox root instead of
+/// being mounted at `/host`. Set once before any fork.
+static ROOT_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Select hostfs-root mode. Must be called before any process forks.
+pub fn set_root_mode(on: bool) {
+    ROOT_MODE.store(on, Ordering::SeqCst);
+}
+
+/// Whether hostfs-root mode is active (read after the forks).
+pub(crate) fn root_mode() -> bool {
+    ROOT_MODE.load(Ordering::SeqCst)
+}
 
 /// The host-side mountpoint of the FUSE filesystem, if it has been started.
 pub(crate) fn host_mount_point() -> Option<&'static PathBuf> {
@@ -84,16 +103,24 @@ enum Walk {
 /// spec's `hostfs.mirror` glob patterns, reproduced at the same absolute
 /// paths below `/host`. Nothing is pre-expanded; every operation matches
 /// against the patterns directly.
+///
+/// `empty_dirs` (the spec's `hostfs.emptyDirs`) are absolute paths exposed
+/// as empty, unwritable directories regardless of the mirror patterns. They
+/// take *precedence* over the mirror: nothing below an empty-dir path is
+/// visible (it is meant to be covered by a mount inside the sandbox, e.g.
+/// the sandbox root itself or `/dev`). Ancestors of empty-dir paths stay
+/// navigable even when the mirror knows nothing about them.
 #[derive(Clone)]
 struct HostFs {
     uid: u32,
     gid: u32,
     patterns: Vec<MirrorPattern>,
+    empty_dirs: Vec<PathBuf>,
 }
 
 impl HostFs {
     /// Compile the mirror patterns. Invalid patterns are a hard error.
-    fn collect(patterns: &[String]) -> HostFs {
+    fn collect(patterns: &[String], empty_dirs: &[String]) -> HostFs {
         let compiled = patterns
             .iter()
             .map(|p| {
@@ -106,11 +133,43 @@ impl HostFs {
                 MirrorPattern { full, comps }
             })
             .collect();
+        let empties = empty_dirs
+            .iter()
+            .map(|p| {
+                let path = PathBuf::from(p);
+                if !path.is_absolute() {
+                    die(&format!("hostfs emptyDirs entry {p:?} is not an absolute path"));
+                }
+                path
+            })
+            .collect();
         HostFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             patterns: compiled,
+            empty_dirs: empties,
         }
+    }
+
+    /// Whether the host path is exactly one of the empty dirs.
+    fn is_empty_dir(&self, host: &Path) -> bool {
+        self.empty_dirs.iter().any(|v| v.as_path() == host)
+    }
+
+    /// Whether the host path lies strictly *below* an empty dir (so it is
+    /// shadowed by the empty dir's precedence and never visible).
+    fn under_empty_dir(&self, host: &Path) -> bool {
+        self.empty_dirs
+            .iter()
+            .any(|v| host.starts_with(v) && v.as_path() != host)
+    }
+
+    /// Whether the host path is a proper ancestor of an empty dir (so it
+    /// must stay navigable even if the mirror would not show it).
+    fn is_empty_prefix(&self, host: &Path) -> bool {
+        self.empty_dirs
+            .iter()
+            .any(|v| v.starts_with(host) && v.as_path() != host)
     }
 
     /// Map a sandbox-relative path (as passed by the FUSE bridge, without a
@@ -126,8 +185,12 @@ impl HostFs {
     }
 
     /// Whether a host path matches one of the patterns directly (as a file,
-    /// symlink, or a directory named by the pattern itself).
+    /// symlink, or a directory named by the pattern itself). Empty dirs and
+    /// everything below them take precedence over the mirror.
     fn matches(&self, host: &Path) -> bool {
+        if self.is_empty_dir(host) || self.under_empty_dir(host) {
+            return false;
+        }
         // `*` must not cross directory separators, like in a shell.
         self.patterns.iter().any(|p| {
             p.full.matches_path_with(
@@ -141,10 +204,17 @@ impl HostFs {
     }
 
     /// Whether the mirrored host path exists at all: it either matches a
-    /// pattern itself or is an ancestor of something that does (so the tree
-    /// under `/host` stays navigable down to the matched leaves).
+    /// pattern itself, is an ancestor of something that does (so the tree
+    /// under `/host` stays navigable down to the matched leaves), or is an
+    /// empty dir (or an ancestor leading to one).
     fn exists(&self, host: &Path) -> bool {
-        self.matches(host) || self.dir_prefix(host)
+        if self.is_empty_dir(host) {
+            return true;
+        }
+        if self.under_empty_dir(host) {
+            return false;
+        }
+        self.matches(host) || self.dir_prefix(host) || self.is_empty_prefix(host)
     }
 
     /// Whether the pattern could still match something *strictly below* the
@@ -152,12 +222,16 @@ impl HostFs {
     /// directory of the mirror, leading to matches deeper down.
     fn dir_prefix(&self, host: &Path) -> bool {
         if host == Path::new("/") {
-            return !self.patterns.is_empty();
+            return !self.patterns.is_empty() || !self.empty_dirs.is_empty();
+        }
+        if self.under_empty_dir(host) {
+            return false;
         }
         let comps: Vec<Component> = host.components().collect();
         self.patterns
             .iter()
             .any(|p| self.pattern_could_reach(p, &comps))
+            || self.is_empty_prefix(host)
     }
 
     /// Walk the pattern components alongside the path components.
@@ -206,18 +280,61 @@ impl HostFs {
         }
     }
 
+    /// The attributes of an empty dir (or a purely virtual ancestor of one):
+    /// a mode-0555 directory, so nothing can be created inside it.
+    fn empty_dir_attr(&self) -> FileAttr {
+        FileAttr {
+            size: 0,
+            blocks: 0,
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            kind: FileType::Directory,
+            perm: 0o555,
+            nlink: 2,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
+        }
+    }
+
     /// The `lstat`-style attribute of a mirrored path, or ENOENT.
     fn attr(&self, host: &Path) -> std::io::Result<FileAttr> {
+        // Empty dirs take precedence: they appear even when the real host
+        // path exists (with different attributes).
+        if self.is_empty_dir(host) {
+            return Ok(self.empty_dir_attr());
+        }
         match std::fs::symlink_metadata(host) {
             Ok(md) => Ok(attr_from_metadata(&md)),
+            // A purely virtual ancestor of an empty dir has no real
+            // counterpart; present it as a directory.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.is_empty_prefix(host) => {
+                Ok(self.empty_dir_attr())
+            }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Whether the host path refers to a real directory (following
+    /// symlinks); used by opendir/readdir to reject files.
+    fn is_real_dir(&self, host: &Path) -> bool {
+        std::fs::metadata(host).map(|m| m.is_dir()).unwrap_or(false)
+    }
+
+    /// Whether the host path is a listable directory: a real one, an empty
+    /// dir, or a purely virtual ancestor of an empty dir.
+    fn is_listable_dir(&self, host: &Path) -> bool {
+        self.is_real_dir(host) || self.is_empty_dir(host) || self.is_empty_prefix(host)
     }
 
     /// The visible entries of a mirrored directory, sorted by name: every
     /// real entry that matches a pattern (directly or as an ancestor of a
     /// match) — and, when the directory is itself matched by a pattern, all
-    /// of its real entries.
+    /// of its real entries. Empty dirs (and everything below them) are
+    /// shadowed by their precedence; empty-dir entries that live directly
+    /// under the directory are always shown.
     fn dir_entries(&self, host: &Path) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
         // A directory named by a pattern itself is a recursive mirror: all
         // of its real entries are visible, not only pattern matches.
@@ -233,11 +350,27 @@ impl HostFs {
                 .map(|e| e.file_name())
                 .filter(|name| {
                     let child = host.join(name);
+                    // Empty-dir precedence: nothing below an empty dir is
+                    // visible, not even a mirror match.
+                    if self.under_empty_dir(&child) {
+                        return false;
+                    }
                     unfiltered || self.exists(&child)
                 })
                 .collect(),
             Err(_) => Vec::new(),
         };
+        // Empty-dir entries living directly under this directory (also when
+        // the real directory itself cannot be listed).
+        for v in &self.empty_dirs {
+            if v.parent().map(|p| p == host).unwrap_or(false) {
+                if let Some(name) = v.file_name() {
+                    if !names.iter().any(|n| n == name) {
+                        names.push(name.to_os_string());
+                    }
+                }
+            }
+        }
         names.sort();
         names
             .into_iter()
@@ -452,7 +585,7 @@ impl PathFilesystem for HostFs {
         _flags: u32,
     ) -> Result<ReplyOpen> {
         let host = self.host_path(path);
-        if !self.exists(&host) || !is_root(path) && !self.is_real_dir(&host) {
+        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host) {
             return Err(libc::ENOENT.into());
         }
         Ok(ReplyOpen { fh: 0, flags: 0 })
@@ -467,7 +600,7 @@ impl PathFilesystem for HostFs {
     ) -> Result<ReplyDirectory<impl futures_util::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
         let host = self.host_path(path);
-        if !self.exists(&host) || !is_root(path) && !self.is_real_dir(&host) {
+        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host) {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
@@ -501,7 +634,7 @@ impl PathFilesystem for HostFs {
         >,
     > {
         let host = self.host_path(path);
-        if !self.exists(&host) || !is_root(path) && !self.is_real_dir(&host) {
+        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host) {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
@@ -530,20 +663,22 @@ impl PathFilesystem for HostFs {
         if !self.exists(&host) {
             return Err(libc::ENOENT.into());
         }
+        // Empty dirs (and purely virtual ancestors) are unwritable by
+        // definition; answer directly instead of asking the real filesystem.
+        if self.is_empty_dir(&host)
+            || self.is_empty_prefix(&host) && std::fs::symlink_metadata(&host).is_err()
+        {
+            if mask & libc::W_OK as u32 != 0 {
+                return Err(libc::EACCES.into());
+            }
+            return Ok(());
+        }
         // Ask the real filesystem, with the server's real (host) credentials.
         let cpath = CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
         if unsafe { libc::access(cpath.as_ptr(), mask as libc::c_int) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
-    }
-}
-
-impl HostFs {
-    /// Whether the host path refers to a real directory (following
-    /// symlinks); used by opendir/readdir to reject files.
-    fn is_real_dir(&self, host: &Path) -> bool {
-        std::fs::metadata(host).map(|m| m.is_dir()).unwrap_or(false)
     }
 }
 
@@ -585,7 +720,7 @@ pub fn start_host_fs(config: &crate::spec::HostFsConfig) {
     if pid == 0 {
         // Child: serve the FUSE filesystem forever (or until the host dies).
         unsafe { libc::close(read_fd) };
-        serve(config.mirror.clone(), mountpoint, write_fd);
+        serve(config.mirror.clone(), config.empty_dirs.clone(), mountpoint, write_fd);
         // serve never returns
     }
 
@@ -607,10 +742,15 @@ pub fn start_host_fs(config: &crate::spec::HostFsConfig) {
 /// loop is a spawned task, and a current-thread runtime only polls its tasks
 /// while `block_on` is running — returning early would silently stall the
 /// event loop and every filesystem access would hang.
-fn serve(mirror: Vec<String>, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
+fn serve(
+    mirror: Vec<String>,
+    empty_dirs: Vec<String>,
+    mountpoint: PathBuf,
+    ready_fd: libc::c_int,
+) -> ! {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    let fs = HostFs::collect(&mirror);
+    let fs = HostFs::collect(&mirror, &empty_dirs);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -702,7 +842,92 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<Vec<String>>(),
+            &[],
         )
+    }
+
+    fn fs_with_empty_dirs(patterns: &[&str], empty: &[&str]) -> HostFs {
+        HostFs::collect(
+            &patterns
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>(),
+            &empty.iter().map(|s| s.to_string()).collect::<Vec<String>>(),
+        )
+    }
+
+    #[test]
+    fn empty_dirs_are_virtual_unwritable_directories() {
+        let f = fs_with_empty_dirs(&[], &["/dev"]);
+
+        // The dir itself exists, with no write permission...
+        assert!(f.exists(Path::new("/dev")));
+        assert!(f.is_empty_dir(Path::new("/dev")));
+        assert_eq!(f.attr(Path::new("/dev")).unwrap().perm, 0o555);
+        assert_eq!(f.attr(Path::new("/dev")).unwrap().kind, FileType::Directory);
+        // ...and it is empty even though the real host /dev has entries.
+        assert!(f.dir_entries(Path::new("/dev")).is_empty());
+        // Deeper paths are shadowed by the precedence.
+        assert!(!f.exists(Path::new("/dev/null")));
+        assert!(!f.matches(Path::new("/dev/null")));
+        assert!(!f.dir_prefix(Path::new("/dev/null")));
+        // The mountpoint dir is not itself a dir-prefix.
+        assert!(!f.dir_prefix(Path::new("/dev")));
+    }
+
+    #[test]
+    fn empty_dirs_take_precedence_over_mirror() {
+        let f = fs_with_empty_dirs(&["/etc/*", "/etc"], &["/etc"]);
+        assert!(f.is_empty_dir(Path::new("/etc")));
+        // Mirror contents below the empty dir are hidden.
+        assert!(!f.exists(Path::new("/etc/passwd")));
+        assert!(f.dir_entries(Path::new("/etc")).is_empty());
+        // But /etc still appears at the root listing.
+        let names: Vec<_> = f
+            .dir_entries(Path::new("/"))
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["etc"]);
+    }
+
+    #[test]
+    fn empty_dir_ancestors_stay_navigable() {
+        // A nested empty dir; /var exists only as a virtual ancestor.
+        let f = fs_with_empty_dirs(&[], &["/var/tmp"]);
+        assert!(f.exists(Path::new("/var")));
+        assert!(f.is_empty_prefix(Path::new("/var")));
+        assert!(f.exists(Path::new("/var/tmp")));
+        assert!(!f.exists(Path::new("/var/tmp/other")));
+        assert!(!f.exists(Path::new("/var/etc")));
+        // The root listing contains both levels of the chain.
+        let root: Vec<_> = f
+            .dir_entries(Path::new("/"))
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(root, ["var"]);
+        let var: Vec<_> = f
+            .dir_entries(Path::new("/var"))
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(var, ["tmp"]);
+    }
+
+    #[test]
+    fn empty_dirs_coexist_with_mirror() {
+        // /dev is empty, /etc is mirrored normally; siblings of the empty
+        // dir are listed together with it.
+        let f = fs_with_empty_dirs(&["/etc/passwd"], &["/dev"]);
+        let names: Vec<_> = f
+            .dir_entries(Path::new("/"))
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["dev", "etc"]);
+        assert!(f.exists(Path::new("/etc/passwd")));
+        assert!(!f.exists(Path::new("/dev/whatever")));
     }
 
     #[test]
@@ -812,5 +1037,18 @@ mod tests {
         let f = fs(&[]);
         assert!(!f.exists(Path::new("/")));
         assert!(f.dir_entries(Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn empty_dirs_only_still_show_root() {
+        let f = fs_with_empty_dirs(&[], &["/dev"]);
+        assert!(f.exists(Path::new("/")));
+        assert_eq!(
+            f.dir_entries(Path::new("/"))
+                .into_iter()
+                .map(|(n, _)| n.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["dev"]
+        );
     }
 }

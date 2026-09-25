@@ -59,6 +59,12 @@ root, a fresh procfs at `/proc`, and the host network.
   directory **recursively**; `**` spans directory levels
   (`/usr/share/**/*.rs`). Ancestor directories are shown so the tree is
   navigable down to the matched leaves. Missing or empty mirrors nothing.
+- `hostfs.emptyDirs` — a list of **absolute paths** exposed as **empty,
+  unwritable directories** (mode 0555, no contents). They take
+  *precedence* over `mirror`: nothing below an entry is visible, and the
+  entry itself is shown even when a mirror pattern covers it. Their
+  purpose is to provide mount points for the sandbox's ops (`dev`,
+  `tmpfs`, `proc`, binds) — see the `hostfs.root` mode below.
 
 Everything on the command line (optionally after a `--` separator) is the
 command to run inside the sandbox:
@@ -84,7 +90,9 @@ Like bwrap, the tool:
    its exit status.
 5. Marks the mount tree as a **slave**, so nothing mounted inside
    propagates back to the host.
-6. Creates a fresh **tmpfs** as the sandbox root.
+6. Creates a fresh **tmpfs** as the sandbox root. (Experimental
+   alternative: with `hostfs.root = true` the read-only FUSE filesystem
+   itself becomes the root — see below.)
 7. Applies the filesystem ops (the spec's `proc` and `ops`) **in the
    order they were given** (order matters, exactly like bwrap). Because
    the PID namespace is created before the mounts (the mounting process
@@ -251,6 +259,41 @@ rs-bubble -- /bin/sh -c 'cat /host/etc/hosts'
   matches the requested path against the patterns on the fly, so a large
   host tree costs nothing and only the accessed paths are touched.
 - The mirror is read-only; writes to `/host` fail.
+
+### Experimental: the host filesystem as the sandbox root
+
+With `hostfs.root = true` the FUSE filesystem itself becomes the sandbox
+root instead of being mounted at `/host`: everything the mirror exposes
+appears at its absolute host path, and the ops (`dev`, `tmpfs`, proc,
+binds) are mounted **on top of** it:
+
+```json
+{
+  "hostfs": {
+    "root": true,
+    "mirror": ["/bin", "/etc", "/lib", "/lib64", "/usr"],
+    "emptyDirs": ["/dev", "/tmp", "/proc"]
+  },
+  "ops": [
+    { "type": "dev", "dest": "/dev" },
+    { "type": "tmpfs", "dest": "/tmp", "perms": "1777" }
+  ],
+  "proc": "/proc"
+}
+```
+
+```sh
+rs-bubble --spec hostfs-root.json -- /bin/sh
+```
+
+The `emptyDirs` entries are exposed by the FUSE filesystem as empty,
+unwritable (mode 0555) directories — pure mount points, taking *precedence*
+over the mirror (nothing below them is visible, and no mirror pattern can
+bring content back). They must exist for every mount point, because the
+read-only FUSE filesystem cannot have directories created on it. The `dev`
+and `tmpfs` mounts (and the fresh procfs) then cover the empty dirs,
+giving a writable `/dev` and `/tmp` and a sandbox-only `/proc` on top of
+the read-only host view.
 
 ## Requirements
 

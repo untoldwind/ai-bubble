@@ -151,6 +151,21 @@ pub struct HostFsConfig {
     /// (`/etc/passwd` → `/host/etc/passwd`); matched directories are
     /// mirrored recursively. Empty mirrors nothing.
     pub mirror: Vec<String>,
+    /// Absolute paths exposed as **empty, unwritable directories**
+    /// (mode 0555, no contents), taking *precedence* over `mirror`:
+    /// nothing below an entry is visible, and the entry itself is shown
+    /// even when a mirror pattern (or the real host path) covers it.
+    /// Meant as mount points inside the sandbox, e.g. `/dev`, `/tmp`,
+    /// `/proc` — or the sandbox root itself with `hostfs.root`.
+    #[serde(rename = "emptyDirs")]
+    pub empty_dirs: Vec<String>,
+    /// **Experimental:** use the FUSE filesystem itself as the sandbox
+    /// root instead of mounting it at `/host`. Everything mirrored appears
+    /// at its absolute host path; the ops (`dev`, `tmpfs`, `proc`, binds)
+    /// are mounted on top of it. Because the FUSE filesystem is read-only,
+    /// every mount point must be listed in `emptyDirs` (or exist in the
+    /// mirror).
+    pub root: bool,
 }
 
 /// The whole sandbox specification.
@@ -370,6 +385,21 @@ mod tests {
             spec.hostfs.mirror,
             ["/etc/*.conf".to_string(), "/home/me/project".to_string()]
         );
+    }
+
+    #[test]
+    fn hostfs_root_flag_parses() {
+        assert!(!parse("{}").hostfs.root);
+        let spec = parse(r#"{ "hostfs": { "root": true, "mirror": ["/etc"] } }"#);
+        assert!(spec.hostfs.root);
+        assert_eq!(spec.hostfs.mirror, ["/etc".to_string()]);
+    }
+
+    #[test]
+    fn hostfs_empty_dirs_parse() {
+        let spec = parse(r#"{ "hostfs": { "emptyDirs": ["/dev", "/tmp"] } }"#);
+        assert_eq!(spec.hostfs.empty_dirs, ["/dev".to_string(), "/tmp".to_string()]);
+        assert!(parse("{}").hostfs.empty_dirs.is_empty());
     }
 
     #[test]

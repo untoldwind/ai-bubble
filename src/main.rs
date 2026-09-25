@@ -37,7 +37,12 @@ fn main() {
     let spec = spec::Spec::load(args.spec.as_deref());
 
     // Start the host FUSE filesystem server (in its own child process) before
-    // any namespace setup, so the sandbox can bind-mount it at /host.
+    // any namespace setup, so the sandbox can bind-mount it at /host (or use
+    // it as the sandbox root itself, see below).
+    if spec.hostfs.root && spec.hostfs.mirror.is_empty() && spec.hostfs.empty_dirs.is_empty() {
+        sandbox::die("hostfs.root needs at least one hostfs.mirror pattern or hostfs.emptyDirs entry");
+    }
+    hostfs::set_root_mode(spec.hostfs.root);
     hostfs::start_host_fs(&spec.hostfs);
 
     let net = &spec.net;

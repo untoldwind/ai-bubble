@@ -4,15 +4,24 @@
     { "type": "bind",    "src": "/etc", "dest": "/etc" },
     { "type": "dev",     "dest": "/dev" },
     { "type": "tmpfs",   "dest": "/tmp" },
-    { "type": "tmpfs",   "dest": "/run" },
-    { "type": "tmpfs",   "dest": "/home" },
-    { "type": "symlink", "src": "usr/lib", "dest": "/lib" },
-    { "type": "symlink", "src": "usr/lib64", "dest": "/lib64" },
-    { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
+    { "type": "tmpfs",   "dest": "/run" }
   ],
   "hostfs": {
+    "root": true,
     "mirror": [
-      "/home/bjunglas/workspaces"
+      "/home/bjunglas/workspaces",
+      "/lib",
+      "/lib64",
+      "/bin"
+    ],
+    "emptyDirs": [
+      "/dev",
+      "/usr",
+      "/etc",
+      "/proc",
+      "/net",
+      "/run",
+      "/tmp"
     ]
   },
   "proc": "/proc",
