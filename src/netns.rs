@@ -130,6 +130,7 @@ unsafe fn isolated_parent(netdir: &Path, net: &NetConfig, ops: &[Op], command: &
             ("HTTPS_PROXY", PROXY_URL),
             ("all_proxy", PROXY_URL),
             ("ALL_PROXY", PROXY_URL),
+            ("NO_PROXY", "localhost,127.0.0.1,::1"),
             ("RS_BUBBLE_PROXY", "/net/sock"),
         ] {
             std::env::set_var(key, val);
