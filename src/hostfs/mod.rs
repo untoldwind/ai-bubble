@@ -1,11 +1,11 @@
 //! The host-side FUSE filesystem.
 //!
-//! The *host* process exposes a read-only mirror of parts of the real
-//! filesystem via FUSE. The mirrored paths are selected by the spec file's
-//! ordered `hostfs.patterns` glob → permission map (`"mirror"` mirrors a
-//! matched path, `"hide"` hides it, `"empty"` exposes it empty; when a
-//! path matches several patterns, the last match wins); the sandboxed
-//! command gets
+//! The *host* process exposes a mirror of parts of the real filesystem via
+//! FUSE. The mirrored paths are selected by the spec file's ordered
+//! `hostfs.patterns` glob → permission map (`"ro"` mirrors a matched path
+//! read-only, `"rw"` mirrors it read-write, `"hide"` hides it, `"empty"`
+//! exposes it empty; when a path matches several patterns, the last match
+//! wins); the sandboxed command gets
 //! the result bind-mounted at `/host`, where the **full host paths** are
 //! reproduced: a pattern `/etc/*.conf` makes `/etc/foo.conf` available as
 //! `/host/etc/foo.conf`. A pattern that matches a directory exactly
@@ -27,31 +27,37 @@
 //! then proceeds with the namespace setup. When the parent dies, the FUSE
 //! server unmounts and exits.
 //!
-//! `hostfs.patterns` is an ordered glob → permission map: `"mirror"`
-//! mirrors the matched paths, `"hide"` hides them (a hidden directory
-//! hides its whole subtree) and `"empty"` exposes them empty — an empty,
-//! unwritable directory when the path is (or would be) a directory, an
-//! empty file when it matches a real file. Empty paths take precedence
-//! over the mirror: nothing below them is visible, which makes them the
-//! mount points for the sandbox to stack `/dev`, `/proc`, tmpfs (or, with
-//! `hostfs.root`, its whole root) on top of. When a path matches several
-//! patterns the last match wins.
+//! `hostfs.patterns` is an ordered glob → permission map: `"ro"`/`"rw"`
+//! mirror the matched paths (read-only or read-write), `"hide"` hides them
+//! (a hidden directory hides its whole subtree) and `"empty"` exposes them
+//! empty — an empty, unwritable directory when the path is (or would be) a
+//! directory, an empty file when it matches a real file. Empty paths take
+//! precedence over the mirror: nothing below them is visible, which makes
+//! them the mount points for the sandbox to stack `/dev`, `/proc`, tmpfs
+//! (or, with `hostfs.root`, its whole root) on top of. When a path matches
+//! several patterns the last match wins.
+//!
+//! Writes: a path is writable only when the last pattern naming it (or its
+//! nearest mirrored ancestor — an exactly-named or `**`-covered directory
+//! is a recursive mirror, so its permission governs everything below it)
+//! says `"rw"`, **and** the real host filesystem allows the operation. The
+//! FUSE mount is mounted read-only unless some pattern says `"rw"`.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use fuse3::path::reply::{
-    DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs,
+    DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyCreated, ReplyData,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs, ReplyWrite,
 };
 use fuse3::path::{PathFilesystem, Session};
-use fuse3::{FileType, MountOptions, Result};
+use fuse3::{FileType, MountOptions, Result, SetAttr, Timestamp};
 use futures_util::stream;
 
 use crate::sandbox::die_with_error;
@@ -106,8 +112,8 @@ impl MirrorPattern {
     }
 }
 
-/// The mirror filesystem: a read-only view of the paths selected by the
-/// spec's ordered `hostfs.patterns` glob → permission map, reproduced at
+/// The mirror filesystem: a view of the paths selected by the spec's
+/// ordered `hostfs.patterns` glob → permission map, reproduced at
 /// the same absolute paths below `/host`. Nothing is pre-expanded; every
 /// operation matches against the patterns directly.
 ///
@@ -120,10 +126,12 @@ impl MirrorPattern {
 /// navigable even when the mirror knows nothing about them.
 ///
 /// Permissions: the **last** pattern that names a path (exactly or via
-/// `**`) decides whether it is mirrored (`mirror`), empty (`empty`) or
-/// hidden (`hide`); a hidden path — or one below a hidden directory — is
-/// not visible at all. Ancestors of visible matches stay navigable as
-/// long as no hidden pattern stands between them and the matches below.
+/// `**`) decides whether it is mirrored read-only (`ro`), mirrored
+/// read-write (`rw`), empty (`empty`) or hidden (`hide`); a hidden path —
+/// or one below a hidden directory — is not visible at all. Ancestors of
+/// visible matches stay navigable as long as no hidden pattern stands
+/// between them and the matches below. Writes additionally require the
+/// `rw` permission (see [`HostFs::write_permission`]).
 #[derive(Clone)]
 struct HostFs {
     uid: u32,
@@ -192,7 +200,43 @@ impl HostFs {
         if self.is_empty(host) || self.under_empty(host) {
             return false;
         }
-        self.permission_of(host) == Some(Permission::Mirror)
+        matches!(self.permission_of(host), Some(p) if p.is_mirrored())
+    }
+
+    /// The spec-level permission that governs **writing** to the host path
+    /// (modifying its content or metadata, creating or deleting it): the
+    /// last pattern naming the path itself decides, or — when no pattern
+    /// names it directly — the permission of the *nearest* mirrored
+    /// ancestor (an exactly-named or `**`-covered directory is a recursive
+    /// mirror, so its permission governs everything below it). Empty paths
+    /// and hidden paths are never writable.
+    ///
+    /// The result is only the *spec* side: the real host filesystem may
+    /// still deny the operation (the server acts with the real host
+    /// credentials, so the underlying file or directory permissions apply).
+    fn write_permission(&self, host: &Path) -> Option<Permission> {
+        if self.is_empty(host) || self.under_empty(host) || self.hidden(host) {
+            return None;
+        }
+        if let Some(p) = self.permission_of(host) {
+            return p.is_mirrored().then_some(p);
+        }
+        host.ancestors()
+            .skip(1)
+            .find_map(|a| self.permission_of(a).filter(|p| p.is_mirrored()))
+    }
+
+    /// Whether writes to the host path are allowed: the spec must say `rw`.
+    /// (Whether the *real* file or directory actually allows it is decided
+    /// by the host filesystem when the operation is performed.)
+    fn writable(&self, host: &Path) -> bool {
+        self.write_permission(host) == Some(Permission::Rw)
+    }
+
+    /// Whether any pattern grants write access: the FUSE mount is mounted
+    /// read-only unless it does.
+    fn has_writable_patterns(&self) -> bool {
+        self.patterns.iter().any(|p| p.permission.is_writable())
     }
 
     /// The permission of the **last** pattern that names the path itself
@@ -242,14 +286,16 @@ impl HostFs {
     /// deeper down. Denied patterns never make a path navigable.
     fn dir_prefix(&self, host: &Path) -> bool {
         if host == Path::new("/") {
-            return self
-                .patterns
-                .iter()
-                .any(|p| matches!(p.permission, Permission::Mirror | Permission::Empty));
+            return self.patterns.iter().any(|p| {
+                matches!(
+                    p.permission,
+                    Permission::Ro | Permission::Rw | Permission::Empty
+                )
+            });
         }
         self.patterns
             .iter()
-            .any(|p| p.permission == Permission::Mirror && self.pattern_reaches(p, host))
+            .any(|p| p.permission.is_mirrored() && self.pattern_reaches(p, host))
             || self.is_empty_prefix(host)
     }
 
@@ -520,9 +566,11 @@ impl PathFilesystem for HostFs {
         if std::fs::metadata(&host).map(|m| m.is_dir()).unwrap_or(true) {
             return Err(libc::EISDIR.into());
         }
-        if flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0 {
-            // The mirror is read-only; the kernel usually rejects writes on
-            // the read-only mount already, but be defensive.
+        let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
+        if write_flags && !self.writable(&host) {
+            // `ro` paths (and anything below an empty or hidden pattern) are
+            // never writable; the real file permissions are checked by the
+            // host filesystem on the actual write.
             return Err(libc::EACCES.into());
         }
         // fh 0 = stateless IO; every read re-opens the host file.
@@ -555,6 +603,40 @@ impl PathFilesystem for HostFs {
         let n = file.read(&mut buf)?;
         buf.truncate(n);
         Ok(ReplyData::from(Bytes::from(buf)))
+    }
+
+    async fn write(
+        &self,
+        _req: fuse3::raw::Request,
+        path: Option<&OsStr>,
+        _fh: u64,
+        offset: u64,
+        data: &[u8],
+        _write_flags: u32,
+        flags: u32,
+    ) -> Result<ReplyWrite> {
+        let Some(p) = path else {
+            return Err(libc::ENOENT.into());
+        };
+        let host = self.host_path(p);
+        if !self.exists(&host) {
+            return Err(libc::ENOENT.into());
+        }
+        if !self.writable(&host) {
+            // The spec must say `rw`; the real file permissions are
+            // enforced by the host filesystem on the open below.
+            return Err(libc::EACCES.into());
+        }
+        // Stateless IO: reopen the host file for every write.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(flags & libc::O_APPEND as u32 != 0)
+            .open(&host)?;
+        if flags & libc::O_APPEND as u32 == 0 {
+            file.seek(SeekFrom::Start(offset))?;
+        }
+        let n = file.write(data)?;
+        Ok(ReplyWrite { written: n as u32 })
     }
     async fn statfs(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyStatFs> {
         // Report the real filesystem holding the mirrored path (or "/" for
@@ -680,12 +762,215 @@ impl PathFilesystem for HostFs {
             }
             return Ok(());
         }
-        // Ask the real filesystem, with the server's real (host) credentials.
+        // W_OK is answered by the spec: only `rw` paths may be written (the
+        // real file permissions are checked when a write is attempted).
+        let non_write = mask & !(libc::W_OK as u32);
+        if mask & libc::W_OK as u32 != 0 && !self.writable(&host) {
+            return Err(libc::EACCES.into());
+        }
+        // The rest (R_OK, X_OK) is decided by the real filesystem, with the
+        // server's real (host) credentials.
+        if non_write == 0 {
+            return Ok(());
+        }
         let cpath = CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
-        if unsafe { libc::access(cpath.as_ptr(), mask as libc::c_int) } != 0 {
+        if unsafe { libc::access(cpath.as_ptr(), non_write as libc::c_int) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
+    }
+
+    async fn setattr(
+        &self,
+        _req: fuse3::raw::Request,
+        path: Option<&OsStr>,
+        _fh: Option<u64>,
+        set_attr: SetAttr,
+    ) -> Result<ReplyAttr> {
+        let Some(p) = path else {
+            return Err(libc::ENOENT.into());
+        };
+        let host = self.host_path(p);
+        if self.is_empty(&host) {
+            // Empty paths are virtual: nothing to change.
+            return Err(libc::EACCES.into());
+        }
+        if !self.exists(&host) {
+            return Err(libc::ENOENT.into());
+        }
+        if !self.writable(&host) {
+            return Err(libc::EACCES.into());
+        }
+        if let Some(size) = set_attr.size {
+            let f = std::fs::OpenOptions::new().write(true).open(&host)?;
+            f.set_len(size)?;
+        }
+        if let Some(mode) = set_attr.mode {
+            std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode))?;
+        }
+        if set_attr.uid.is_some() || set_attr.gid.is_some() {
+            let cpath = cstring_of(&host)?;
+            let uid = set_attr.uid.unwrap_or(u32::MAX);
+            let gid = set_attr.gid.unwrap_or(u32::MAX);
+            if unsafe { libc::lchown(cpath.as_ptr(), uid, gid) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        if set_attr.atime.is_some() || set_attr.mtime.is_some() {
+            let times = [
+                ts_to_timespec(set_attr.atime),
+                ts_to_timespec(set_attr.mtime),
+            ];
+            let cpath = cstring_of(&host)?;
+            if unsafe {
+                libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(ReplyAttr {
+            ttl: TTL,
+            attr: self.attr(&host)?,
+        })
+    }
+
+    async fn mkdir(
+        &self,
+        _req: fuse3::raw::Request,
+        parent: &OsStr,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+    ) -> Result<ReplyEntry> {
+        let host = self.host_path(parent).join(name);
+        if !self.writable(&host) {
+            return Err(libc::EACCES.into());
+        }
+        // Only a *real* entry at the target means EEXIST; a path merely
+        // matched by a wildcard pattern may not exist yet.
+        if std::fs::symlink_metadata(&host).is_ok() {
+            return Err(libc::EEXIST.into());
+        }
+        let cpath = cstring_of(&host)?;
+        if unsafe { libc::mkdir(cpath.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: self.attr(&host)?,
+        })
+    }
+
+    async fn unlink(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
+        let host = self.host_path(parent).join(name);
+        if self.is_empty(&host) {
+            // Empty paths are virtual mount points; they cannot be removed.
+            return Err(libc::EACCES.into());
+        }
+        if !self.exists(&host) {
+            return Err(libc::ENOENT.into());
+        }
+        if !self.writable(&host) {
+            return Err(libc::EACCES.into());
+        }
+        std::fs::remove_file(&host)?;
+        Ok(())
+    }
+
+    async fn rmdir(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
+        let host = self.host_path(parent).join(name);
+        if self.is_empty(&host) {
+            return Err(libc::EACCES.into());
+        }
+        if !self.exists(&host) {
+            return Err(libc::ENOENT.into());
+        }
+        if !self.writable(&host) {
+            return Err(libc::EACCES.into());
+        }
+        std::fs::remove_dir(&host)?;
+        Ok(())
+    }
+
+    async fn rename(
+        &self,
+        _req: fuse3::raw::Request,
+        origin_parent: &OsStr,
+        origin_name: &OsStr,
+        parent: &OsStr,
+        name: &OsStr,
+    ) -> Result<()> {
+        let old = self.host_path(origin_parent).join(origin_name);
+        let new = self.host_path(parent).join(name);
+        if self.is_empty(&old) || self.is_empty(&new) {
+            return Err(libc::EACCES.into());
+        }
+        if !self.exists(&old) {
+            return Err(libc::ENOENT.into());
+        }
+        if !self.writable(&old) || !self.writable(&new) {
+            return Err(libc::EACCES.into());
+        }
+        std::fs::rename(&old, &new)?;
+        Ok(())
+    }
+
+    async fn create(
+        &self,
+        _req: fuse3::raw::Request,
+        parent: &OsStr,
+        name: &OsStr,
+        mode: u32,
+        flags: u32,
+    ) -> Result<ReplyCreated> {
+        let host = self.host_path(parent).join(name);
+        if !self.writable(&host) {
+            return Err(libc::EACCES.into());
+        }
+        // Only a *real* entry at the target means EEXIST; a path merely
+        // matched by a wildcard pattern may not exist yet.
+        if std::fs::symlink_metadata(&host).is_ok() {
+            return Err(libc::EEXIST.into());
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        if flags & libc::O_RDWR as u32 != 0 {
+            opts.read(true);
+        }
+        if flags & libc::O_APPEND as u32 != 0 {
+            opts.append(true);
+        }
+        let file = opts.mode(mode & 0o7777).open(&host)?;
+        let attr = attr_from_metadata(&file.metadata()?);
+        Ok(ReplyCreated {
+            ttl: TTL,
+            attr,
+            generation: 0,
+            fh: 0,
+            flags: 0,
+        })
+    }
+}
+
+/// A host path as a NUL-terminated C string, for the libc calls.
+fn cstring_of(path: &Path) -> std::io::Result<CString> {
+    CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOENT))
+}
+
+/// Map a fuse3 timestamp to a `utimensat` timespec; `None` means "leave
+/// this time unchanged" (`UTIME_OMIT`).
+fn ts_to_timespec(ts: Option<Timestamp>) -> libc::timespec {
+    match ts {
+        Some(t) => libc::timespec {
+            tv_sec: t.sec,
+            tv_nsec: t.nsec as libc::c_long,
+        },
+        None => libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT as libc::c_long,
+        },
     }
 }
 
@@ -762,7 +1047,9 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let outcome = {
         let mp = mountpoint.clone();
         runtime.block_on(async move {
-            let handle = match mount_with_fallback(&mp, uid, gid, &fs).await {
+            let handle = match mount_with_fallback(&mp, uid, gid, &fs, !fs.has_writable_patterns())
+                .await
+            {
                 Ok(handle) => handle,
                 Err(e) => return Err(e),
             };
@@ -797,19 +1084,21 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
 }
 
 /// Mount the host filesystem, preferring the unprivileged fusermount3 route
-/// and falling back to a direct (root-only) mount.
+/// and falling back to a direct (root-only) mount. The mount is read-only
+/// unless `read_only` is false (some pattern grants write access).
 async fn mount_with_fallback(
     mountpoint: &Path,
     uid: u32,
     gid: u32,
     fs: &HostFs,
+    read_only: bool,
 ) -> std::io::Result<fuse3::raw::MountHandle> {
     let options = || {
         let mut o = MountOptions::default();
         o.uid(uid)
             .gid(gid)
             .rootmode(0o755)
-            .read_only(true)
+            .read_only(read_only)
             .allow_other(false)
             .nonempty(true);
         o
@@ -877,8 +1166,8 @@ mod tests {
     #[test]
     fn empty_paths_take_precedence_over_mirror() {
         let f = fs(&[
-            ("/etc/*", Permission::Mirror),
-            ("/etc", Permission::Mirror),
+            ("/etc/*", Permission::Ro),
+            ("/etc", Permission::Ro),
             ("/etc", Permission::Empty),
         ]);
         assert!(f.is_empty(Path::new("/etc")));
@@ -946,7 +1235,7 @@ mod tests {
         // /dev is empty, /etc/passwd is mirrored normally; siblings of the
         // empty path are listed together with it.
         let f = fs(&[
-            ("/etc/passwd", Permission::Mirror),
+            ("/etc/passwd", Permission::Ro),
             ("/dev", Permission::Empty),
         ]);
         let names: Vec<_> = f
@@ -978,8 +1267,8 @@ mod tests {
     #[test]
     fn pattern_matching_per_operation() {
         let f = fs(&[
-            ("/etc/*.conf", Permission::Mirror),
-            ("/home/me/project", Permission::Mirror),
+            ("/etc/*.conf", Permission::Ro),
+            ("/home/me/project", Permission::Ro),
         ]);
 
         // Direct matches.
@@ -1008,7 +1297,7 @@ mod tests {
 
     #[test]
     fn double_star_spans_directories() {
-        let f = fs(&[("/usr/share/**/*.rs", Permission::Mirror)]);
+        let f = fs(&[("/usr/share/**/*.rs", Permission::Ro)]);
         assert!(f.exists(Path::new("/usr/share")));
         assert!(f.dir_prefix(Path::new("/usr/share/doc")));
         assert!(f.matches(Path::new("/usr/share/doc/x/y.rs")));
@@ -1027,7 +1316,7 @@ mod tests {
         std::fs::create_dir(base.join("d.conf")).unwrap();
         std::fs::write(base.join("d.conf/y"), b"y").unwrap();
 
-        let f = fs(&[(&format!("{}/*.conf", base.display()), Permission::Mirror)]);
+        let f = fs(&[(&format!("{}/*.conf", base.display()), Permission::Ro)]);
 
         // Only matching entries (and entries leading to matches) survive.
         let names: Vec<_> = f
@@ -1043,7 +1332,7 @@ mod tests {
         // An entry that only leads to a match (virtual ancestor) is shown.
         let f = fs(&[(
             &format!("{}/c.conf.dir/x", base.display()),
-            Permission::Mirror,
+            Permission::Ro,
         )]);
         let names: Vec<_> = f
             .dir_entries(&base)
@@ -1058,7 +1347,7 @@ mod tests {
         // entries are visible.
         let f = fs(&[(
             &format!("{}", base.join("c.conf.dir").display()),
-            Permission::Mirror,
+            Permission::Ro,
         )]);
         let names: Vec<_> = f
             .dir_entries(&base.join("c.conf.dir"))
@@ -1094,7 +1383,7 @@ mod tests {
     fn last_matching_pattern_wins() {
         // The later hide hides the file inside the mirrored tree...
         let f = fs(&[
-            ("/etc", Permission::Mirror),
+            ("/etc", Permission::Ro),
             ("/etc/passwd", Permission::Hide),
         ]);
         assert!(f.exists(Path::new("/etc")));
@@ -1106,7 +1395,7 @@ mod tests {
         // but a sibling is visible via the later recursive mirror.
         let f = fs(&[
             ("/etc/passwd", Permission::Hide),
-            ("/etc", Permission::Mirror),
+            ("/etc", Permission::Ro),
         ]);
         assert!(!f.exists(Path::new("/etc/passwd")));
         assert!(f.exists(Path::new("/etc/hosts")));
@@ -1115,8 +1404,8 @@ mod tests {
     #[test]
     fn hidden_directories_hide_their_subtree() {
         let f = fs(&[
-            ("/etc", Permission::Mirror),
-            ("/etc/passwd", Permission::Mirror),
+            ("/etc", Permission::Ro),
+            ("/etc/passwd", Permission::Ro),
             ("/etc", Permission::Hide),
         ]);
         // The hide pattern matches /etc last and shadows everything below.
@@ -1131,7 +1420,7 @@ mod tests {
         std::fs::create_dir_all(base.join("secret")).unwrap();
         let base_str = base.display().to_string();
         let f = fs(&[
-            (&format!("{base_str}/*"), Permission::Mirror),
+            (&format!("{base_str}/*"), Permission::Ro),
             (&format!("{base_str}/secret"), Permission::Hide),
         ]);
         assert!(f.exists(&base.join("foo.conf")));
@@ -1153,5 +1442,69 @@ mod tests {
         let f = fs(&[("/etc/passwd", Permission::Hide)]);
         assert!(!f.exists(Path::new("/")));
         assert!(!f.exists(Path::new("/etc")));
+    }
+
+    #[test]
+    fn write_permission_follows_the_last_pattern() {
+        let f = fs(&[("/etc", Permission::Ro), ("/etc/passwd", Permission::Rw)]);
+        assert_eq!(f.write_permission(Path::new("/etc")), Some(Permission::Ro));
+        assert_eq!(
+            f.write_permission(Path::new("/etc/passwd")),
+            Some(Permission::Rw)
+        );
+        assert!(!f.writable(Path::new("/etc")));
+        assert!(f.writable(Path::new("/etc/passwd")));
+        // The root is never writable.
+        assert!(!f.writable(Path::new("/")));
+    }
+
+    #[test]
+    fn rw_directories_are_recursively_writable() {
+        let f = fs(&[
+            ("/proj", Permission::Rw),
+            ("/proj/secret", Permission::Ro),
+        ]);
+        // Children of an exactly-named rw dir inherit its permission.
+        assert!(f.writable(Path::new("/proj/newfile")));
+        assert!(f.writable(Path::new("/proj/sub/x")));
+        // The nearest mirrored ancestor decides: `ro` wins below /secret.
+        assert!(!f.writable(Path::new("/proj/secret")));
+        assert!(!f.writable(Path::new("/proj/secret/x")));
+    }
+
+    #[test]
+    fn wildcard_rw_patterns_allow_creating_matching_children() {
+        let f = fs(&[("/out/*.txt", Permission::Rw)]);
+        assert!(f.writable(Path::new("/out/a.txt")));
+        assert!(!f.writable(Path::new("/out/a.conf")));
+        // The parent dir itself is only a wildcard ancestor, not writable.
+        assert!(!f.writable(Path::new("/out")));
+    }
+
+    #[test]
+    fn star_star_rw_covers_everything_below() {
+        let f = fs(&[("/work/**", Permission::Rw)]);
+        assert!(f.writable(Path::new("/work")));
+        assert!(f.writable(Path::new("/work/a/b/c")));
+    }
+
+    #[test]
+    fn hide_and_empty_block_writes() {
+        let f = fs(&[
+            ("/a", Permission::Rw),
+            ("/a/h", Permission::Hide),
+            ("/a/e", Permission::Empty),
+        ]);
+        assert!(!f.writable(Path::new("/a/h/x")));
+        assert!(!f.writable(Path::new("/a/e")));
+        assert!(!f.writable(Path::new("/a/e/x")));
+    }
+
+    #[test]
+    fn writable_patterns_are_detected_for_the_mount_options() {
+        assert!(!fs(&[("/etc", Permission::Ro)]).has_writable_patterns());
+        assert!(fs(&[("/etc", Permission::Ro), ("/tmp/x", Permission::Rw)])
+            .has_writable_patterns());
+        assert!(!fs(&[]).has_writable_patterns());
     }
 }

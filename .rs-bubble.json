@@ -10,10 +10,10 @@
   "hostfs": {
     "root": true,
     "patterns": {
-      "/home/bjunglas/workspaces": "mirror",
-      "/lib": "mirror",
-      "/lib64": "mirror",
-      "/bin": "mirror",
+      "/home/bjunglas/workspaces": "rw",
+      "/lib": "ro",
+      "/lib64": "ro",
+      "/bin": "ro",
       "/home/bjunglas/workspaces/**/target": "hide",
       "/dev": "empty",
       "/usr": "empty",

@@ -23,7 +23,7 @@ root, a fresh procfs at `/proc`, and the host network.
   ],
   "proc": "/proc",
   "net": { "isolated": true, "allow": ["example.com:443"] },
-  "hostfs": { "patterns": { "/etc/*.conf": "mirror" } }
+  "hostfs": { "patterns": { "/etc/*.conf": "ro" } }
 }
 ```
 
@@ -53,24 +53,30 @@ root, a fresh procfs at `/proc`, and the host network.
 - `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`.
   Empty or missing means every target is allowed
 - `hostfs.patterns` — an **ordered** mapping from **glob patterns** of
-  absolute host paths to permissions (`"mirror"`, `"hide"` or
-  `"empty"`). Mirrored paths are exposed read-only under **`/host`**:
-  matched paths appear at the same absolute path below `/host`
+  absolute host paths to permissions (`"ro"`, `"rw"`, `"hide"` or
+  `"empty"`). Mirrored paths are exposed under **`/host`**: matched paths
+  appear at the same absolute path below `/host`
   (`/etc/passwd` → `/host/etc/passwd`). A pattern that names a directory
   exactly (`/usr/share/doc`) mirrors that directory **recursively**; `**`
   spans directory levels (`/usr/share/**/*.rs`). Ancestor directories are
   shown so the tree is navigable down to the matched leaves.
   **Order matters**: when a path matches several patterns, the **last**
-  matching pattern decides — e.g. `{"/etc": "mirror", "/etc/passwd":
+  matching pattern decides — e.g. `{"/etc": "ro", "/etc/passwd":
   "hide"}` hides `/etc/passwd`. A hidden directory hides its whole
-  subtree, too. `"empty"` exposes the matched paths **empty**: as an
-  empty, unwritable directory (mode 0555) when the path is (or would be)
-  a directory — or as an **empty file** when the pattern matches a real
-  file. Empty paths take *precedence* over the mirror: nothing below
-  them is visible, and they are shown even when a mirror pattern covers
-  them. Their purpose is to provide mount points for the sandbox's ops
-  (`dev`, `tmpfs`, `proc`, binds) — see the `hostfs.root` mode below.
-  Missing or empty matches nothing.
+  subtree, too. `"ro"` mirrors the matched paths **read-only** (they can
+  be read, and executed when the underlying file has the exec bits);
+  `"rw"` mirrors them **read-write** — content, metadata, creation and
+  deletion are passed through as far as the *real* host file or
+  directory permissions allow, and only if the last pattern naming the
+  path (or its nearest mirrored ancestor) says `"rw"`. `"empty"` exposes
+  the matched paths **empty**: as an empty, unwritable directory (mode
+  0555) when the path is (or would be) a directory — or as an **empty
+  file** when the pattern matches a real file. Empty paths take
+  *precedence* over the mirror: nothing below them is visible, and they
+  are shown even when a mirror pattern covers them. Their purpose is to
+  provide mount points for the sandbox's ops (`dev`, `tmpfs`, `proc`,
+  binds) — see the `hostfs.root` mode below. Missing or empty matches
+  nothing.
 
 Everything on the command line (optionally after a `--` separator) is the
 command to run inside the sandbox:
@@ -97,7 +103,7 @@ Like bwrap, the tool:
 5. Marks the mount tree as a **slave**, so nothing mounted inside
    propagates back to the host.
 6. Creates a fresh **tmpfs** as the sandbox root. (Experimental
-   alternative: with `hostfs.root = true` the read-only FUSE filesystem
+   alternative: with `hostfs.root = true` the FUSE filesystem
    itself becomes the root — see below.)
 7. Applies the filesystem ops (the spec's `proc` and `ops`) **in the
    order they were given** (order matters, exactly like bwrap). Because
@@ -137,8 +143,7 @@ Notes:
 
 - Bind/symlink destinations are created on the tmpfs root as needed. If a
   destination lies inside an earlier bind mount, it must already exist there
-  (creating it would touch the host filesystem, which is read-only inside
-  the namespace).
+  (rs-bubble does not create directories inside a bind mount).
 - The fresh procfs is mounted with `MS_NOSUID|MS_NOEXEC|MS_NODEV`. Unlike
   bwrap, the `/proc/sys`, `/proc/sysrq-trigger`, `/proc/irq` and `/proc/bus`
   "cover" mounts are not applied; the command runs with no capabilities at
@@ -242,17 +247,17 @@ namespace split.
 
 ## The host filesystem at /host
 
-The sandbox always gets a read-only FUSE filesystem mounted at `/host`,
-served by a separate forked rs-bubble process. It mirrors the paths
-selected by the spec's ordered `hostfs.patterns` glob → permission map at
-their absolute host paths:
+The sandbox always gets a FUSE filesystem mounted at `/host`, served by a
+separate forked rs-bubble process. It mirrors the paths selected by the
+spec's ordered `hostfs.patterns` glob → permission map at their absolute
+host paths:
 
 ```json
 {
   "hostfs": {
     "patterns": {
-      "/etc/*.conf": "mirror",
-      "/usr/share/doc": "mirror",
+      "/etc/*.conf": "ro",
+      "/usr/share/doc": "ro",
       "/etc/secret.conf": "hide"
     }
   }
@@ -266,18 +271,25 @@ rs-bubble -- /bin/sh -c 'cat /host/etc/hosts'
 - Patterns are standard globs (`*`, `?`, `[...]`, `**`); they must be
   absolute, and `*` does not cross directory separators (use `**` for
   that). A pattern that names a directory exactly mirrors it with its
-  whole subtree. Each pattern's value is `"mirror"` (the matched paths are
-  mirrored), `"hide"` (they are hidden; a hidden directory hides its
-  whole subtree) or `"empty"` (they are exposed empty — an empty,
-  unwritable directory, or an empty file when the pattern matches a real
-  file). Since this is a JSON object, the patterns are tried in
-  the order they are written and the **last** match wins — put more
-  specific patterns after broader ones, e.g. mirror `/etc` and then hide
-  `/etc/ssh`.
+  whole subtree. Each pattern's value is `"ro"` (the matched paths are
+  mirrored read-only), `"rw"` (they are mirrored read-write — writes,
+  creates and deletes are passed through to the real host file system as
+  far as its permissions allow), `"hide"` (they are hidden; a hidden
+  directory hides its whole subtree) or `"empty"` (they are exposed
+  empty — an empty, unwritable directory, or an empty file when the
+  pattern matches a real file). Since this is a JSON object, the patterns
+  are tried in the order they are written and the **last** match wins —
+  put more specific patterns after broader ones, e.g. mirror `/etc` and
+  then hide `/etc/ssh`.
 - The host tree is **not** crawled at startup: every FUSE operation
   matches the requested path against the patterns on the fly, so a large
   host tree costs nothing and only the accessed paths are touched.
-- The mirror is read-only; writes to `/host` fail.
+- Writes only go through where a pattern says `"rw"`: the last pattern
+  naming the path (or its nearest mirrored ancestor — an exactly-named or
+  `**`-covered directory is a recursive mirror, so its permission governs
+  everything below it) decides, and the **real** host file or directory
+  permissions still apply on top. The mount itself is read-only unless
+  some pattern says `"rw"`.
 
 ### Experimental: the host filesystem as the sandbox root
 
@@ -291,11 +303,11 @@ binds) are mounted **on top of** it:
   "hostfs": {
     "root": true,
     "patterns": {
-      "/bin": "mirror",
-      "/etc": "mirror",
-      "/lib": "mirror",
-      "/lib64": "mirror",
-      "/usr": "mirror",
+      "/bin": "ro",
+      "/etc": "ro",
+      "/lib": "ro",
+      "/lib64": "ro",
+      "/usr": "ro",
       "/dev": "empty",
       "/tmp": "empty",
       "/proc": "empty"
@@ -316,11 +328,11 @@ rs-bubble --spec hostfs-root.json -- /bin/sh
 The `"empty"` entries are exposed by the FUSE filesystem as empty,
 unwritable (mode 0555) directories — pure mount points, taking *precedence*
 over the mirror (nothing below them is visible, and no mirror pattern can
-bring content back). They must exist for every mount point, because the
-read-only FUSE filesystem cannot have directories created on it. The `dev`
-and `tmpfs` mounts (and the fresh procfs) then cover the empty dirs,
+bring content back). They must exist for every mount point, because
+rs-bubble does not create directories on the FUSE filesystem itself. The
+`dev` and `tmpfs` mounts (and the fresh procfs) then cover the empty dirs,
 giving a writable `/dev` and `/tmp` and a sandbox-only `/proc` on top of
-the read-only host view.
+the host view.
 
 ## Requirements
 

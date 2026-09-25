@@ -63,9 +63,9 @@ pub(crate) fn mkdir_p(newroot: &Path, dest: &Path) {
 /// Make sure `dest` exists under `newroot` before mounting something on it.
 ///
 /// On a tmpfs root the directory is simply created (like bwrap). In
-/// hostfs-root mode the FUSE filesystem is read-only, so the directory must
-/// already be provided by the mirror; anything else is a hard error with a
-/// hint.
+/// hostfs-root mode the FUSE filesystem only exposes the mirrored paths, so
+/// the directory must already be provided by the mirror; anything else is
+/// a hard error with a hint.
 fn ensure_dir(newroot: &Path, dest: &Path) {
     if crate::hostfs::root_mode() {
         let full = sandbox_path(newroot, dest);
@@ -73,7 +73,7 @@ fn ensure_dir(newroot: &Path, dest: &Path) {
             Ok(_) => {}
             Err(_) => die(&format!(
                 "Mount point {} does not exist in the hostfs root; \
-                 add a mirror pattern for it (or a parent directory) to hostfs.mirror",
+                 add a ro/rw pattern for it (or a parent directory) to hostfs.patterns",
                 dest.display()
             )),
         }
@@ -451,7 +451,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     // Bind targets must exist; create missing directories on
                     // the tmpfs root (bwrap does the same for its new root).
                     // In hostfs-root mode they must already exist in the
-                    // mirror (the FUSE filesystem is read-only).
+                    // mirror (the FUSE filesystem only exposes mirrored paths).
                     ensure_dir(&newroot, dest);
                     let dest_c = cstring(dest_abs.as_os_str());
                     if libc::mount(
@@ -655,8 +655,8 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                             }
                         } else {
                             let hint = if crate::hostfs::root_mode() {
-                                " (the hostfs root is read-only; the symlink must already \
-                                 exist in a mirrored path)"
+                                " (the hostfs root only exposes mirrored paths; the symlink \
+                                 must already exist in one)"
                             } else {
                                 ""
                             };
