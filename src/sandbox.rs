@@ -149,6 +149,17 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
         }
         check_new_userns(old_userns);
 
+        // Also give the sandbox its own UTS namespace, like bwrap's
+        // --unshare-all: the command then can't see the host's hostname and
+        // domainname (and couldn't change it either way — that needs
+        // CAP_SYS_ADMIN over the owning user namespace). CLONE_NEWUTS takes
+        // effect immediately and needs the same authority as CLONE_NEWUSER,
+        // so this mirrors the netns path, which unshares user|net|uts in one
+        // go in netns::isolated_parent.
+        if libc::unshare(libc::CLONE_NEWUTS) != 0 {
+            die_with_error("Can't unshare UTS namespace");
+        }
+
         // Set up the id mappings in the same order as bwrap: uid_map, then
         // setgroups deny, then gid_map. The setgroups deny is required before
         // gid_map unless the writer has CAP_SETGID in the parent namespace.
@@ -172,7 +183,17 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
     }
 }
 
-/// Unshare a fresh PID namespace and run the sandbox setup + exec there.
+/// Unshare a fresh IPC namespace and then a fresh PID namespace and run the
+/// sandbox setup + exec there.
+///
+/// The IPC namespace is part of bwrap's `--unshare-all`: it gives the sandbox
+/// its own copy of all SysV IPC objects (shared memory segments, semaphores,
+/// message queues) and POSIX message queues, so the command can neither see
+/// nor attach to any host IPC object. `unshare(CLONE_NEWIPC)` takes effect
+/// immediately for the calling process (unlike `CLONE_NEWPID`) and only
+/// requires `CAP_SYS_ADMIN` over the current user namespace, which both
+/// entry points (this one and `netns::isolated_parent`) hold at this point.
+/// Doing it here means both paths get the same isolation.
 ///
 /// `unshare(CLONE_NEWPID)` only takes effect for *later* forks: the calling
 /// process stays in the old PID namespace. Like bwrap (which passes
@@ -188,6 +209,9 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
 /// The parent keeps waiting for the child and forwards its exit status.
 pub(crate) unsafe fn pidns_and_exec(ops: &[Op], command: &[String]) -> ! {
     unsafe {
+        if libc::unshare(libc::CLONE_NEWIPC) != 0 {
+            die_with_error("Can't unshare IPC namespace");
+        }
         if libc::unshare(libc::CLONE_NEWPID) != 0 {
             die_with_error("Can't unshare PID namespace");
         }

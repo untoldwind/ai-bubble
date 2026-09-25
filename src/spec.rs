@@ -250,6 +250,11 @@ pub struct Spec {
     pub net: NetConfig,
     /// The host filesystem mounted at `/host`.
     pub hostfs: HostFsConfig,
+    /// Accepted for editor tooling only: it names the JSON schema
+    /// (`--print-schema`) so the spec file can get completion and
+    /// validation. Never serialized back out.
+    #[serde(rename = "$schema", default, skip_serializing)]
+    pub schema: Option<String>,
 }
 
 impl Spec {
@@ -485,6 +490,17 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected() {
         assert!(serde_json::from_str::<Spec>(r#"{ "nope": true }"#).is_err());
+    }
+
+    #[test]
+    fn schema_key_is_accepted_but_ignored() {
+        let spec = parse(r#"{ "$schema": "./rs-bubble.spec.schema.json", "ops": [] }"#);
+        assert!(spec.ops.is_empty());
+        assert_eq!(spec.schema.as_deref(), Some("./rs-bubble.spec.schema.json"));
+        // It must be advertised in the generated schema (it's a real
+        // field with skip_serializing), so editors accept it.
+        let schema: serde_json::Value = serde_json::from_str(crate::SPEC_SCHEMA).unwrap();
+        assert!(schema["properties"]["$schema"].is_object());
     }
 
     #[test]

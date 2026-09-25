@@ -10,7 +10,7 @@
 //!            listens on 127.0.0.2:3128 (HTTP CONNECT) and forwards the
 //!            child's exit status.
 //!         └─ C — unshares the mount namespace, builds the tmpfs sandbox
-//!                and execs COMMAND in its own PID namespace (see
+//!                and execs COMMAND in its own PID and IPC namespaces (see
 //!                sandbox::pidns_and_exec).
 //!
 //! The network namespace is shared by P and C, so COMMAND can reach the

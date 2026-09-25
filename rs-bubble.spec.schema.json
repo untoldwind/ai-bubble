@@ -4,6 +4,14 @@
   "description": "The whole sandbox specification.",
   "type": "object",
   "properties": {
+    "$schema": {
+      "description": "Accepted for editor tooling only: it names the JSON schema (`--print-schema`) so the spec file can get completion and validation. Never serialized back out.",
+      "writeOnly": true,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "hostfs": {
       "description": "The host filesystem mounted at `/host`.",
       "allOf": [
