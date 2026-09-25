@@ -23,7 +23,7 @@ root, a fresh procfs at `/proc`, and the host network.
   ],
   "proc": "/proc",
   "net": { "isolated": true, "allow": ["example.com:443"] },
-  "hostfs": { "mirror": ["/etc/*.conf"] }
+  "hostfs": { "mirror": { "/etc/*.conf": "mirror" } }
 }
 ```
 
@@ -52,13 +52,18 @@ root, a fresh procfs at `/proc`, and the host network.
   rs-bubble process stays on the host and acts as a **TCP proxy**
 - `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`.
   Empty or missing means every target is allowed
-- `hostfs.mirror` — a list of **glob patterns** of absolute host paths
-  mirrored read-only under **`/host`**: matched paths appear at the same
-  absolute path below `/host` (`/etc/passwd` → `/host/etc/passwd`). A
-  pattern that names a directory exactly (`/usr/share/doc`) mirrors that
-  directory **recursively**; `**` spans directory levels
-  (`/usr/share/**/*.rs`). Ancestor directories are shown so the tree is
-  navigable down to the matched leaves. Missing or empty mirrors nothing.
+- `hostfs.mirror` — an **ordered** mapping from **glob patterns** of
+  absolute host paths to permissions (`"mirror"` or `"hide"`). Mirrored
+  paths are exposed read-only under **`/host`**: matched paths appear at
+  the same absolute path below `/host` (`/etc/passwd` →
+  `/host/etc/passwd`). A pattern that names a directory exactly
+  (`/usr/share/doc`) mirrors that directory **recursively**; `**` spans
+  directory levels (`/usr/share/**/*.rs`). Ancestor directories are shown
+  so the tree is navigable down to the matched leaves. **Order matters**:
+  when a path matches several patterns, the **last** matching pattern
+  decides — e.g. `{"/etc": "mirror", "/etc/passwd": "hide"}` hides
+  `/etc/passwd`. A hidden directory hides its whole subtree, too. Missing
+  or empty mirrors nothing.
 - `hostfs.emptyDirs` — a list of **absolute paths** exposed as **empty,
   unwritable directories** (mode 0555, no contents). They take
   *precedence* over `mirror`: nothing below an entry is visible, and the
@@ -238,12 +243,18 @@ namespace split.
 
 The sandbox always gets a read-only FUSE filesystem mounted at `/host`,
 served by a separate forked rs-bubble process. It mirrors the paths
-selected by the spec's `hostfs.mirror` glob patterns at their absolute
-host paths:
+selected by the spec's ordered `hostfs.mirror` glob → permission map at
+their absolute host paths:
 
 ```json
 {
-  "hostfs": { "mirror": ["/etc/*.conf", "/usr/share/doc"] }
+  "hostfs": {
+    "mirror": {
+      "/etc/*.conf": "mirror",
+      "/usr/share/doc": "mirror",
+      "/etc/secret.conf": "hide"
+    }
+  }
 }
 ```
 
@@ -254,7 +265,12 @@ rs-bubble -- /bin/sh -c 'cat /host/etc/hosts'
 - Patterns are standard globs (`*`, `?`, `[...]`, `**`); they must be
   absolute, and `*` does not cross directory separators (use `**` for
   that). A pattern that names a directory exactly mirrors it with its
-  whole subtree.
+  whole subtree. Each pattern's value is `"mirror"` (the matched paths are
+  mirrored) or `"hide"` (they are hidden); a hidden directory hides its
+  whole subtree. Since this is a JSON object, the patterns are tried in
+  the order they are written and the **last** match wins — put more
+  specific patterns after broader ones, e.g. mirror `/etc` and then hide
+  `/etc/ssh`.
 - The host tree is **not** crawled at startup: every FUSE operation
   matches the requested path against the patterns on the fly, so a large
   host tree costs nothing and only the accessed paths are touched.
@@ -271,7 +287,13 @@ binds) are mounted **on top of** it:
 {
   "hostfs": {
     "root": true,
-    "mirror": ["/bin", "/etc", "/lib", "/lib64", "/usr"],
+    "mirror": {
+      "/bin": "mirror",
+      "/etc": "mirror",
+      "/lib": "mirror",
+      "/lib64": "mirror",
+      "/usr": "mirror"
+    },
     "emptyDirs": ["/dev", "/tmp", "/proc"]
   },
   "ops": [

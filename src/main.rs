@@ -26,7 +26,7 @@ mod proxy;
 mod sandbox;
 mod spec;
 
-/// The JSON Schema for the spec file, generated from `src/spec.rs` by
+/// The JSON Schema for the spec file, generated from `src/spec/mod.rs` by
 /// `build.rs` at compile time. Printed by `--print-schema`; point an
 /// editor (e.g. VS Code's `json.schemas`) at it to get completion and
 /// validation for `.rs-bubble.json`.

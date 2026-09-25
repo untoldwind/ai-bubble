@@ -59,11 +59,10 @@
           }
         },
         "mirror": {
-          "description": "Glob patterns (absolute host paths) mirrored under `/host`. Matched paths appear at the same absolute path below `/host` (`/etc/passwd` → `/host/etc/passwd`); matched directories are mirrored recursively. Empty mirrors nothing.",
-          "default": [],
-          "type": "array",
-          "items": {
-            "type": "string"
+          "description": "An ordered mapping from glob patterns (absolute host paths) to permissions: matched paths are mirrored read-only under `/host` (`\"mirror\"`) or hidden (`\"hide\"`). Order matters — when a path matches several patterns, the **last** matching pattern decides. Matched paths appear at the same absolute path below `/host` (`/etc/passwd` → `/host/etc/passwd`); matched directories are mirrored recursively (or, when hidden, disappear with their whole subtree). Empty mirrors nothing.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/Permission"
           }
         },
         "root": {
@@ -228,6 +227,25 @@
               ]
             }
           }
+        }
+      ]
+    },
+    "Permission": {
+      "description": "What happens to a path matched by a `hostfs.mirror` glob pattern: it is mirrored (and readable) under `/host`, or hidden.",
+      "oneOf": [
+        {
+          "description": "The matched paths are mirrored under `/host` (read-only).",
+          "type": "string",
+          "enum": [
+            "mirror"
+          ]
+        },
+        {
+          "description": "The matched paths are hidden. A hidden **directory** hides its whole subtree, too.",
+          "type": "string",
+          "enum": [
+            "hide"
+          ]
         }
       ]
     }

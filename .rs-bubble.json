@@ -9,12 +9,13 @@
   ],
   "hostfs": {
     "root": true,
-    "mirror": [
-      "/home/bjunglas/workspaces",
-      "/lib",
-      "/lib64",
-      "/bin"
-    ],
+    "mirror": {
+      "/home/bjunglas/workspaces": "mirror",
+      "/lib": "mirror",
+      "/lib64": "mirror",
+      "/bin": "mirror",
+      "/home/bjunglas/workspaces/**/target": "hide"
+    },
     "emptyDirs": [
       "/dev",
       "/usr",

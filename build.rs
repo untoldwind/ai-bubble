@@ -1,6 +1,6 @@
 //! Build-time JSON-schema generation for the sandbox spec file.
 //!
-//! The build script compiles `src/spec.rs` itself (with stand-ins for the
+//! The build script compiles `src/spec/mod.rs` itself (with stand-ins for the
 //! pieces the main crate provides, like `crate::sandbox::die`) and uses
 //! `schemars` to derive a JSON Schema for `Spec`, honoring the serde
 //! attributes. The result is written to `OUT_DIR/rs-bubble-schema.json`,
@@ -13,7 +13,7 @@
 //! Because the schema is generated from the very same source file that
 //! does the deserialization, it can never drift from what the program
 //! actually accepts (the hand-written `TmpfsPerms` deserializer is
-//! described manually in `spec.rs`).
+//! described manually in `spec/mod.rs` and its submodules).
 
 mod sandbox {
     /// Stand-in for the main crate's `sandbox::die`: the schema generation
@@ -24,12 +24,16 @@ mod sandbox {
     }
 }
 
-#[path = "src/spec.rs"]
+#[path = "src/spec/mod.rs"]
 #[allow(dead_code)] // the main crate uses these; the schema generation only needs the types
 mod spec;
 
 fn main() {
-    println!("cargo:rerun-if-changed=src/spec.rs");
+    println!("cargo:rerun-if-changed=src/spec/mod.rs");
+    println!("cargo:rerun-if-changed=src/spec/op.rs");
+    println!("cargo:rerun-if-changed=src/spec/tmpfs.rs");
+    println!("cargo:rerun-if-changed=src/spec/net.rs");
+    println!("cargo:rerun-if-changed=src/spec/hostfs.rs");
 
     let mut schema = schemars::r#gen::SchemaSettings::draft07()
         .into_generator()
