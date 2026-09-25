@@ -32,84 +32,37 @@ pub struct Cli {
     pub command: Vec<String>,
 }
 
-impl Cli {
-    /// Parse the argument list (without argv[0]).
-    ///
-    /// Errors are returned instead of exiting so that tests don't kill the
-    /// harness; `main` turns them into the usual diagnostic + exit.
-    pub fn parse_args<I>(argv: I) -> Result<Cli, String>
-    where
-        I: IntoIterator,
-        I::Item: Into<String>,
-    {
-        let argv: Vec<String> = argv.into_iter().map(Into::into).collect();
-        let rest = protect_command(&argv);
-        Cli::try_parse_from(std::iter::once("rs-bubble".to_string()).chain(rest))
-            .map_err(|e| e.to_string())
-    }
-}
-
-/// Options that take a value (the value must not be mistaken for the start
-/// of the command).
-const VALUE_OPTIONS: [&str; 1] = ["--spec"];
-
-/// Everything from the first bare argument (or from `--`) is the command;
-/// guard it behind a `--` so its own flags (e.g. `ls -l`) pass through
-/// verbatim instead of being mistaken for rs-bubble options.
-fn protect_command(argv: &[String]) -> Vec<String> {
-    let mut i = 0;
-    while i < argv.len() {
-        let a = &argv[i];
-        if a == "--" {
-            return argv.to_vec();
-        }
-        if !a.starts_with('-') || a.len() == 1 {
-            let mut rest = argv[..i].to_vec();
-            rest.push("--".into());
-            rest.extend(argv[i..].iter().cloned());
-            return rest;
-        }
-        // Skip a value-taking option's value so it stays attached.
-        i += if VALUE_OPTIONS.contains(&a.as_str()) {
-            2
-        } else {
-            1
-        };
-    }
-    argv.to_vec()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Cli {
-        Cli::parse_args(args.iter().map(|s| s.to_string())).unwrap()
+        Cli::parse_from(args.iter().map(|s| s.to_string()))
     }
 
     #[test]
     fn spec_and_command() {
-        let cli = parse(&["--spec", "s.json", "--", "sh", "-c", "echo hi"]);
+        let cli = parse(&["rs-bubble", "--spec", "s.json", "--", "sh", "-c", "echo hi"]);
         assert_eq!(cli.spec.as_deref(), Some(std::path::Path::new("s.json")));
         assert_eq!(cli.command, ["sh", "-c", "echo hi"]);
     }
 
     #[test]
     fn no_spec_option() {
-        let cli = parse(&["sh", "-c", "echo hi"]);
+        let cli = parse(&["rs-bubble", "sh", "-c", "echo hi"]);
         assert_eq!(cli.spec, None);
         assert_eq!(cli.command, ["sh", "-c", "echo hi"]);
     }
 
     #[test]
     fn command_flags_pass_through() {
-        let cli = parse(&["ls", "-l", "--color"]);
+        let cli = parse(&["rs-bubble", "ls", "-l", "--color"]);
         assert_eq!(cli.command, ["ls", "-l", "--color"]);
     }
 
     #[test]
     fn spec_before_bare_command() {
-        let cli = parse(&["--spec", "other.json", "sh"]);
+        let cli = parse(&["rs-bubble", "--spec", "other.json", "sh"]);
         assert_eq!(
             cli.spec.as_deref(),
             Some(std::path::Path::new("other.json"))
@@ -119,13 +72,17 @@ mod tests {
 
     #[test]
     fn spec_without_value_is_an_error() {
-        let err = Cli::parse_args(["--spec"]).unwrap_err();
+        let err = Cli::try_parse_from(["rs-bubble", "--spec"])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--spec"), "{err}");
     }
 
     #[test]
     fn unknown_option_is_an_error() {
-        let err = Cli::parse_args(["--bind", "/usr", "/usr", "sh"]).unwrap_err();
+        let err = Cli::try_parse_from(["rs-bubble", "--bind", "/usr", "/usr", "sh"])
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("unexpected") || err.contains("--bind"),
             "{err}"

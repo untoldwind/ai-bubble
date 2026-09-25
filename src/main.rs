@@ -17,6 +17,8 @@
 //!   a Unix socket and the in-sandbox HTTP CONNECT proxy. No namespace or
 //!   process management.
 
+use clap::Parser;
+
 mod cli;
 mod hostfs;
 mod netns;
@@ -25,10 +27,7 @@ mod sandbox;
 mod spec;
 
 fn main() {
-    let args = match cli::Cli::parse_args(std::env::args().skip(1)) {
-        Ok(args) => args,
-        Err(e) => sandbox::die(&e),
-    };
+    let args = cli::Cli::parse();
 
     let command = args.command.clone();
     if command.is_empty() {
