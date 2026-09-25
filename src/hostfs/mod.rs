@@ -42,11 +42,16 @@
 //! is a recursive mirror, so its permission governs everything below it)
 //! says `"rw"`, **and** the real host filesystem allows the operation. The
 //! FUSE mount is mounted read-only unless some pattern says `"rw"`.
+//!
+//! The FUSE handlers are async: the pure pattern matching runs inline, but
+//! every blocking host operation (std::fs, raw libc calls) is pushed to
+//! tokio's blocking pool (`tokio::fs` / `spawn_blocking`), so a slow read
+//! or a hung network filesystem never stalls the mount's event loop.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::SeekFrom;
 use std::num::NonZeroU32;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, SystemTime};
@@ -59,6 +64,9 @@ use fuse3::path::reply::{
 use fuse3::path::{PathFilesystem, Session};
 use fuse3::{FileType, MountOptions, Result, SetAttr, Timestamp};
 use futures_util::stream;
+
+use tokio::fs as tokio_fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::sandbox::die_with_error;
 use crate::spec::hostfs::{Patterns, Permission};
@@ -339,19 +347,21 @@ impl HostFs {
         attr
     }
 
-    /// The `lstat`-style attribute of a mirrored path, or ENOENT.
-    fn attr(&self, host: &Path) -> std::io::Result<FileAttr> {
+    /// The `lstat`-style attribute of a mirrored path, or ENOENT. Async: it
+    /// stats the real host filesystem (`tokio::fs` runs the syscall on
+    /// tokio's blocking pool) and must never run on the FUSE event loop.
+    async fn attr(&self, host: &Path) -> std::io::Result<FileAttr> {
         // Empty paths take precedence: they appear even when the real host
         // path exists (with different attributes) — as an empty directory
         // when the path is (or would be) a directory, as an empty file
         // when it matches a real file.
         if self.is_empty(host) {
-            return match std::fs::symlink_metadata(host) {
+            return match tokio_fs::symlink_metadata(host).await {
                 Ok(md) if !md.is_dir() => Ok(Self::empty_file_attr(&md)),
                 _ => Ok(self.empty_dir_attr()),
             };
         }
-        match std::fs::symlink_metadata(host) {
+        match tokio_fs::symlink_metadata(host).await {
             Ok(md) => Ok(attr_from_metadata(&md)),
             // A purely virtual ancestor of an empty path has no real
             // counterpart; present it as a directory.
@@ -362,16 +372,17 @@ impl HostFs {
         }
     }
 
-    /// Whether the host path refers to a real directory (following
-    /// symlinks); used by opendir/readdir to reject files.
-    fn is_real_dir(&self, host: &Path) -> bool {
-        std::fs::metadata(host).map(|m| m.is_dir()).unwrap_or(false)
-    }
-
     /// Whether the host path is a listable directory: a real one, an empty
-    /// path, or a purely virtual ancestor of an empty path.
-    fn is_listable_dir(&self, host: &Path) -> bool {
-        self.is_real_dir(host) || self.is_empty(host) || self.is_empty_prefix(host)
+    /// path, or a purely virtual ancestor of an empty path. Async: it
+    /// stats the real host filesystem (`tokio::fs`).
+    async fn is_listable_dir(&self, host: &Path) -> bool {
+        if self.is_empty(host) || self.is_empty_prefix(host) {
+            return true;
+        }
+        tokio_fs::metadata(host)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
     }
 
     /// The visible entries of a mirrored directory, sorted by name: every
@@ -379,28 +390,32 @@ impl HostFs {
     /// match) — and, when the directory is itself matched by a pattern, all
     /// of its real entries. Everything below an empty path is shadowed by
     /// its precedence; empty paths that live directly under the directory
-    /// are always shown.
-    fn dir_entries(&self, host: &Path) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
+    /// are always shown. Async: it reads and stats the real host
+    /// directory (`tokio::fs`).
+    async fn dir_entries(&self, host: &Path) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
         // A directory named by a mirrored pattern itself is a recursive
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
         let unfiltered = self.matches(host);
-        let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(host) {
-            Ok(entries) => entries
-                .flatten()
-                .map(|e| e.file_name())
-                .filter(|name| {
-                    let child = host.join(name);
+        let mut names: Vec<std::ffi::OsString> = match tokio_fs::read_dir(host).await {
+            Ok(mut entries) => {
+                let mut names = Vec::new();
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let name = entry.file_name();
+                    let child = host.join(&name);
                     // Empty-path precedence: nothing below an empty path is
                     // visible, not even a mirror match. Denied entries (and
                     // everything below a hidden directory) are hidden even
                     // inside a recursively mirrored directory.
                     if self.under_empty(&child) || self.hidden(&child) {
-                        return false;
+                        continue;
                     }
-                    unfiltered || self.exists(&child)
-                })
-                .collect(),
+                    if unfiltered || self.exists(&child) {
+                        names.push(name);
+                    }
+                }
+                names
+            }
             Err(_) => Vec::new(),
         };
         // Empty-path entries living directly under this directory (also
@@ -419,13 +434,12 @@ impl HostFs {
             }
         }
         names.sort();
-        names
-            .into_iter()
-            .map(|name| {
-                let child = host.join(&name);
-                (name, self.attr(&child))
-            })
-            .collect()
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            let child = host.join(&name);
+            entries.push((name, self.attr(&child).await));
+        }
+        entries
     }
 }
 
@@ -511,10 +525,8 @@ impl PathFilesystem for HostFs {
         // root directory itself.
         let host = self.host_path(parent).join(name);
         if self.exists(&host) {
-            return Ok(ReplyEntry {
-                ttl: TTL,
-                attr: self.attr(&host)?,
-            });
+            let attr = self.attr(&host).await?;
+            return Ok(ReplyEntry { ttl: TTL, attr });
         }
         Err(libc::ENOENT.into())
     }
@@ -534,10 +546,8 @@ impl PathFilesystem for HostFs {
             Some(p) => {
                 let host = self.host_path(p);
                 if self.exists(&host) {
-                    return Ok(ReplyAttr {
-                        ttl: TTL,
-                        attr: self.attr(&host)?,
-                    });
+                    let attr = self.attr(&host).await?;
+                    return Ok(ReplyAttr { ttl: TTL, attr });
                 }
                 Err(libc::ENOENT.into())
             }
@@ -550,7 +560,7 @@ impl PathFilesystem for HostFs {
         if !self.exists(&host) {
             return Err(libc::ENOENT.into());
         }
-        let target = std::fs::read_link(&host)?;
+        let target = tokio_fs::read_link(&host).await?;
         Ok(ReplyData::from(Bytes::copy_from_slice(
             target.as_os_str().as_encoded_bytes(),
         )))
@@ -563,7 +573,13 @@ impl PathFilesystem for HostFs {
         if !self.exists(&host) {
             return Err(libc::ENOENT.into());
         }
-        if std::fs::metadata(&host).map(|m| m.is_dir()).unwrap_or(true) {
+        // The path is visible through the mirror; only real files are
+        // openable (a directory that merely leads to a match is not).
+        if tokio_fs::metadata(&host)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(true)
+        {
             return Err(libc::EISDIR.into());
         }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
@@ -597,10 +613,11 @@ impl PathFilesystem for HostFs {
         if self.is_empty(&host) {
             return Ok(ReplyData::from(Bytes::new()));
         }
-        let mut file = std::fs::File::open(&host)?;
-        file.seek(SeekFrom::Start(offset))?;
+        // Stateless IO: reopen the host file for every read.
+        let mut file = tokio_fs::File::open(&host).await?;
+        file.seek(SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; size as usize];
-        let n = file.read(&mut buf)?;
+        let n = file.read(&mut buf).await?;
         buf.truncate(n);
         Ok(ReplyData::from(Bytes::from(buf)))
     }
@@ -628,14 +645,16 @@ impl PathFilesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         // Stateless IO: reopen the host file for every write.
-        let mut file = std::fs::OpenOptions::new()
+        let append = flags & libc::O_APPEND as u32 != 0;
+        let mut file = tokio_fs::OpenOptions::new()
             .write(true)
-            .append(flags & libc::O_APPEND as u32 != 0)
-            .open(&host)?;
-        if flags & libc::O_APPEND as u32 == 0 {
-            file.seek(SeekFrom::Start(offset))?;
+            .append(append)
+            .open(&host)
+            .await?;
+        if !append {
+            file.seek(SeekFrom::Start(offset)).await?;
         }
-        let n = file.write(data)?;
+        let n = file.write(data).await?;
         Ok(ReplyWrite { written: n as u32 })
     }
     async fn statfs(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyStatFs> {
@@ -647,21 +666,28 @@ impl PathFilesystem for HostFs {
             self.host_path(path)
         };
         let cpath = CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
-        let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut vfs) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(ReplyStatFs {
-            blocks: vfs.f_blocks,
-            bfree: vfs.f_bfree,
-            bavail: vfs.f_bavail,
-            files: vfs.f_files,
-            ffree: vfs.f_ffree,
-            bsize: vfs.f_bsize as u32,
-            namelen: vfs.f_namemax as u32,
-            frsize: vfs.f_frsize as u32,
+        // errno is per-thread: capture the error on the blocking thread.
+        blocking(move || {
+            let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(cpath.as_ptr(), &mut vfs) } != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(vfs)
+            }
         })
+        .await
+        .map(|vfs| {
+            Ok(ReplyStatFs {
+                blocks: vfs.f_blocks,
+                bfree: vfs.f_bfree,
+                bavail: vfs.f_bavail,
+                files: vfs.f_files,
+                ffree: vfs.f_ffree,
+                bsize: vfs.f_bsize as u32,
+                namelen: vfs.f_namemax as u32,
+                frsize: vfs.f_frsize as u32,
+            })
+        })?
     }
 
     async fn opendir(
@@ -671,7 +697,7 @@ impl PathFilesystem for HostFs {
         _flags: u32,
     ) -> Result<ReplyOpen> {
         let host = self.host_path(path);
-        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host) {
+        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host).await {
             return Err(libc::ENOENT.into());
         }
         Ok(ReplyOpen { fh: 0, flags: 0 })
@@ -686,12 +712,10 @@ impl PathFilesystem for HostFs {
     ) -> Result<ReplyDirectory<impl futures_util::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
         let host = self.host_path(path);
-        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host) {
+        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host).await {
             return Err(libc::ENOENT.into());
         }
-        let entries: Vec<_> = self
-            .dir_entries(&host)
-            .into_iter()
+        let entries: Vec<_> = self.dir_entries(&host).await.into_iter()
             .skip(offset.max(0) as usize)
             .enumerate()
             .map(|(i, (name, attr))| {
@@ -720,12 +744,10 @@ impl PathFilesystem for HostFs {
         >,
     > {
         let host = self.host_path(path);
-        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host) {
+        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host).await {
             return Err(libc::ENOENT.into());
         }
-        let entries: Vec<_> = self
-            .dir_entries(&host)
-            .into_iter()
+        let entries: Vec<_> = self.dir_entries(&host).await.into_iter()
             .skip(offset as usize)
             .enumerate()
             .map(|(i, (name, attr))| {
@@ -755,7 +777,8 @@ impl PathFilesystem for HostFs {
         // Empty paths (and purely virtual ancestors) are unwritable by
         // definition; answer directly instead of asking the real filesystem.
         if self.is_empty(&host)
-            || self.is_empty_prefix(&host) && std::fs::symlink_metadata(&host).is_err()
+            || self.is_empty_prefix(&host)
+                && tokio_fs::symlink_metadata(&host).await.is_err()
         {
             if mask & libc::W_OK as u32 != 0 {
                 return Err(libc::EACCES.into());
@@ -774,9 +797,16 @@ impl PathFilesystem for HostFs {
             return Ok(());
         }
         let cpath = CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
-        if unsafe { libc::access(cpath.as_ptr(), non_write as libc::c_int) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        // errno is per-thread: capture the error on the blocking thread.
+        blocking(move || {
+            if unsafe { libc::access(cpath.as_ptr(), non_write as libc::c_int) } != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .map_err(fuse3::Errno::from)?;
         Ok(())
     }
 
@@ -802,19 +832,26 @@ impl PathFilesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         if let Some(size) = set_attr.size {
-            let f = std::fs::OpenOptions::new().write(true).open(&host)?;
-            f.set_len(size)?;
+            let f = tokio_fs::OpenOptions::new().write(true).open(&host).await?;
+            f.set_len(size).await?;
         }
         if let Some(mode) = set_attr.mode {
-            std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode))?;
+            let perms = std::fs::Permissions::from_mode(mode);
+            tokio_fs::set_permissions(&host, perms).await?;
         }
         if set_attr.uid.is_some() || set_attr.gid.is_some() {
             let cpath = cstring_of(&host)?;
             let uid = set_attr.uid.unwrap_or(u32::MAX);
             let gid = set_attr.gid.unwrap_or(u32::MAX);
-            if unsafe { libc::lchown(cpath.as_ptr(), uid, gid) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
+            // errno is per-thread: capture the error on the blocking thread.
+            blocking(move || {
+                if unsafe { libc::lchown(cpath.as_ptr(), uid, gid) } != 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            })
+            .await?;
         }
         if set_attr.atime.is_some() || set_attr.mtime.is_some() {
             let times = [
@@ -822,17 +859,21 @@ impl PathFilesystem for HostFs {
                 ts_to_timespec(set_attr.mtime),
             ];
             let cpath = cstring_of(&host)?;
-            if unsafe {
-                libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
+            // errno is per-thread: capture the error on the blocking thread.
+            blocking(move || {
+                if unsafe {
+                    libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+                } != 0
+                {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            })
+            .await?;
         }
-        Ok(ReplyAttr {
-            ttl: TTL,
-            attr: self.attr(&host)?,
-        })
+        let attr = self.attr(&host).await?;
+        Ok(ReplyAttr { ttl: TTL, attr })
     }
 
     async fn mkdir(
@@ -849,16 +890,24 @@ impl PathFilesystem for HostFs {
         }
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet.
-        if std::fs::symlink_metadata(&host).is_ok() {
+        if tokio_fs::symlink_metadata(&host).await.is_ok() {
             return Err(libc::EEXIST.into());
         }
+        // errno is per-thread: capture the error on the blocking thread.
         let cpath = cstring_of(&host)?;
-        if unsafe { libc::mkdir(cpath.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        blocking(move || {
+            if unsafe { libc::mkdir(cpath.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .map_err(fuse3::Errno::from)?;
+        let attr = self.attr(&host).await?;
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: self.attr(&host)?,
+            attr,
         })
     }
 
@@ -874,11 +923,9 @@ impl PathFilesystem for HostFs {
         if !self.writable(&host) {
             return Err(libc::EACCES.into());
         }
-        std::fs::remove_file(&host)?;
+        tokio_fs::remove_file(&host).await?;
         Ok(())
-    }
-
-    async fn rmdir(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
+    }    async fn rmdir(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
         let host = self.host_path(parent).join(name);
         if self.is_empty(&host) {
             return Err(libc::EACCES.into());
@@ -889,7 +936,7 @@ impl PathFilesystem for HostFs {
         if !self.writable(&host) {
             return Err(libc::EACCES.into());
         }
-        std::fs::remove_dir(&host)?;
+        tokio_fs::remove_dir(&host).await?;
         Ok(())
     }
 
@@ -912,7 +959,7 @@ impl PathFilesystem for HostFs {
         if !self.writable(&old) || !self.writable(&new) {
             return Err(libc::EACCES.into());
         }
-        std::fs::rename(&old, &new)?;
+        tokio_fs::rename(&old, &new).await?;
         Ok(())
     }
 
@@ -930,10 +977,10 @@ impl PathFilesystem for HostFs {
         }
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet.
-        if std::fs::symlink_metadata(&host).is_ok() {
+        if tokio_fs::symlink_metadata(&host).await.is_ok() {
             return Err(libc::EEXIST.into());
         }
-        let mut opts = std::fs::OpenOptions::new();
+        let mut opts = tokio_fs::OpenOptions::new();
         opts.write(true).create_new(true);
         if flags & libc::O_RDWR as u32 != 0 {
             opts.read(true);
@@ -941,8 +988,9 @@ impl PathFilesystem for HostFs {
         if flags & libc::O_APPEND as u32 != 0 {
             opts.append(true);
         }
-        let file = opts.mode(mode & 0o7777).open(&host)?;
-        let attr = attr_from_metadata(&file.metadata()?);
+        let file = opts.mode(mode & 0o7777).open(&host).await?;
+        let md = file.metadata().await?;
+        let attr = attr_from_metadata(&md);
         Ok(ReplyCreated {
             ttl: TTL,
             attr,
@@ -1123,6 +1171,21 @@ fn die(msg: &str) -> ! {
     crate::sandbox::die(msg)
 }
 
+/// Run a raw libc call (which has no tokio wrapper) on tokio's blocking
+/// pool, so the FUSE session's event loop is never stalled by host IO. The
+/// `HostFs` itself is cloned in: it holds only the compiled patterns, so
+/// cloning is cheap. Everything that has a `tokio::fs` equivalent uses
+/// that directly instead.
+async fn blocking<T, F>(f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .expect("blocking hostfs task panicked")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1141,6 +1204,17 @@ mod tests {
         fs(entries)
     }
 
+    /// The async HostFs methods (`attr`, `dir_entries`, …) run their host
+    /// syscalls via `tokio::fs` on the blocking pool; the synchronous tests
+    /// await them on a throwaway current-thread runtime.
+    fn block<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
     #[test]
     fn empty_paths_are_virtual_unwritable_directories() {
         let f = fs_with_empties(&[("/dev", Permission::Empty)]);
@@ -1148,10 +1222,10 @@ mod tests {
         // The dir itself exists, with no write permission...
         assert!(f.exists(Path::new("/dev")));
         assert!(f.is_empty(Path::new("/dev")));
-        assert_eq!(f.attr(Path::new("/dev")).unwrap().perm, 0o555);
-        assert_eq!(f.attr(Path::new("/dev")).unwrap().kind, FileType::Directory);
+        assert_eq!(block(f.attr(Path::new("/dev"))).unwrap().perm, 0o555);
+        assert_eq!(block(f.attr(Path::new("/dev"))).unwrap().kind, FileType::Directory);
         // ...and it is empty even though the real host /dev has entries.
-        assert!(f.dir_entries(Path::new("/dev")).is_empty());
+        assert!(block(f.dir_entries(Path::new("/dev"))).is_empty());
         // Deeper paths are shadowed by the precedence.
         assert!(!f.exists(Path::new("/dev/null")));
         assert!(!f.matches(Path::new("/dev/null")));
@@ -1173,10 +1247,9 @@ mod tests {
         assert!(f.is_empty(Path::new("/etc")));
         // Mirror contents below the empty dir are hidden.
         assert!(!f.exists(Path::new("/etc/passwd")));
-        assert!(f.dir_entries(Path::new("/etc")).is_empty());
+        assert!(block(f.dir_entries(Path::new("/etc"))).is_empty());
         // But /etc still appears at the root listing.
-        let names: Vec<_> = f
-            .dir_entries(Path::new("/"))
+        let names: Vec<_> = block(f.dir_entries(Path::new("/")))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect();
@@ -1195,14 +1268,14 @@ mod tests {
 
         let f = fs(&[(&format!("{}/*", base.display()), Permission::Empty)]);
         // The real file is shown empty.
-        let file = f.attr(&base.join("f.txt")).unwrap();
+        let file = block(f.attr(&base.join("f.txt"))).unwrap();
         assert_eq!(file.kind, FileType::RegularFile);
         assert_eq!(file.size, 0);
         // The real directory is shown as an empty directory.
-        let dir = f.attr(&base.join("d")).unwrap();
+        let dir = block(f.attr(&base.join("d"))).unwrap();
         assert_eq!(dir.kind, FileType::Directory);
         assert_eq!(dir.perm, 0o555);
-        assert!(f.dir_entries(&base.join("d")).is_empty());
+        assert!(block(f.dir_entries(&base.join("d"))).is_empty());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -1216,14 +1289,12 @@ mod tests {
         assert!(!f.exists(Path::new("/var/tmp/other")));
         assert!(!f.exists(Path::new("/var/etc")));
         // The root listing contains both levels of the chain.
-        let root: Vec<_> = f
-            .dir_entries(Path::new("/"))
+        let root: Vec<_> = block(f.dir_entries(Path::new("/")))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect();
         assert_eq!(root, ["var"]);
-        let var: Vec<_> = f
-            .dir_entries(Path::new("/var"))
+        let var: Vec<_> = block(f.dir_entries(Path::new("/var")))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect();
@@ -1238,8 +1309,7 @@ mod tests {
             ("/etc/passwd", Permission::Ro),
             ("/dev", Permission::Empty),
         ]);
-        let names: Vec<_> = f
-            .dir_entries(Path::new("/"))
+        let names: Vec<_> = block(f.dir_entries(Path::new("/")))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect();
@@ -1319,8 +1389,7 @@ mod tests {
         let f = fs(&[(&format!("{}/*.conf", base.display()), Permission::Ro)]);
 
         // Only matching entries (and entries leading to matches) survive.
-        let names: Vec<_> = f
-            .dir_entries(&base)
+        let names: Vec<_> = block(f.dir_entries(&base))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect();
@@ -1334,8 +1403,7 @@ mod tests {
             &format!("{}/c.conf.dir/x", base.display()),
             Permission::Ro,
         )]);
-        let names: Vec<_> = f
-            .dir_entries(&base)
+        let names: Vec<_> = block(f.dir_entries(&base))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect();
@@ -1349,8 +1417,7 @@ mod tests {
             &format!("{}", base.join("c.conf.dir").display()),
             Permission::Ro,
         )]);
-        let names: Vec<_> = f
-            .dir_entries(&base.join("c.conf.dir"))
+        let names: Vec<_> = block(f.dir_entries(&base.join("c.conf.dir")))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect();
@@ -1363,7 +1430,7 @@ mod tests {
     fn empty_mirror_matches_nothing() {
         let f = fs(&[]);
         assert!(!f.exists(Path::new("/")));
-        assert!(f.dir_entries(Path::new("/")).is_empty());
+        assert!(block(f.dir_entries(Path::new("/"))).is_empty());
     }
 
     #[test]
@@ -1371,7 +1438,7 @@ mod tests {
         let f = fs_with_empties(&[("/dev", Permission::Empty)]);
         assert!(f.exists(Path::new("/")));
         assert_eq!(
-            f.dir_entries(Path::new("/"))
+            block(f.dir_entries(Path::new("/")))
                 .into_iter()
                 .map(|(n, _)| n.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
@@ -1411,7 +1478,7 @@ mod tests {
         // The hide pattern matches /etc last and shadows everything below.
         assert!(!f.exists(Path::new("/etc")));
         assert!(!f.exists(Path::new("/etc/passwd")));
-        assert!(f.dir_entries(Path::new("/")).is_empty());
+        assert!(block(f.dir_entries(Path::new("/"))).is_empty());
         // Siblings are unaffected; the hide is scoped to /etc.
         let base =
             std::env::temp_dir().join(format!("rs-bubble-hostfs-hide-test-{}", std::process::id()));
@@ -1427,8 +1494,7 @@ mod tests {
         assert!(!f.exists(&base.join("secret")));
         // The parent stays navigable for the still-mirrored matches.
         assert!(f.exists(&base));
-        let names: Vec<_> = f
-            .dir_entries(&base)
+        let names: Vec<_> = block(f.dir_entries(&base))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect();
