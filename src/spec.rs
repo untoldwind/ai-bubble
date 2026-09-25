@@ -104,11 +104,11 @@ impl schemars::JsonSchema for TmpfsPerms {
     }
 
     fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::SingleOrVec;
         use schemars::schema::{
             InstanceType, Metadata, NumberValidation, Schema, SchemaObject, StringValidation,
             SubschemaValidation,
         };
-        use schemars::schema::SingleOrVec;
         Schema::Object(SchemaObject {
             metadata: Some(Box::new(Metadata {
                 description: Some(
@@ -163,8 +163,7 @@ impl<'de> Deserialize<'de> for TmpfsPerms {
                 // --perms: 755 means 0o755.
                 match u64::from_str_radix(&v.to_string(), 8) {
                     Ok(octal) => octal_from_u64(octal).map_err(E::custom).map(TmpfsPerms),
-                    Err(_) => Err(E::invalid_value(
-                        serde::de::Unexpected::Unsigned(v), &self)),
+                    Err(_) => Err(E::invalid_value(serde::de::Unexpected::Unsigned(v), &self)),
                 }
             }
             fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
@@ -426,7 +425,14 @@ mod tests {
             }
         );
         let spec = parse(r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": 700 } ] }"#);
-        assert_eq!(spec.ops[0], Op::Tmpfs { dest: PathBuf::from("/x"), perms: Some(TmpfsPerms(0o700)), size: None });
+        assert_eq!(
+            spec.ops[0],
+            Op::Tmpfs {
+                dest: PathBuf::from("/x"),
+                perms: Some(TmpfsPerms(0o700)),
+                size: None
+            }
+        );
 
         assert_eq!(TmpfsPerms::DEFAULT.mount_option(), "mode=0755");
         assert_eq!(TmpfsPerms(0o700).mount_option(), "mode=0700");
@@ -434,9 +440,24 @@ mod tests {
 
     #[test]
     fn tmpfs_rejects_bad_perms() {
-        assert!(serde_json::from_str::<Spec>(r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "abc" } ] }"#).is_err());
-        assert!(serde_json::from_str::<Spec>(r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "999" } ] }"#).is_err());
-        assert!(serde_json::from_str::<Spec>(r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "777777777777" } ] }"#).is_err());
+        assert!(
+            serde_json::from_str::<Spec>(
+                r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "abc" } ] }"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Spec>(
+                r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "999" } ] }"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Spec>(
+                r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "777777777777" } ] }"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -452,9 +473,7 @@ mod tests {
 
     #[test]
     fn hostfs_mirror_parses() {
-        let spec = parse(
-            r#"{ "hostfs": { "mirror": ["/etc/*.conf", "/home/me/project"] } }"#,
-        );
+        let spec = parse(r#"{ "hostfs": { "mirror": ["/etc/*.conf", "/home/me/project"] } }"#);
         assert_eq!(
             spec.hostfs.mirror,
             ["/etc/*.conf".to_string(), "/home/me/project".to_string()]
@@ -472,7 +491,10 @@ mod tests {
     #[test]
     fn hostfs_empty_dirs_parse() {
         let spec = parse(r#"{ "hostfs": { "emptyDirs": ["/dev", "/tmp"] } }"#);
-        assert_eq!(spec.hostfs.empty_dirs, ["/dev".to_string(), "/tmp".to_string()]);
+        assert_eq!(
+            spec.hostfs.empty_dirs,
+            ["/dev".to_string(), "/tmp".to_string()]
+        );
         assert!(parse("{}").hostfs.empty_dirs.is_empty());
     }
 
@@ -506,15 +528,15 @@ mod tests {
     #[test]
     fn embedded_schema_is_valid_json_and_covers_all_op_types() {
         let schema: serde_json::Value = serde_json::from_str(crate::SPEC_SCHEMA).unwrap();
-        assert_eq!(
-            schema["$schema"],
-            "http://json-schema.org/draft-07/schema#"
-        );
+        assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
         assert_eq!(schema["title"], "rs-bubble sandbox spec");
         // The ops are a "type"-tagged enum: every variant's tag must show
         // up in the generated schema.
         for tag in ["bind", "symlink", "proc", "dev", "tmpfs"] {
-            assert!(crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")), "{tag} missing from schema");
+            assert!(
+                crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")),
+                "{tag} missing from schema"
+            );
         }
         // deny_unknown_fields on Spec must surface in the schema.
         assert_eq!(schema["additionalProperties"], false);

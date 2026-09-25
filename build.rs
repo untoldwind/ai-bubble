@@ -31,10 +31,9 @@ mod spec;
 fn main() {
     println!("cargo:rerun-if-changed=src/spec.rs");
 
-    let schema = schemars::r#gen::SchemaSettings::draft07()
+    let mut schema = schemars::r#gen::SchemaSettings::draft07()
         .into_generator()
         .into_root_schema_for::<spec::Spec>();
-    let mut schema = schema;
     schema
         .schema
         .metadata

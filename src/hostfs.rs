@@ -138,7 +138,9 @@ impl HostFs {
             .map(|p| {
                 let path = PathBuf::from(p);
                 if !path.is_absolute() {
-                    die(&format!("hostfs emptyDirs entry {p:?} is not an absolute path"));
+                    die(&format!(
+                        "hostfs emptyDirs entry {p:?} is not an absolute path"
+                    ));
                 }
                 path
             })
@@ -313,7 +315,7 @@ impl HostFs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.is_empty_prefix(host) => {
                 Ok(self.empty_dir_attr())
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -339,11 +341,8 @@ impl HostFs {
         // A directory named by a pattern itself is a recursive mirror: all
         // of its real entries are visible, not only pattern matches.
         let comps: Vec<Component> = host.components().collect();
-        let unfiltered = self.matches(host)
-            || self
-                .patterns
-                .iter()
-                .any(|p| self.pattern_exact(p, &comps));
+        let unfiltered =
+            self.matches(host) || self.patterns.iter().any(|p| self.pattern_exact(p, &comps));
         let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(host) {
             Ok(entries) => entries
                 .flatten()
@@ -363,12 +362,11 @@ impl HostFs {
         // Empty-dir entries living directly under this directory (also when
         // the real directory itself cannot be listed).
         for v in &self.empty_dirs {
-            if v.parent().map(|p| p == host).unwrap_or(false) {
-                if let Some(name) = v.file_name() {
-                    if !names.iter().any(|n| n == name) {
-                        names.push(name.to_os_string());
-                    }
-                }
+            if let (Some(parent), Some(name)) = (v.parent(), v.file_name())
+                && parent == host
+                && !names.iter().any(|n| n == name)
+            {
+                names.push(name.to_os_string());
             }
         }
         names.sort();
@@ -644,7 +642,10 @@ impl PathFilesystem for HostFs {
             .enumerate()
             .map(|(i, (name, attr))| {
                 Ok(DirectoryEntryPlus {
-                    kind: attr.as_ref().map(|a| a.kind).unwrap_or(FileType::RegularFile),
+                    kind: attr
+                        .as_ref()
+                        .map(|a| a.kind)
+                        .unwrap_or(FileType::RegularFile),
                     name,
                     offset: (offset + i as u64 + 1) as i64,
                     attr: attr?,
@@ -720,7 +721,12 @@ pub fn start_host_fs(config: &crate::spec::HostFsConfig) {
     if pid == 0 {
         // Child: serve the FUSE filesystem forever (or until the host dies).
         unsafe { libc::close(read_fd) };
-        serve(config.mirror.clone(), config.empty_dirs.clone(), mountpoint, write_fd);
+        serve(
+            config.mirror.clone(),
+            config.empty_dirs.clone(),
+            mountpoint,
+            write_fd,
+        );
         // serve never returns
     }
 

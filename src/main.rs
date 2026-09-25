@@ -33,28 +33,33 @@ mod spec;
 pub const SPEC_SCHEMA: &str = include_str!(concat!(env!("OUT_DIR"), "/rs-bubble-schema.json"));
 
 fn main() {
-    let args = cli::Cli::parse();
+    let mut args = cli::Cli::parse();
 
     if args.print_schema {
         print!("{}", SPEC_SCHEMA);
         return;
     }
 
-    let command = args.command.clone();
+    let spec = spec::Spec::load(args.spec.as_deref());
+    let command = std::mem::take(&mut args.command);
     if command.is_empty() {
         sandbox::die("No command given; usage: rs-bubble [--spec FILE] -- COMMAND [args...]");
     }
 
-    let spec = spec::Spec::load(args.spec.as_deref());
-
     // Start the host FUSE filesystem server (in its own child process) before
     // any namespace setup, so the sandbox can bind-mount it at /host (or use
-    // it as the sandbox root itself, see below).
+    // it as the sandbox root itself, see below). Only when the spec actually
+    // exposes something: a sandbox without any hostfs configuration must not
+    // depend on (or fail for the lack of) FUSE.
     if spec.hostfs.root && spec.hostfs.mirror.is_empty() && spec.hostfs.empty_dirs.is_empty() {
-        sandbox::die("hostfs.root needs at least one hostfs.mirror pattern or hostfs.emptyDirs entry");
+        sandbox::die(
+            "hostfs.root needs at least one hostfs.mirror pattern or hostfs.emptyDirs entry",
+        );
     }
-    hostfs::set_root_mode(spec.hostfs.root);
-    hostfs::start_host_fs(&spec.hostfs);
+    if spec.hostfs.root || !spec.hostfs.mirror.is_empty() || !spec.hostfs.empty_dirs.is_empty() {
+        hostfs::set_root_mode(spec.hostfs.root);
+        hostfs::start_host_fs(&spec.hostfs);
+    }
 
     let net = &spec.net;
     let ops = spec.filesystem_ops();

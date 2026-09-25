@@ -4,7 +4,7 @@
 //! Everything in this module runs *inside* the namespace-building process;
 //! it never touches the network (that is `netns`/`proxy` territory).
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -23,6 +23,12 @@ pub(crate) fn die(msg: &str) -> ! {
 pub(crate) fn die_with_error(msg: &str) -> ! {
     eprintln!("rs-bubble: {msg}: {}", io::Error::last_os_error());
     exit(1)
+}
+
+/// A CString for a spec-supplied path (or any other OS string). NUL bytes
+/// in a spec file are reported as a clean error instead of a panic.
+pub(crate) fn cstring(s: &OsStr) -> CString {
+    CString::new(s.as_bytes()).unwrap_or_else(|_| die(&format!("Path contains NUL byte: {s:?}")))
 }
 
 /// Exit with the raw waitpid status of the sandboxed command.
@@ -308,7 +314,12 @@ pub(crate) unsafe fn drop_all_capabilities() {
 /// Mount a fresh tmpfs on `dest_abs` (a path inside the new sandbox root),
 /// like bwrap's `setup_op_tmpfs_mount`: `MS_NOSUID | MS_NODEV`, a `mode=`
 /// option and an optional `size=` (bytes; 0 means the kernel default).
-pub(crate) unsafe fn mount_tmpfs(dest_abs: &Path, perms: TmpfsPerms, size: Option<u64>, display: &Path) {
+pub(crate) unsafe fn mount_tmpfs(
+    dest_abs: &Path,
+    perms: TmpfsPerms,
+    size: Option<u64>,
+    display: &Path,
+) {
     let mut options = perms.mount_option();
     if let Some(bytes) = size {
         if bytes == 0 {
@@ -402,8 +413,8 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
         // resolvable. (The FUSE server keeps running in the host process.)
         // In hostfs-root mode the FUSE filesystem *is* the root, so there is
         // no /host.
-        if let Some(host_mount) = crate::hostfs::host_mount_point()
-            .filter(|_| !crate::hostfs::root_mode())
+        if let Some(host_mount) =
+            crate::hostfs::host_mount_point().filter(|_| !crate::hostfs::root_mode())
         {
             mkdir_p(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
             let dest_abs = sandbox_path(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
@@ -431,7 +442,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     {
                         die(&format!("Invalid bind destination {}", dest.display()));
                     }
-                    let src_c = CString::new(src.as_bytes()).unwrap();
+                    let src_c = cstring(OsStr::new(src));
                     let mut src_stat: libc::stat = std::mem::zeroed();
                     if libc::stat(src_c.as_ptr(), &mut src_stat) != 0 {
                         die_with_error(&format!("Can't find source {src}"));
@@ -442,7 +453,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     // In hostfs-root mode they must already exist in the
                     // mirror (the FUSE filesystem is read-only).
                     ensure_dir(&newroot, dest);
-                    let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
+                    let dest_c = cstring(dest_abs.as_os_str());
                     if libc::mount(
                         src_c.as_ptr(),
                         dest_c.as_ptr(),
@@ -463,7 +474,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     }
                     ensure_dir(&newroot, dest);
                     let dest_abs = sandbox_path(&newroot, dest);
-                    let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
+                    let dest_c = cstring(dest_abs.as_os_str());
                     // Mount a *fresh* procfs, like bwrap's --proc does when a
                     // new PID namespace exists: this instance shows only the
                     // sandbox's processes. (We are inside the new PID
@@ -580,8 +591,7 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     {
                         die_with_error("Can't mount devpts on /dev/pts");
                     }
-                    let ptmx_c =
-                        CString::new(dev_abs.join("ptmx").as_os_str().as_bytes()).unwrap();
+                    let ptmx_c = CString::new(dev_abs.join("ptmx").as_os_str().as_bytes()).unwrap();
                     let target_c = CString::new("pts/ptmx").unwrap();
                     if libc::symlink(target_c.as_ptr(), ptmx_c.as_ptr()) != 0 {
                         die_with_error("Can't make symlink ptmx -> pts/ptmx");
@@ -624,8 +634,8 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                         ensure_dir(&newroot, p);
                     }
                     let dest_abs = sandbox_path(&newroot, dest);
-                    let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
-                    let src_c = CString::new(src.as_bytes()).unwrap();
+                    let dest_c = cstring(dest_abs.as_os_str());
+                    let src_c = cstring(OsStr::new(src));
                     if libc::symlink(src_c.as_ptr(), dest_c.as_ptr()) != 0 {
                         let e = io::Error::last_os_error();
                         if e.kind() == io::ErrorKind::AlreadyExists {
