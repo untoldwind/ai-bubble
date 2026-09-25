@@ -26,8 +26,19 @@ mod proxy;
 mod sandbox;
 mod spec;
 
+/// The JSON Schema for the spec file, generated from `src/spec.rs` by
+/// `build.rs` at compile time. Printed by `--print-schema`; point an
+/// editor (e.g. VS Code's `json.schemas`) at it to get completion and
+/// validation for `.rs-bubble.json`.
+pub const SPEC_SCHEMA: &str = include_str!(concat!(env!("OUT_DIR"), "/rs-bubble-schema.json"));
+
 fn main() {
     let args = cli::Cli::parse();
+
+    if args.print_schema {
+        print!("{}", SPEC_SCHEMA);
+        return;
+    }
 
     let command = args.command.clone();
     if command.is_empty() {

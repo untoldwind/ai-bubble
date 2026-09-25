@@ -1,0 +1,227 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "rs-bubble sandbox spec",
+  "description": "The whole sandbox specification.",
+  "type": "object",
+  "properties": {
+    "hostfs": {
+      "description": "The host filesystem mounted at `/host`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/HostFsConfig"
+        }
+      ]
+    },
+    "net": {
+      "description": "Isolated-network configuration.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/NetConfig"
+        }
+      ]
+    },
+    "ops": {
+      "description": "The mount operations, in application order.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Op"
+      }
+    },
+    "proc": {
+      "description": "Where to mount a fresh procfs instance. `None` mounts nothing; see [`Spec::filesystem_ops`] for the default of `/proc`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "HostFsConfig": {
+      "description": "The spec file's `hostfs` section: what the FUSE filesystem mounted at `/host` exposes.",
+      "type": "object",
+      "properties": {
+        "emptyDirs": {
+          "description": "Absolute paths exposed as **empty, unwritable directories** (mode 0555, no contents), taking *precedence* over `mirror`: nothing below an entry is visible, and the entry itself is shown even when a mirror pattern (or the real host path) covers it. Meant as mount points inside the sandbox, e.g. `/dev`, `/tmp`, `/proc` — or the sandbox root itself with `hostfs.root`.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mirror": {
+          "description": "Glob patterns (absolute host paths) mirrored under `/host`. Matched paths appear at the same absolute path below `/host` (`/etc/passwd` → `/host/etc/passwd`); matched directories are mirrored recursively. Empty mirrors nothing.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "root": {
+          "description": "**Experimental:** use the FUSE filesystem itself as the sandbox root instead of mounting it at `/host`. Everything mirrored appears at its absolute host path; the ops (`dev`, `tmpfs`, `proc`, binds) are mounted on top of it. Because the FUSE filesystem is read-only, every mount point must be listed in `emptyDirs` (or exist in the mirror).",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "NetConfig": {
+      "description": "Network-related configuration for isolated networking.",
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Allow-list of `host` or `host:port` targets for the proxy. Empty means: allow everything.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "isolated": {
+          "description": "Run the command in a fresh network namespace and proxy its connections from the host side.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Op": {
+      "description": "One sandbox setup operation. The JSON `type` tag selects the variant, and the order of the list is the order in which the operations are applied inside the sandbox (order matters, exactly like bwrap).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "dest",
+            "src",
+            "type"
+          ],
+          "properties": {
+            "dest": {
+              "type": "string"
+            },
+            "src": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "bind"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "dest",
+            "src",
+            "type"
+          ],
+          "properties": {
+            "dest": {
+              "type": "string"
+            },
+            "src": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "symlink"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Mount a fresh procfs instance. Usually set via the top-level `proc` field rather than as an explicit op, but kept here so the sandbox can treat it uniformly.",
+          "type": "object",
+          "required": [
+            "dest",
+            "type"
+          ],
+          "properties": {
+            "dest": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "proc"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Mount a minimal `/dev`, like bwrap's `--dev`: a fresh tmpfs (mode 0755, `MS_NOSUID|MS_NODEV`) populated with the usual device nodes (`null`, `zero`, `full`, `random`, `urandom`, `tty`), the stdio symlinks, `/dev/shm`, a fresh devpts instance at `pts` plus the `ptmx` symlink, and `/dev/console` bound to the host tty when stdin is one.",
+          "type": "object",
+          "required": [
+            "dest",
+            "type"
+          ],
+          "properties": {
+            "dest": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "dev"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Mount a fresh tmpfs instance, like bwrap's `--tmpfs`. Options mirror bwrap: `perms` is the octal mode of the mount root (default 0755) and `size` the maximum size in bytes (default: unlimited/half of RAM). The mount is made with `MS_NOSUID | MS_NODEV`, like bwrap's.",
+          "type": "object",
+          "required": [
+            "dest",
+            "type"
+          ],
+          "properties": {
+            "dest": {
+              "type": "string"
+            },
+            "perms": {
+              "description": "Octal mode, e.g. `\"0755\"` or `755`. Default: 0755.",
+              "anyOf": [
+                {
+                  "description": "An octal permission mode like bwrap's `--perms`: a JSON number (`755`) or string (`\"0755\"`), both interpreted as *octal*.",
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "maximum": 4095.0,
+                      "minimum": 0.0
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^[0-7]{1,4}$"
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "size": {
+              "description": "Maximum tmpfs size in bytes.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tmpfs"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

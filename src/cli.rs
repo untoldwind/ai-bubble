@@ -25,6 +25,14 @@ pub struct Cli {
     #[arg(long = "spec", value_name = "FILE")]
     pub spec: Option<PathBuf>,
 
+    /// Print the JSON Schema for the spec file to stdout and exit (no
+    /// command needed). Useful to hand to editors: point `json.schemas`
+    /// (VS Code) or a similar setting at the output of
+    /// `rs-bubble --print-schema > rs-bubble.schema.json` to get
+    /// completion and validation for `.rs-bubble.json`.
+    #[arg(long = "print-schema")]
+    pub print_schema: bool,
+
     /// The command to run inside the sandbox (everything after the first
     /// bare argument or after `--`). `parse_args` inserts a `--` before the
     /// command so that its own flags (e.g. `ls -l`) pass through verbatim.

@@ -1,4 +1,5 @@
 {
+  "$schema": "./rs-bubble.spec.schema.json",
   "ops": [
     { "type": "bind",    "src": "/usr", "dest": "/usr" },
     { "type": "bind",    "src": "/etc", "dest": "/etc" },

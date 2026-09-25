@@ -5,6 +5,13 @@
 //! spec file. The default location is `.rs-bubble.json` in the current
 //! directory; `--spec FILE` on the command line overrides it.
 //!
+//! A JSON Schema for this format is generated from this very file at
+//! build time (see `build.rs`): all the serde attributes are honored,
+//! and `TmpfsPerms`' hand-written deserializer is described manually in
+//! its `JsonSchema` impl. The main crate embeds the generated schema as
+//! `crate::SPEC_SCHEMA` and prints it via `--print-schema`, so editors
+//! can validate and auto-complete spec files against it.
+//!
 //! Format:
 //!
 //! ```json
@@ -29,13 +36,15 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use schemars::JsonSchema;
+
 /// The default spec file, looked up relative to the current directory.
 pub const DEFAULT_SPEC: &str = ".rs-bubble.json";
 
 /// One sandbox setup operation. The JSON `type` tag selects the variant,
 /// and the order of the list is the order in which the operations are
 /// applied inside the sandbox (order matters, exactly like bwrap).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Op {
     Bind {
@@ -78,8 +87,68 @@ pub enum Op {
 ///
 /// Accepts either a JSON number (`755`) or string (`"0755"`); both are
 /// interpreted as *octal*, like bwrap does on the command line.
+///
+/// Its schema is described by hand in the [`schemars::JsonSchema`]
+/// implementation below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TmpfsPerms(pub u32);
+
+impl schemars::JsonSchema for TmpfsPerms {
+    fn schema_name() -> String {
+        "TmpfsPerms".to_string()
+    }
+
+    fn is_referenceable() -> bool {
+        // Inline the oneOf; the type has no name in the JSON format.
+        false
+    }
+
+    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{
+            InstanceType, Metadata, NumberValidation, Schema, SchemaObject, StringValidation,
+            SubschemaValidation,
+        };
+        use schemars::schema::SingleOrVec;
+        Schema::Object(SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(
+                    "An octal permission mode like bwrap's `--perms`: a JSON number (`755`) or \
+                     string (`\"0755\"`), both interpreted as *octal*."
+                        .to_string(),
+                ),
+                ..Default::default()
+            })),
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![
+                    // A bare number is a sequence of octal digits, like
+                    // bwrap's command line: 755 means 0o755.
+                    SchemaObject {
+                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Integer))),
+                        number: Some(Box::new(NumberValidation {
+                            minimum: Some(0.0),
+                            maximum: Some(0o7777 as f64),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                    .into(),
+                    // A string of (leading-zero-tolerant) octal digits.
+                    SchemaObject {
+                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
+                        string: Some(Box::new(StringValidation {
+                            pattern: Some("^[0-7]{1,4}$".to_string()),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                    .into(),
+                ]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
 
 impl<'de> Deserialize<'de> for TmpfsPerms {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -130,7 +199,7 @@ impl TmpfsPerms {
 }
 
 /// Network-related configuration for isolated networking.
-#[derive(Debug, Default, PartialEq, Deserialize, Clone)]
+#[derive(Debug, Default, PartialEq, Deserialize, Clone, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetConfig {
     /// Run the command in a fresh network namespace and proxy its
@@ -143,7 +212,7 @@ pub struct NetConfig {
 
 /// The spec file's `hostfs` section: what the FUSE filesystem mounted at
 /// `/host` exposes.
-#[derive(Debug, Default, PartialEq, Deserialize, Clone)]
+#[derive(Debug, Default, PartialEq, Deserialize, Clone, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct HostFsConfig {
     /// Glob patterns (absolute host paths) mirrored under `/host`.
@@ -169,7 +238,7 @@ pub struct HostFsConfig {
 }
 
 /// The whole sandbox specification.
-#[derive(Debug, Default, PartialEq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Spec {
     /// The mount operations, in application order.
@@ -416,6 +485,29 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected() {
         assert!(serde_json::from_str::<Spec>(r#"{ "nope": true }"#).is_err());
+    }
+
+    #[test]
+    fn embedded_schema_is_valid_json_and_covers_all_op_types() {
+        let schema: serde_json::Value = serde_json::from_str(crate::SPEC_SCHEMA).unwrap();
+        assert_eq!(
+            schema["$schema"],
+            "http://json-schema.org/draft-07/schema#"
+        );
+        assert_eq!(schema["title"], "rs-bubble sandbox spec");
+        // The ops are a "type"-tagged enum: every variant's tag must show
+        // up in the generated schema.
+        for tag in ["bind", "symlink", "proc", "dev", "tmpfs"] {
+            assert!(crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")), "{tag} missing from schema");
+        }
+        // deny_unknown_fields on Spec must surface in the schema.
+        assert_eq!(schema["additionalProperties"], false);
+        // The hand-written TmpfsPerms schema: number or octal string.
+        // The hand-written TmpfsPerms schema is inlined, not a $ref.
+        assert!(crate::SPEC_SCHEMA.contains(r#""pattern": "^[0-7]{1,4}$""#));
+        assert_eq!(schema["$defs"], serde_json::Value::Null);
+        // The op variants are described in a referenced definition.
+        assert!(schema["definitions"]["Op"]["oneOf"].is_array());
     }
 
     #[test]
