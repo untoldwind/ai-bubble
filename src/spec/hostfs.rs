@@ -57,11 +57,12 @@ impl<'de> Deserialize<'de> for Mirror {
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("an object mapping glob patterns to \"mirror\" or \"hide\"")
             }
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Mirror, A::Error> {
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Mirror, A::Error> {
                 let mut entries = Vec::new();
-                while let Some((pattern, permission)) =
-                    map.next_entry::<String, Permission>()?
-                {
+                while let Some((pattern, permission)) = map.next_entry::<String, Permission>()? {
                     if !pattern.starts_with('/') {
                         return Err(serde::de::Error::custom(format!(
                             "hostfs mirror pattern {pattern:?} is not an absolute path"
@@ -164,9 +165,8 @@ mod tests {
 
     #[test]
     fn hostfs_mirror_preserves_order_and_permissions() {
-        let spec = parse(
-            r#"{ "hostfs": { "mirror": { "/etc": "mirror", "/etc/passwd": "hide" } } }"#,
-        );
+        let spec =
+            parse(r#"{ "hostfs": { "mirror": { "/etc": "mirror", "/etc/passwd": "hide" } } }"#);
         assert_eq!(
             spec.hostfs.mirror,
             Mirror(vec![
@@ -179,12 +179,16 @@ mod tests {
     #[test]
     fn hostfs_mirror_rejects_relative_patterns_and_bad_permissions() {
         assert!(
-            serde_json::from_str::<crate::spec::Spec>(r#"{ "hostfs": { "mirror": { "etc": "mirror" } } }"#)
-                .is_err()
+            serde_json::from_str::<crate::spec::Spec>(
+                r#"{ "hostfs": { "mirror": { "etc": "mirror" } } }"#
+            )
+            .is_err()
         );
         assert!(
-            serde_json::from_str::<crate::spec::Spec>(r#"{ "hostfs": { "mirror": { "/etc": "rw" } } }"#)
-                .is_err()
+            serde_json::from_str::<crate::spec::Spec>(
+                r#"{ "hostfs": { "mirror": { "/etc": "rw" } } }"#
+            )
+            .is_err()
         );
     }
 
@@ -202,7 +206,10 @@ mod tests {
     #[test]
     fn hostfs_empty_dirs_parse() {
         let spec = parse(r#"{ "hostfs": { "emptyDirs": ["/dev", "/tmp"] } }"#);
-        assert_eq!(spec.hostfs.empty_dirs, ["/dev".to_string(), "/tmp".to_string()]);
+        assert_eq!(
+            spec.hostfs.empty_dirs,
+            ["/dev".to_string(), "/tmp".to_string()]
+        );
         assert!(parse("{}").hostfs.empty_dirs.is_empty());
     }
 
@@ -214,6 +221,8 @@ mod tests {
 
     #[test]
     fn hostfs_rejects_unknown_fields() {
-        assert!(serde_json::from_str::<crate::spec::Spec>(r#"{ "hostfs": { "nope": true } }"#).is_err());
+        assert!(
+            serde_json::from_str::<crate::spec::Spec>(r#"{ "hostfs": { "nope": true } }"#).is_err()
+        );
     }
 }

@@ -19,11 +19,11 @@ pub struct NetConfig {
 #[cfg(test)]
 mod tests {
     use super::super::tests::parse;
-    use super::*;
 
     #[test]
     fn net_options() {
-        let spec = parse(r#"{ "net": { "isolated": true, "allow": ["example.com:443", "localhost"] } }"#);
+        let spec =
+            parse(r#"{ "net": { "isolated": true, "allow": ["example.com:443", "localhost"] } }"#);
         assert!(spec.net.isolated);
         assert_eq!(spec.net.allow, ["example.com:443", "localhost"]);
     }

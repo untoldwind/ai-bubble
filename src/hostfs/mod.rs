@@ -14,9 +14,10 @@
 //!
 //! The patterns are *not* expanded at startup: the host tree is never
 //! crawled. Every FUSE operation matches the requested path against the
-//! compiled glob patterns on the fly, so startup is O(patterns) and a
-//! huge host tree costs nothing. (`readdir` lists the real directory and
-//! filters out every entry that matches no pattern.)
+//! compiled patterns on the fly (see `pattern.rs` for the supported glob
+//! syntax), so startup is O(patterns) and a huge host tree costs nothing.
+//! (`readdir` lists the real directory and filters out every entry that
+//! matches no pattern.)
 //!
 //! Because a FUSE session must keep running while the sandboxed command runs,
 //! and because tokio runtimes must never be shared across `fork` (see
@@ -39,7 +40,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::io::{Read, Seek, SeekFrom};
 use std::num::NonZeroU32;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -51,10 +52,12 @@ use fuse3::path::reply::{
 use fuse3::path::{PathFilesystem, Session};
 use fuse3::{FileType, MountOptions, Result};
 use futures_util::stream;
-use glob::Pattern;
 
 use crate::sandbox::die_with_error;
 use crate::spec::hostfs::{Mirror, Permission};
+
+mod pattern;
+use pattern::{Pattern, Walk};
 
 /// The sandbox-absolute path the host filesystem is mounted at.
 pub const SANDBOX_MOUNT_POINT: &str = "/host";
@@ -87,32 +90,19 @@ static HOST_PID: AtomicI32 = AtomicI32::new(0);
 
 const TTL: Duration = Duration::from_secs(1);
 
-/// One compiled mirror pattern: the whole-path form for matching concrete
-/// files, and the per-component form for the ancestor/prefix checks.
+/// One compiled mirror pattern, with the permission it carries.
 #[derive(Clone)]
 struct MirrorPattern {
-    full: Pattern,
-    comps: Vec<Pattern>,
+    pattern: Pattern,
+    permission: Permission,
 }
 
-/// Walk result of comparing a pattern's components against a path's
-/// components.
-enum Walk {
-    /// The pattern names the path exactly (all pattern components
-    /// consumed when the path ran out).
-    Exact,
-    /// A `**` component was reached: the pattern covers this directory
-    /// and everything below it.
-    StarStar,
-    /// The pattern was fully consumed before the path was: it names a
-    /// strict ancestor of the path.
-    Ancestor,
-    /// The path was fully consumed while the pattern still had components
-    /// left: the path could be an ancestor of something the pattern
-    /// matches deeper down.
-    CouldReach,
-    /// No match.
-    Fail,
+impl MirrorPattern {
+    /// Whether the pattern names the path itself (exactly, or via a `**`
+    /// that covers it).
+    fn names(&self, host: &Path) -> bool {
+        self.pattern.matches(host)
+    }
 }
 
 /// The mirror filesystem: a read-only view of the paths selected by the
@@ -136,7 +126,7 @@ enum Walk {
 struct HostFs {
     uid: u32,
     gid: u32,
-    patterns: Vec<(MirrorPattern, Permission)>,
+    patterns: Vec<MirrorPattern>,
     empty_dirs: Vec<PathBuf>,
 }
 
@@ -145,14 +135,9 @@ impl HostFs {
     fn collect(mirror: &Mirror, empty_dirs: &[String]) -> HostFs {
         let compiled = mirror
             .iter()
-            .map(|(p, perm)| {
-                let full = compile(p);
-                let comps = p
-                    .split('/')
-                    .filter(|c| !c.is_empty())
-                    .map(compile)
-                    .collect();
-                (MirrorPattern { full, comps }, *perm)
+            .map(|(p, perm)| MirrorPattern {
+                pattern: compile(p),
+                permission: *perm,
             })
             .collect();
         let empties = empty_dirs
@@ -227,19 +212,17 @@ impl HostFs {
         self.patterns
             .iter()
             .rev()
-            .find(|(p, _)| p.full.matches_path_with(host, GLOB_OPTIONS))
-            .map(|(_, perm)| *perm)
+            .find(|p| p.names(host))
+            .map(|p| p.permission)
     }
 
     /// Whether the path is hidden because a pattern hides it directly, or
     /// a hidden pattern names one of its strict ancestors (a hidden
     /// directory hides its whole subtree).
     fn hidden(&self, host: &Path) -> bool {
-        let comps = comps(host);
-        self.patterns.iter().any(|(p, perm)| {
-            *perm == Permission::Hide
-                && (p.full.matches_path_with(host, GLOB_OPTIONS)
-                    || matches!(self.pattern_walk(p, &comps), Walk::Ancestor))
+        self.patterns.iter().any(|p| {
+            p.permission == Permission::Hide
+                && (p.names(host) || matches!(p.pattern.walk(host), Walk::Ancestor))
         })
     }
 
@@ -266,14 +249,16 @@ impl HostFs {
     /// (possibly virtual) directory of the mirror, leading to matches
     /// deeper down. Denied patterns never make a path navigable.
     fn dir_prefix(&self, host: &Path) -> bool {
-        let comps = comps(host);
-        if comps.is_empty() {
-            return self.patterns.iter().any(|(_, p)| *p == Permission::Mirror)
+        if host == Path::new("/") {
+            return self
+                .patterns
+                .iter()
+                .any(|p| p.permission == Permission::Mirror)
                 || !self.empty_dirs.is_empty();
         }
         self.patterns
             .iter()
-            .any(|(p, perm)| *perm == Permission::Mirror && self.pattern_reaches(p, &comps))
+            .any(|p| p.permission == Permission::Mirror && self.pattern_reaches(p, host))
             || self.is_empty_prefix(host)
     }
 
@@ -282,45 +267,11 @@ impl HostFs {
     /// consumed, or the path hit (or ends at) a `**`, or the pattern names
     /// a strict ancestor of the path — an exactly-named directory is
     /// mirrored recursively, so everything below it is visible.
-    fn pattern_reaches(&self, p: &MirrorPattern, comps: &[Component]) -> bool {
+    fn pattern_reaches(&self, p: &MirrorPattern, host: &Path) -> bool {
         matches!(
-            self.pattern_walk(p, comps),
+            p.pattern.walk(host),
             Walk::CouldReach | Walk::StarStar | Walk::Ancestor
         )
-    }
-
-    /// Walk the pattern components alongside the path components. This is
-    /// only used for the ancestor/prefix checks; direct matches are decided
-    /// by the whole-path pattern (`MirrorPattern::full`).
-    fn pattern_walk(&self, p: &MirrorPattern, comps: &[Component]) -> Walk {
-        let mut pi = 0;
-        for c in comps {
-            let Component::Normal(name) = c else {
-                continue;
-            };
-            // Non-UTF-8 components can never match a glob pattern.
-            let Some(name) = name.to_str() else {
-                return Walk::Fail;
-            };
-            if pi >= p.comps.len() {
-                // The pattern ran out: it names a strict ancestor.
-                return Walk::Ancestor;
-            }
-            if p.comps[pi].as_str() == "**" {
-                // The pattern covers this directory and everything below
-                // it (a full pattern match is decided by `full`).
-                return Walk::StarStar;
-            }
-            if !p.comps[pi].matches(name) {
-                return Walk::Fail;
-            }
-            pi += 1;
-        }
-        if pi == p.comps.len() {
-            Walk::Exact
-        } else {
-            Walk::CouldReach
-        }
     }
 
     /// The attributes of an empty dir (or a purely virtual ancestor of one):
@@ -423,20 +374,7 @@ impl HostFs {
 }
 
 fn compile(pattern: &str) -> Pattern {
-    Pattern::new(pattern)
-        .unwrap_or_else(|e| die(&format!("Invalid hostfs mirror pattern {pattern:?}: {e}")))
-}
-
-/// `*` must not cross directory separators, like in a shell.
-const GLOB_OPTIONS: glob::MatchOptions = glob::MatchOptions {
-    case_sensitive: true,
-    require_literal_separator: true,
-    require_literal_leading_dot: false,
-};
-
-/// The path's components, for the pattern walking.
-fn comps(path: &Path) -> Vec<Component<'_>> {
-    path.components().collect()
+    Pattern::new(pattern).unwrap_or_else(|e| die(&format!("Invalid hostfs mirror pattern: {e}")))
 }
 
 fn attr_from_metadata(md: &std::fs::Metadata) -> FileAttr {
@@ -802,12 +740,7 @@ pub fn start_host_fs(config: &crate::spec::HostFsConfig) {
 /// loop is a spawned task, and a current-thread runtime only polls its tasks
 /// while `block_on` is running — returning early would silently stall the
 /// event loop and every filesystem access would hang.
-fn serve(
-    mirror: Mirror,
-    empty_dirs: Vec<String>,
-    mountpoint: PathBuf,
-    ready_fd: libc::c_int,
-) -> ! {
+fn serve(mirror: Mirror, empty_dirs: Vec<String>, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let fs = HostFs::collect(&mirror, &empty_dirs);
@@ -908,10 +841,7 @@ mod tests {
         )
     }
 
-    fn fs_with_empty_dirs(
-        entries: &[(&str, Permission)],
-        empty: &[&str],
-    ) -> HostFs {
+    fn fs_with_empty_dirs(entries: &[(&str, Permission)], empty: &[&str]) -> HostFs {
         HostFs::collect(
             &Mirror(
                 entries
@@ -989,10 +919,7 @@ mod tests {
     fn empty_dirs_coexist_with_mirror() {
         // /dev is empty, /etc is mirrored normally; siblings of the empty
         // dir are listed together with it.
-        let f = fs_with_empty_dirs(
-            &[("/etc/passwd", Permission::Mirror)],
-            &["/dev"],
-        );
+        let f = fs_with_empty_dirs(&[("/etc/passwd", Permission::Mirror)], &["/dev"]);
         let names: Vec<_> = f
             .dir_entries(Path::new("/"))
             .into_iter()
@@ -1071,10 +998,7 @@ mod tests {
         std::fs::create_dir(base.join("d.conf")).unwrap();
         std::fs::write(base.join("d.conf/y"), b"y").unwrap();
 
-        let f = fs(&[(
-            &format!("{}/*.conf", base.display()),
-            Permission::Mirror,
-        )]);
+        let f = fs(&[(&format!("{}/*.conf", base.display()), Permission::Mirror)]);
 
         // Only matching entries (and entries leading to matches) survive.
         let names: Vec<_> = f
