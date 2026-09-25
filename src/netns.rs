@@ -30,11 +30,11 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 
-use crate::cli::{NetConfig, Op};
 use crate::proxy::{PROXY_ADDR, PROXY_URL};
 use crate::sandbox::{
     die, die_with_error, exit_with_status, pidns_and_exec, userns_id, write_id_map,
 };
+use crate::spec::{NetConfig, Op};
 
 /// Temporary host directory holding the proxy socket. It is bind-mounted
 /// at /net inside the sandbox so that the (network-isolated) child can

@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use crate::cli::Op;
+use crate::spec::Op;
 
 pub(crate) fn die(msg: &str) -> ! {
     eprintln!("rs-bubble: {msg}");

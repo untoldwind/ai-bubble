@@ -4,23 +4,51 @@ A minimal Rust reimplementation of the basic functionality of
 [bubblewrap](https://github.com/flatpak/bubblewrap) (`bwrap`), built as a
 simple CLI on top of [clap](https://docs.rs/clap).
 
-Currently supported options:
+The sandbox is configured through a **spec file** (JSON), not through
+command-line options. By default rs-bubble looks for `.rs-bubble.json` in
+the current directory; `--spec FILE` points it at a different file.
 
-- `--bind SRC DEST` — bind-mount `SRC` at `DEST` inside the sandbox
-  (read-write, non-recursive; use `--rbind`-style recursion is not yet supported)
-- `--symlink SRC DEST` — create a symlink at `DEST` pointing to `SRC`
-  (mirrors bwrap: fails if `DEST` exists and is not the identical symlink)
-- `--proc DEST` — mount a **fresh procfs instance** at `DEST`
-  (like bwrap: `MS_NOSUID|MS_NOEXEC|MS_NODEV`). If no `--proc` is given,
-  a fresh procfs is mounted at `/proc` automatically
-- `--isolated-net` — run the command in a fresh **network namespace**
+## Spec file format
+
+All fields are optional. A missing `.rs-bubble.json` means: empty tmpfs
+root, a fresh procfs at `/proc`, and the host network.
+
+```json
+{
+  "ops": [
+    { "type": "bind",    "src": "/usr", "dest": "/usr" },
+    { "type": "symlink", "src": "usr/lib", "dest": "/lib" },
+    { "type": "symlink", "src": "usr/lib64", "dest": "/lib64" },
+    { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
+  ],
+  "proc": "/proc",
+  "net": { "isolated": true, "allow": ["example.com:443"] }
+}
+```
+
+- `ops` — the mount operations, applied **in this order** (order matters,
+  exactly like bwrap):
+  - `{"type": "bind", "src": ..., "dest": ...}` — bind-mount `SRC` at
+    `DEST` inside the sandbox (read-write, non-recursive)
+  - `{"type": "symlink", "src": ..., "dest": ...}` — create a symlink at
+    `DEST` pointing to `SRC` (mirrors bwrap: fails if `DEST` exists and is
+    not the identical symlink)
+- `proc` — where to mount a **fresh procfs instance**
+  (like bwrap: `MS_NOSUID|MS_NOEXEC|MS_NODEV`). If not given, a fresh
+  procfs is mounted at `/proc` automatically
+- `net.isolated` — run the command in a fresh **network namespace**
   (no interfaces besides loopback, which rs-bubble brings up) while the
   rs-bubble process stays on the host and acts as a **TCP proxy**
-- `--allow-net HOST[:PORT]` — allow-list for the proxy; repeatable.
-  Without it, every target is allowed
+- `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`.
+  Empty or missing means every target is allowed
 
-Everything after the options (optionally after a `--` separator) is the
-command to run inside the sandbox.
+Everything on the command line (optionally after a `--` separator) is the
+command to run inside the sandbox:
+
+```sh
+rs-bubble -- /bin/sh
+rs-bubble --spec custom.json /bin/sh
+```
 
 ## How it works
 
@@ -39,7 +67,7 @@ Like bwrap, the tool:
 5. Marks the mount tree as a **slave**, so nothing mounted inside
    propagates back to the host.
 6. Creates a fresh **tmpfs** as the sandbox root.
-7. Applies the filesystem ops (`--proc`, `--bind`, `--symlink`) **in the
+7. Applies the filesystem ops (the spec's `proc` and `ops`) **in the
    order they were given** (order matters, exactly like bwrap). Because
    the PID namespace is created before the mounts (the mounting process
    is PID 1 of it), a fresh procfs instance only ever shows the
@@ -51,14 +79,18 @@ Like bwrap, the tool:
 The sandbox root starts empty: only what you bind in exists. The standard
 bubblewrap example works the same way here:
 
-```sh
-rs-bubble \
-  --bind /usr /usr \
-  --symlink usr/lib /lib \
-  --symlink usr/lib64 /lib64 \
-  --symlink usr/bin /bin \
-  /bin/sh
+```json
+{
+  "ops": [
+    { "type": "bind", "src": "/usr", "dest": "/usr" },
+    { "type": "symlink", "src": "usr/lib", "dest": "/lib" },
+    { "type": "symlink", "src": "usr/lib64", "dest": "/lib64" },
+    { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
+  ]
+}
 ```
+
+`rs-bubble -- /bin/sh` then reproduces:
 
 `/lib`, `/lib64` and `/bin` are symlinks created inside the sandbox, pointing
 into the bound `/usr` — exactly like the corresponding
@@ -86,7 +118,7 @@ Notes:
 
 ## Isolated networking
 
-With `--isolated-net` the sandboxed command gets a network namespace that
+With `net.isolated = true` the sandboxed command gets a network namespace that
 is completely isolated from the host (only a freshly brought-up loopback
 interface; the sandbox also gets its own UTS namespace) — while the
 rs-bubble process tree provides a proxy **inside** that namespace, so the
@@ -115,13 +147,24 @@ bind-mounted at `/net` inside the sandbox.
 The sandbox is still network-isolated: the namespace has no interfaces
 besides loopback and no routes to the host, so direct connections
 (anything that ignores the proxy) simply fail. Targets must pass the
-`--allow-net` filter in the connector.
+`net.allow` filter in the connector.
 
 ### Usage
 
 ```sh
-rs-bubble --isolated-net --allow-net example.com:443 \
-  --bind /usr /usr --symlink usr/lib /lib -- /bin/sh
+rs-bubble --spec isolated.json -- /bin/sh
+```
+
+with `isolated.json`:
+
+```json
+{
+  "ops": [
+    { "type": "bind", "src": "/usr", "dest": "/usr" },
+    { "type": "symlink", "src": "usr/lib", "dest": "/lib" }
+  ],
+  "net": { "isolated": true, "allow": ["example.com:443"] }
+}
 ```
 
 Standard tools automatically use the proxy, because the sandbox sets:
@@ -150,8 +193,8 @@ printf 'example.com:443\n' >&3
 head -c 1 <&3   # 'K' if the connector connected
 ```
 
-`--allow-net HOST[:PORT]` (repeatable) restricts both proxy paths;
-entries without a port allow any port on that host. Without it, every
+`net.allow` entries (`HOST[:PORT]`) restrict both proxy paths;
+entries without a port allow any port on that host. Without them, every
 target is allowed.
 
 Exit status: the connector forwards the sandbox's status; a killed
@@ -174,6 +217,7 @@ namespace split.
 
 ## Status
 
-Starter project — `--bind`, `--symlink`, `--proc`, `--isolated-net` and
-`--allow-net` are implemented. Natural next steps would be `--ro-bind`,
-`--dev`, `--tmpfs`, `--die-with-parent`, and `--unshare-all`.
+Starter project — the spec file's `ops` (bind, symlink), `proc`,
+`net.isolated` and `net.allow` are implemented. Natural next steps would be
+read-only binds, `--dev`, `--tmpfs`, `--die-with-parent`, and
+`--unshare-all`.

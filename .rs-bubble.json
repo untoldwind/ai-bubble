@@ -1,0 +1,11 @@
+{
+  "ops": [
+    { "type": "bind",    "src": "/usr", "dest": "/usr" },
+    { "type": "bind",    "src": "/etc", "dest": "/etc" },
+    { "type": "symlink", "src": "usr/lib", "dest": "/lib" },
+    { "type": "symlink", "src": "usr/lib64", "dest": "/lib64" },
+    { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
+  ],
+  "proc": "/proc",
+  "net": { "isolated": true, "allow": ["google.com:443"] }
+}
