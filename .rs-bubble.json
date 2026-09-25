@@ -10,6 +10,11 @@
     { "type": "symlink", "src": "usr/lib64", "dest": "/lib64" },
     { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
   ],
+  "hostfs": {
+    "mirror": [
+      "/home/bjunglas/workspaces"
+    ]
+  },
   "proc": "/proc",
   "net": { "isolated": true, "allow": ["google.com:443", "opencode.ai:443"] }
 }

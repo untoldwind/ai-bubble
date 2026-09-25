@@ -1,9 +1,19 @@
 //! The host-side FUSE filesystem.
 //!
-//! The *host* process exposes a small virtual filesystem (currently just a
-//! read-only `hello.txt`) via FUSE. The sandboxed command gets it bind-mounted
-//! at `/host`, so it can reach host-provided data without any other access to
-//! the real filesystem.
+//! The *host* process exposes a read-only mirror of parts of the real
+//! filesystem via FUSE. The mirrored paths are selected by a list of glob
+//! patterns (the spec file's `hostfs.mirror`); the sandboxed command gets
+//! the result bind-mounted at `/host`, where the **full host paths** are
+//! reproduced: a pattern `/etc/*.conf` makes `/etc/foo.conf` available as
+//! `/host/etc/foo.conf`. A pattern that matches a directory exactly
+//! (`/usr/share/doc`) mirrors that directory recursively; `**` matches
+//! across directory boundaries.
+//!
+//! The patterns are *not* expanded at startup: the host tree is never
+//! crawled. Every FUSE operation matches the requested path against the
+//! compiled glob patterns on the fly, so startup is O(patterns) and a
+//! huge host tree costs nothing. (`readdir` lists the real directory and
+//! filters out every entry that matches no pattern.)
 //!
 //! Because a FUSE session must keep running while the sandboxed command runs,
 //! and because tokio runtimes must never be shared across `fork` (see
@@ -12,9 +22,11 @@
 //! then proceeds with the namespace setup. When the parent dies, the FUSE
 //! server unmounts and exits.
 
-use std::ffi::OsStr;
+use std::ffi::{CStr, CString, OsStr};
+use std::io::{Read, Seek, SeekFrom};
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -26,6 +38,7 @@ use fuse3::path::reply::{
 use fuse3::path::{PathFilesystem, Session};
 use fuse3::{FileType, MountOptions, Result};
 use futures_util::stream;
+use glob::Pattern;
 
 use crate::sandbox::die_with_error;
 
@@ -44,15 +57,238 @@ pub(crate) static HOST_MOUNT_POINT: std::sync::OnceLock<PathBuf> = std::sync::On
 /// PID of the sandbox (host) process; the FUSE server exits when it dies.
 static HOST_PID: AtomicI32 = AtomicI32::new(0);
 
-/// A trivial read-only filesystem containing a single virtual file.
-struct HelloFs {
-    uid: u32,
-    gid: u32,
+const TTL: Duration = Duration::from_secs(1);
+
+/// One compiled mirror pattern: the whole-path form for matching concrete
+/// files, and the per-component form for the directory-prefix checks used
+/// by lookup/readdir to keep ancestor directories visible.
+#[derive(Clone)]
+struct MirrorPattern {
+    full: Pattern,
+    comps: Vec<Pattern>,
 }
 
-const HELLO_CONTENT: &[u8] = b"Hello from the rs-bubble host filesystem!\n";
+/// Walk result of comparing a pattern's components against a path's
+/// components.
+enum Walk {
+    /// All path components matched; `usize` is the pattern index.
+    Ok(usize),
+    /// A `**` component was reached: the pattern covers this directory
+    /// itself and everything below it.
+    StarStar,
+    /// No match.
+    Fail,
+}
 
-const TTL: Duration = Duration::from_secs(1);
+/// The mirror filesystem: a read-only view of the paths selected by the
+/// spec's `hostfs.mirror` glob patterns, reproduced at the same absolute
+/// paths below `/host`. Nothing is pre-expanded; every operation matches
+/// against the patterns directly.
+#[derive(Clone)]
+struct HostFs {
+    uid: u32,
+    gid: u32,
+    patterns: Vec<MirrorPattern>,
+}
+
+impl HostFs {
+    /// Compile the mirror patterns. Invalid patterns are a hard error.
+    fn collect(patterns: &[String]) -> HostFs {
+        let compiled = patterns
+            .iter()
+            .map(|p| {
+                let full = compile(p);
+                let comps = p
+                    .split('/')
+                    .filter(|c| !c.is_empty())
+                    .map(compile)
+                    .collect();
+                MirrorPattern { full, comps }
+            })
+            .collect();
+        HostFs {
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            patterns: compiled,
+        }
+    }
+
+    /// Map a sandbox-relative path (as passed by the FUSE bridge, without a
+    /// leading slash) to the mirrored host path. The mirror reproduces full
+    /// host paths, so `/host/etc/passwd` maps to host `/etc/passwd`.
+    fn host_path(&self, path: &OsStr) -> PathBuf {
+        let rel = Path::new(path);
+        let mut host = PathBuf::from("/");
+        for component in rel.components() {
+            host.push(component);
+        }
+        host
+    }
+
+    /// Whether a host path matches one of the patterns directly (as a file,
+    /// symlink, or a directory named by the pattern itself).
+    fn matches(&self, host: &Path) -> bool {
+        // `*` must not cross directory separators, like in a shell.
+        self.patterns.iter().any(|p| {
+            p.full.matches_path_with(
+                host,
+                glob::MatchOptions {
+                    require_literal_separator: true,
+                    ..Default::default()
+                },
+            )
+        })
+    }
+
+    /// Whether the mirrored host path exists at all: it either matches a
+    /// pattern itself or is an ancestor of something that does (so the tree
+    /// under `/host` stays navigable down to the matched leaves).
+    fn exists(&self, host: &Path) -> bool {
+        self.matches(host) || self.dir_prefix(host)
+    }
+
+    /// Whether the pattern could still match something *strictly below* the
+    /// given host path — i.e. the path acts as a (possibly virtual)
+    /// directory of the mirror, leading to matches deeper down.
+    fn dir_prefix(&self, host: &Path) -> bool {
+        if host == Path::new("/") {
+            return !self.patterns.is_empty();
+        }
+        let comps: Vec<Component> = host.components().collect();
+        self.patterns
+            .iter()
+            .any(|p| self.pattern_could_reach(p, &comps))
+    }
+
+    /// Walk the pattern components alongside the path components.
+    fn pattern_walk(&self, p: &MirrorPattern, comps: &[Component]) -> Walk {
+        let mut pi = 0;
+        for c in comps {
+            let Component::Normal(name) = c else {
+                continue;
+            };
+            // Non-UTF-8 components can never match a glob pattern.
+            let Some(name) = name.to_str() else {
+                return Walk::Fail;
+            };
+            if pi >= p.comps.len() {
+                return Walk::Fail;
+            }
+            if p.comps[pi].as_str() == "**" {
+                return Walk::StarStar;
+            }
+            if !p.comps[pi].matches(name) {
+                return Walk::Fail;
+            }
+            pi += 1;
+        }
+        Walk::Ok(pi)
+    }
+
+    /// Could this pattern match a path strictly below `comps`? (The pattern
+    /// must still have components left after the path is consumed.)
+    fn pattern_could_reach(&self, p: &MirrorPattern, comps: &[Component]) -> bool {
+        match self.pattern_walk(p, comps) {
+            Walk::Ok(pi) => pi < p.comps.len(),
+            Walk::StarStar => true,
+            Walk::Fail => false,
+        }
+    }
+
+    /// Does this pattern name the directory `comps` itself (or reach a
+    /// `**`), making it a recursive mirror whose *entire* contents are
+    /// visible?
+    fn pattern_exact(&self, p: &MirrorPattern, comps: &[Component]) -> bool {
+        match self.pattern_walk(p, comps) {
+            Walk::Ok(pi) => pi == p.comps.len(),
+            Walk::StarStar => true,
+            Walk::Fail => false,
+        }
+    }
+
+    /// The `lstat`-style attribute of a mirrored path, or ENOENT.
+    fn attr(&self, host: &Path) -> std::io::Result<FileAttr> {
+        match std::fs::symlink_metadata(host) {
+            Ok(md) => Ok(attr_from_metadata(&md)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The visible entries of a mirrored directory, sorted by name: every
+    /// real entry that matches a pattern (directly or as an ancestor of a
+    /// match) — and, when the directory is itself matched by a pattern, all
+    /// of its real entries.
+    fn dir_entries(&self, host: &Path) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
+        // A directory named by a pattern itself is a recursive mirror: all
+        // of its real entries are visible, not only pattern matches.
+        let comps: Vec<Component> = host.components().collect();
+        let unfiltered = self.matches(host)
+            || self
+                .patterns
+                .iter()
+                .any(|p| self.pattern_exact(p, &comps));
+        let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(host) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.file_name())
+                .filter(|name| {
+                    let child = host.join(name);
+                    unfiltered || self.exists(&child)
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let child = host.join(&name);
+                (name, self.attr(&child))
+            })
+            .collect()
+    }
+}
+
+fn compile(pattern: &str) -> Pattern {
+    Pattern::new(pattern)
+        .unwrap_or_else(|e| die(&format!("Invalid hostfs mirror pattern {pattern:?}: {e}")))
+}
+
+fn attr_from_metadata(md: &std::fs::Metadata) -> FileAttr {
+    let kind = md.file_type();
+    let kind = if kind.is_dir() {
+        FileType::Directory
+    } else if kind.is_symlink() {
+        FileType::Symlink
+    } else if kind.is_char_device() {
+        FileType::CharDevice
+    } else if kind.is_block_device() {
+        FileType::BlockDevice
+    } else if kind.is_fifo() {
+        FileType::NamedPipe
+    } else if kind.is_socket() {
+        FileType::Socket
+    } else {
+        FileType::RegularFile
+    };
+    FileAttr {
+        size: md.size(),
+        blocks: md.blocks(),
+        atime: SystemTime::UNIX_EPOCH
+            + Duration::new(md.atime().max(0) as u64, md.atime_nsec().max(0) as u32),
+        mtime: SystemTime::UNIX_EPOCH
+            + Duration::new(md.mtime().max(0) as u64, md.mtime_nsec().max(0) as u32),
+        ctime: SystemTime::UNIX_EPOCH
+            + Duration::new(md.ctime().max(0) as u64, md.ctime_nsec().max(0) as u32),
+        kind,
+        perm: (md.mode() & 0o7777) as u16,
+        nlink: md.nlink() as u32,
+        uid: md.uid(),
+        gid: md.gid(),
+        rdev: md.rdev() as u32,
+        blksize: md.blksize() as u32,
+    }
+}
 
 fn root_attr(uid: u32, gid: u32) -> FileAttr {
     FileAttr {
@@ -71,37 +307,13 @@ fn root_attr(uid: u32, gid: u32) -> FileAttr {
     }
 }
 
-fn hello_attr(uid: u32, gid: u32) -> FileAttr {
-    FileAttr {
-        size: HELLO_CONTENT.len() as u64,
-        blocks: 1,
-        atime: SystemTime::UNIX_EPOCH,
-        mtime: SystemTime::UNIX_EPOCH,
-        ctime: SystemTime::UNIX_EPOCH,
-        kind: FileType::RegularFile,
-        perm: 0o444,
-        nlink: 1,
-        uid,
-        gid,
-        rdev: 0,
-        blksize: 4096,
-    }
-}
-
-const HELLO_NAME: &str = "hello.txt";
-
-/// The bridge passes absolute paths ("/hello.txt"); accept those and be
-/// lenient about a missing leading slash.
-fn is_hello(path: &OsStr) -> bool {
-    let p = Path::new(path);
-    p == Path::new(HELLO_NAME) || p == Path::new("/").join(HELLO_NAME)
-}
-
+/// The bridge passes absolute paths ("/etc/passwd") and is lenient about a
+/// missing leading slash.
 fn is_root(path: &OsStr) -> bool {
     path == Path::new("/") || path.is_empty()
 }
 
-impl PathFilesystem for HelloFs {
+impl PathFilesystem for HostFs {
     async fn init(&self, _req: fuse3::raw::Request) -> Result<ReplyInit> {
         Ok(ReplyInit {
             max_write: NonZeroU32::new(4096).unwrap(),
@@ -118,10 +330,11 @@ impl PathFilesystem for HelloFs {
     ) -> Result<ReplyEntry> {
         // The path-based API calls lookup with the parent path; "/" means the
         // root directory itself.
-        if parent == Path::new("/") && name == Path::new(HELLO_NAME) {
+        let host = self.host_path(parent).join(name);
+        if self.exists(&host) {
             return Ok(ReplyEntry {
                 ttl: TTL,
-                attr: hello_attr(self.uid, self.gid),
+                attr: self.attr(&host)?,
             });
         }
         Err(libc::ENOENT.into())
@@ -139,26 +352,48 @@ impl PathFilesystem for HelloFs {
                 ttl: TTL,
                 attr: root_attr(self.uid, self.gid),
             }),
-            Some(p) if is_hello(p) => Ok(ReplyAttr {
-                ttl: TTL,
-                attr: hello_attr(self.uid, self.gid),
-            }),
-            _ => Err(libc::ENOENT.into()),
+            Some(p) => {
+                let host = self.host_path(p);
+                if self.exists(&host) {
+                    return Ok(ReplyAttr {
+                        ttl: TTL,
+                        attr: self.attr(&host)?,
+                    });
+                }
+                Err(libc::ENOENT.into())
+            }
+            None => Err(libc::ENOENT.into()),
         }
     }
 
-    async fn open(
-        &self,
-        _req: fuse3::raw::Request,
-        path: &OsStr,
-        _flags: u32,
-    ) -> Result<ReplyOpen> {
-        if is_hello(path) {
-            // fh 0 = stateless IO; the filesystem is read-only, so any write
-            // flags would already have been rejected by the kernel.
-            return Ok(ReplyOpen { fh: 0, flags: 0 });
+    async fn readlink(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyData> {
+        let host = self.host_path(path);
+        if !self.exists(&host) {
+            return Err(libc::ENOENT.into());
         }
-        Err(libc::ENOENT.into())
+        let target = std::fs::read_link(&host)?;
+        Ok(ReplyData::from(Bytes::copy_from_slice(
+            target.as_os_str().as_encoded_bytes(),
+        )))
+    }
+
+    async fn open(&self, _req: fuse3::raw::Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
+        let host = self.host_path(path);
+        // Opening is only for files actually selected by a pattern; a
+        // directory that merely leads to a match is not openable.
+        if !self.matches(&host) {
+            return Err(libc::ENOENT.into());
+        }
+        if std::fs::metadata(&host).map(|m| m.is_dir()).unwrap_or(true) {
+            return Err(libc::EISDIR.into());
+        }
+        if flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0 {
+            // The mirror is read-only; the kernel usually rejects writes on
+            // the read-only mount already, but be defensive.
+            return Err(libc::EACCES.into());
+        }
+        // fh 0 = stateless IO; every read re-opens the host file.
+        Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
     async fn read(
@@ -169,16 +404,88 @@ impl PathFilesystem for HelloFs {
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
-        match path {
-            Some(p) if is_hello(p) => {
-                let start = (offset as usize).min(HELLO_CONTENT.len());
-                let end = (start + size as usize).min(HELLO_CONTENT.len());
-                Ok(ReplyData::from(Bytes::copy_from_slice(
-                    &HELLO_CONTENT[start..end],
-                )))
-            }
-            _ => Err(libc::ENOENT.into()),
+        let Some(p) = path else {
+            return Err(libc::ENOENT.into());
+        };
+        let host = self.host_path(p);
+        if !self.matches(&host) {
+            return Err(libc::ENOENT.into());
         }
+        let mut file = std::fs::File::open(&host)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; size as usize];
+        let n = file.read(&mut buf)?;
+        buf.truncate(n);
+        Ok(ReplyData::from(Bytes::from(buf)))
+    }
+
+    async fn statfs(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyStatFs> {
+        // Report the real filesystem holding the mirrored path (or "/" for
+        // the root), so tools like `df` behave sensibly.
+        let host = if is_root(path) {
+            PathBuf::from("/")
+        } else {
+            self.host_path(path)
+        };
+        let cpath = CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
+        let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut vfs) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(ReplyStatFs {
+            blocks: vfs.f_blocks,
+            bfree: vfs.f_bfree,
+            bavail: vfs.f_bavail,
+            files: vfs.f_files,
+            ffree: vfs.f_ffree,
+            bsize: vfs.f_bsize as u32,
+            namelen: vfs.f_namemax as u32,
+            frsize: vfs.f_frsize as u32,
+        })
+    }
+
+    async fn opendir(
+        &self,
+        _req: fuse3::raw::Request,
+        path: &OsStr,
+        _flags: u32,
+    ) -> Result<ReplyOpen> {
+        let host = self.host_path(path);
+        if !self.exists(&host) || !is_root(path) && !self.is_real_dir(&host) {
+            return Err(libc::ENOENT.into());
+        }
+        Ok(ReplyOpen { fh: 0, flags: 0 })
+    }
+
+    async fn readdir<'a>(
+        &'a self,
+        _req: fuse3::raw::Request,
+        path: &'a OsStr,
+        _fh: u64,
+        offset: i64,
+    ) -> Result<ReplyDirectory<impl futures_util::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
+    {
+        let host = self.host_path(path);
+        if !self.exists(&host) || !is_root(path) && !self.is_real_dir(&host) {
+            return Err(libc::ENOENT.into());
+        }
+        let entries: Vec<_> = self
+            .dir_entries(&host)
+            .into_iter()
+            .skip(offset.max(0) as usize)
+            .enumerate()
+            .map(|(i, (name, attr))| {
+                Ok(DirectoryEntry {
+                    kind: attr.map(|a| a.kind).unwrap_or(FileType::RegularFile),
+                    name,
+                    offset: offset.max(0) + i as i64 + 1,
+                })
+            })
+            .collect();
+        Ok(ReplyDirectory {
+            entries: stream::iter(entries),
+        })
     }
 
     async fn readdirplus<'a>(
@@ -193,109 +500,72 @@ impl PathFilesystem for HelloFs {
             impl futures_util::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a,
         >,
     > {
-        if !is_root(path) {
+        let host = self.host_path(path);
+        if !self.exists(&host) || !is_root(path) && !self.is_real_dir(&host) {
             return Err(libc::ENOENT.into());
         }
-        // One entry; `offset` is the offset of the *next* entry, so a single
-        // entry always has offset 1.
-        let entries = if offset == 0 {
-            vec![Ok(DirectoryEntryPlus {
-                kind: FileType::RegularFile,
-                name: HELLO_NAME.into(),
-                offset: 1,
-                attr: hello_attr(self.uid, self.gid),
-                entry_ttl: TTL,
-                attr_ttl: TTL,
-            })]
-        } else {
-            Vec::new()
-        };
+        let entries: Vec<_> = self
+            .dir_entries(&host)
+            .into_iter()
+            .skip(offset as usize)
+            .enumerate()
+            .map(|(i, (name, attr))| {
+                Ok(DirectoryEntryPlus {
+                    kind: attr.as_ref().map(|a| a.kind).unwrap_or(FileType::RegularFile),
+                    name,
+                    offset: (offset + i as u64 + 1) as i64,
+                    attr: attr?,
+                    entry_ttl: TTL,
+                    attr_ttl: TTL,
+                })
+            })
+            .collect();
         Ok(ReplyDirectoryPlus {
             entries: stream::iter(entries),
         })
     }
 
-    async fn access(&self, _req: fuse3::raw::Request, path: &OsStr, _mask: u32) -> Result<()> {
-        if is_root(path) || is_hello(path) {
-            Ok(())
-        } else {
-            Err(libc::ENOENT.into())
-        }
-    }
-
-    async fn statfs(&self, _req: fuse3::raw::Request, _path: &OsStr) -> Result<ReplyStatFs> {
-        Ok(ReplyStatFs {
-            blocks: 1,
-            bfree: 0,
-            bavail: 0,
-            files: 1,
-            ffree: 0,
-            bsize: 4096,
-            namelen: 255,
-            frsize: 4096,
-        })
-    }
-
-    async fn opendir(
-        &self,
-        _req: fuse3::raw::Request,
-        path: &OsStr,
-        _flags: u32,
-    ) -> Result<ReplyOpen> {
-        if is_root(path) {
-            return Ok(ReplyOpen { fh: 0, flags: 0 });
-        }
-        Err(libc::ENOENT.into())
-    }
-
-    async fn readdir<'a>(
-        &'a self,
-        _req: fuse3::raw::Request,
-        path: &'a OsStr,
-        _fh: u64,
-        offset: i64,
-    ) -> Result<ReplyDirectory<impl futures_util::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
-    {
-        if !is_root(path) {
+    async fn access(&self, _req: fuse3::raw::Request, path: &OsStr, mask: u32) -> Result<()> {
+        let host = self.host_path(path);
+        if !self.exists(&host) {
             return Err(libc::ENOENT.into());
         }
-        // One entry; `offset` is the offset of the *next* entry, so a single
-        // entry always has offset 1.
-        let entries = if offset <= 0 {
-            vec![Ok(DirectoryEntry {
-                kind: FileType::RegularFile,
-                name: HELLO_NAME.into(),
-                offset: 1,
-            })]
-        } else {
-            Vec::new()
-        };
-        Ok(ReplyDirectory {
-            entries: stream::iter(entries),
-        })
+        // Ask the real filesystem, with the server's real (host) credentials.
+        let cpath = CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
+        if unsafe { libc::access(cpath.as_ptr(), mask as libc::c_int) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+}
+
+impl HostFs {
+    /// Whether the host path refers to a real directory (following
+    /// symlinks); used by opendir/readdir to reject files.
+    fn is_real_dir(&self, host: &Path) -> bool {
+        std::fs::metadata(host).map(|m| m.is_dir()).unwrap_or(false)
     }
 }
 
 /// Fork the FUSE server process, wait for it to mount, and record the
 /// mountpoint for the sandbox child. Must run before any namespace setup.
 ///
+/// `config` is the spec's `hostfs` section; the patterns are compiled inside
+/// the server process (after the fork).
+///
 /// On success the mountpoint path is stored in `HOST_MOUNT_POINT` (inherited
 /// by every later fork). On any failure the process dies.
-pub fn start_host_fs() {
+pub fn start_host_fs(config: &crate::spec::HostFsConfig) {
     // Create the mountpoint directory in the parent so both the server and the
     // sandbox (and its children) can agree on a stable path.
     let mut tmpl: Vec<u8> = b"/tmp/rs-bubble.host.XXXXXX".to_vec();
     tmpl.push(0);
     let mountpoint = unsafe {
-        let raw = libc::mkdtemp(
-            std::ffi::CString::from_vec_with_nul(tmpl)
-                .unwrap()
-                .into_raw(),
-        );
+        let raw = libc::mkdtemp(CString::from_vec_with_nul(tmpl).unwrap().into_raw());
         if raw.is_null() {
             die_with_error("Can't create temporary host-fs mountpoint");
         }
-        PathBuf::from(std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned())
+        PathBuf::from(CStr::from_ptr(raw).to_string_lossy().into_owned())
     };
 
     let _ = HOST_MOUNT_POINT.set(mountpoint.clone());
@@ -315,7 +585,7 @@ pub fn start_host_fs() {
     if pid == 0 {
         // Child: serve the FUSE filesystem forever (or until the host dies).
         unsafe { libc::close(read_fd) };
-        serve(mountpoint, write_fd);
+        serve(config.mirror.clone(), mountpoint, write_fd);
         // serve never returns
     }
 
@@ -337,9 +607,10 @@ pub fn start_host_fs() {
 /// loop is a spawned task, and a current-thread runtime only polls its tasks
 /// while `block_on` is running — returning early would silently stall the
 /// event loop and every filesystem access would hang.
-fn serve(mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
+fn serve(mirror: Vec<String>, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
+    let fs = HostFs::collect(&mirror);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -349,7 +620,7 @@ fn serve(mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let outcome = {
         let mp = mountpoint.clone();
         runtime.block_on(async move {
-            let handle = match mount_with_fallback(&mp, uid, gid).await {
+            let handle = match mount_with_fallback(&mp, uid, gid, &fs).await {
                 Ok(handle) => handle,
                 Err(e) => return Err(e),
             };
@@ -389,6 +660,7 @@ async fn mount_with_fallback(
     mountpoint: &Path,
     uid: u32,
     gid: u32,
+    fs: &HostFs,
 ) -> std::io::Result<fuse3::raw::MountHandle> {
     let options = || {
         let mut o = MountOptions::default();
@@ -401,12 +673,12 @@ async fn mount_with_fallback(
         o
     };
     match Session::new(options())
-        .mount_with_unprivileged(HelloFs { uid, gid }, mountpoint)
+        .mount_with_unprivileged(fs.clone(), mountpoint)
         .await
     {
         Ok(handle) => Ok(handle),
         Err(unprivileged_err) => Session::new(options())
-            .mount(HelloFs { uid, gid }, mountpoint)
+            .mount(fs.clone(), mountpoint)
             .await
             .map_err(|privileged_err| {
                 std::io::Error::other(format!(
@@ -418,4 +690,127 @@ async fn mount_with_fallback(
 
 fn die(msg: &str) -> ! {
     crate::sandbox::die(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fs(patterns: &[&str]) -> HostFs {
+        HostFs::collect(
+            &patterns
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>(),
+        )
+    }
+
+    #[test]
+    fn host_path_maps_sandbox_paths_to_absolute_host_paths() {
+        let f = fs(&[]);
+        assert_eq!(
+            f.host_path(OsStr::new("/etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        // The bridge may omit the leading slash.
+        assert_eq!(
+            f.host_path(OsStr::new("etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        assert_eq!(f.host_path(OsStr::new("")), PathBuf::from("/"));
+        assert_eq!(f.host_path(OsStr::new("/")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn pattern_matching_per_operation() {
+        let f = fs(&["/etc/*.conf", "/home/me/project"]);
+
+        // Direct matches.
+        assert!(f.matches(Path::new("/etc/foo.conf")));
+        assert!(f.matches(Path::new("/home/me/project")));
+        assert!(!f.matches(Path::new("/etc/passwd")));
+
+        // exists: matches plus ancestor directories.
+        assert!(f.exists(Path::new("/etc/foo.conf")));
+        assert!(f.exists(Path::new("/etc"))); // ancestor of a match
+        assert!(f.exists(Path::new("/"))); // root
+        assert!(f.exists(Path::new("/home/me/project")));
+        assert!(!f.exists(Path::new("/etc/passwd")));
+        assert!(!f.exists(Path::new("/etc/nothing")));
+
+        // dir_prefix: only true for ancestors of matches — an exactly
+        // matched path (file or recursively mirrored directory) is not a
+        // prefix itself.
+        assert!(f.dir_prefix(Path::new("/etc")));
+        assert!(f.dir_prefix(Path::new("/home")));
+        assert!(f.dir_prefix(Path::new("/home/me")));
+        assert!(!f.dir_prefix(Path::new("/home/me/project")));
+        assert!(!f.dir_prefix(Path::new("/etc/passwd")));
+        assert!(!f.dir_prefix(Path::new("/etc/foo.conf")));
+    }
+
+    #[test]
+    fn double_star_spans_directories() {
+        let f = fs(&["/usr/share/**/*.rs"]);
+        assert!(f.exists(Path::new("/usr/share")));
+        assert!(f.dir_prefix(Path::new("/usr/share/doc")));
+        assert!(f.matches(Path::new("/usr/share/doc/x/y.rs")));
+        assert!(!f.matches(Path::new("/usr/share/doc/x/y.c")));
+    }
+
+    #[test]
+    fn readdir_filters_non_matching_entries() {
+        let base =
+            std::env::temp_dir().join(format!("rs-bubble-hostfs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.conf"), b"a").unwrap();
+        std::fs::write(base.join("b.txt"), b"b").unwrap();
+        std::fs::create_dir(base.join("c.conf.dir")).unwrap();
+        std::fs::write(base.join("c.conf.dir/x"), b"x").unwrap();
+        std::fs::create_dir(base.join("d.conf")).unwrap();
+        std::fs::write(base.join("d.conf/y"), b"y").unwrap();
+
+        let f = fs(&[&format!("{}/*.conf", base.display())]);
+
+        // Only matching entries (and entries leading to matches) survive.
+        let names: Vec<_> = f
+            .dir_entries(&base)
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"a.conf".to_string()));
+        assert!(names.contains(&"d.conf".to_string())); // a directory named by the pattern
+        assert!(!names.contains(&"b.txt".to_string()));
+        assert!(!names.contains(&"c.conf.dir".to_string()));
+
+        // An entry that only leads to a match (virtual ancestor) is shown.
+        let f = fs(&[&format!("{}/c.conf.dir/x", base.display())]);
+        let names: Vec<_> = f
+            .dir_entries(&base)
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"c.conf.dir".to_string()));
+        assert!(!names.contains(&"a.conf".to_string()));
+        assert!(!names.contains(&"b.txt".to_string()));
+
+        // An exactly matched directory is a recursive mirror: all real
+        // entries are visible.
+        let f = fs(&[&format!("{}", base.join("c.conf.dir").display())]);
+        let names: Vec<_> = f
+            .dir_entries(&base.join("c.conf.dir"))
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["x"]);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn empty_mirror_matches_nothing() {
+        let f = fs(&[]);
+        assert!(!f.exists(Path::new("/")));
+        assert!(f.dir_entries(Path::new("/")).is_empty());
+    }
 }

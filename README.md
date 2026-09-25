@@ -22,7 +22,8 @@ root, a fresh procfs at `/proc`, and the host network.
     { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
   ],
   "proc": "/proc",
-  "net": { "isolated": true, "allow": ["example.com:443"] }
+  "net": { "isolated": true, "allow": ["example.com:443"] },
+  "hostfs": { "mirror": ["/etc/*.conf"] }
 }
 ```
 
@@ -51,6 +52,13 @@ root, a fresh procfs at `/proc`, and the host network.
   rs-bubble process stays on the host and acts as a **TCP proxy**
 - `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`.
   Empty or missing means every target is allowed
+- `hostfs.mirror` — a list of **glob patterns** of absolute host paths
+  mirrored read-only under **`/host`**: matched paths appear at the same
+  absolute path below `/host` (`/etc/passwd` → `/host/etc/passwd`). A
+  pattern that names a directory exactly (`/usr/share/doc`) mirrors that
+  directory **recursively**; `**` spans directory levels
+  (`/usr/share/**/*.rs`). Ancestor directories are shown so the tree is
+  navigable down to the matched leaves. Missing or empty mirrors nothing.
 
 Everything on the command line (optionally after a `--` separator) is the
 command to run inside the sandbox:
@@ -218,6 +226,32 @@ case a hostile command could kill `P` (cutting its own network access —
 it gains nothing else). Fully separating them would require an additional
 namespace split.
 
+## The host filesystem at /host
+
+The sandbox always gets a read-only FUSE filesystem mounted at `/host`,
+served by a separate forked rs-bubble process. It mirrors the paths
+selected by the spec's `hostfs.mirror` glob patterns at their absolute
+host paths:
+
+```json
+{
+  "hostfs": { "mirror": ["/etc/*.conf", "/usr/share/doc"] }
+}
+```
+
+```sh
+rs-bubble -- /bin/sh -c 'cat /host/etc/hosts'
+```
+
+- Patterns are standard globs (`*`, `?`, `[...]`, `**`); they must be
+  absolute, and `*` does not cross directory separators (use `**` for
+  that). A pattern that names a directory exactly mirrors it with its
+  whole subtree.
+- The host tree is **not** crawled at startup: every FUSE operation
+  matches the requested path against the patterns on the fly, so a large
+  host tree costs nothing and only the accessed paths are touched.
+- The mirror is read-only; writes to `/host` fail.
+
 ## Requirements
 
 - Linux with unprivileged user namespaces enabled
@@ -228,5 +262,5 @@ namespace split.
 ## Status
 
 Starter project — the spec file's `ops` (bind, symlink, dev, tmpfs), `proc`,
-`net.isolated` and `net.allow` are implemented. Natural next steps would be
+`net.isolated`, `net.allow` and `hostfs.mirror` are implemented. Natural next steps would be
 read-only binds, `--die-with-parent`, and `--unshare-all`.

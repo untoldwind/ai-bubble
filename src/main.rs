@@ -38,7 +38,7 @@ fn main() {
 
     // Start the host FUSE filesystem server (in its own child process) before
     // any namespace setup, so the sandbox can bind-mount it at /host.
-    hostfs::start_host_fs();
+    hostfs::start_host_fs(&spec.hostfs);
 
     let net = &spec.net;
     let ops = spec.filesystem_ops();

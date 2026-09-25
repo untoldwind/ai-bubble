@@ -141,6 +141,18 @@ pub struct NetConfig {
     pub allow: Vec<String>,
 }
 
+/// The spec file's `hostfs` section: what the FUSE filesystem mounted at
+/// `/host` exposes.
+#[derive(Debug, Default, PartialEq, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostFsConfig {
+    /// Glob patterns (absolute host paths) mirrored under `/host`.
+    /// Matched paths appear at the same absolute path below `/host`
+    /// (`/etc/passwd` → `/host/etc/passwd`); matched directories are
+    /// mirrored recursively. Empty mirrors nothing.
+    pub mirror: Vec<String>,
+}
+
 /// The whole sandbox specification.
 #[derive(Debug, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -152,6 +164,8 @@ pub struct Spec {
     pub proc: Option<PathBuf>,
     /// Isolated-network configuration.
     pub net: NetConfig,
+    /// The host filesystem mounted at `/host`.
+    pub hostfs: HostFsConfig,
 }
 
 impl Spec {
@@ -345,6 +359,28 @@ mod tests {
                 dest: PathBuf::from("/dev")
             }]
         );
+    }
+
+    #[test]
+    fn hostfs_mirror_parses() {
+        let spec = parse(
+            r#"{ "hostfs": { "mirror": ["/etc/*.conf", "/home/me/project"] } }"#,
+        );
+        assert_eq!(
+            spec.hostfs.mirror,
+            ["/etc/*.conf".to_string(), "/home/me/project".to_string()]
+        );
+    }
+
+    #[test]
+    fn hostfs_defaults_to_no_mirror() {
+        let spec = parse("{}");
+        assert!(spec.hostfs.mirror.is_empty());
+    }
+
+    #[test]
+    fn hostfs_rejects_unknown_fields() {
+        assert!(serde_json::from_str::<Spec>(r#"{ "hostfs": { "nope": true } }"#).is_err());
     }
 
     #[test]
