@@ -33,6 +33,16 @@ root, a fresh procfs at `/proc`, and the host network.
   - `{"type": "symlink", "src": ..., "dest": ...}` — create a symlink at
     `DEST` pointing to `SRC` (mirrors bwrap: fails if `DEST` exists and is
     not the identical symlink)
+  - `{"type": "dev", "dest": ...}` — mount a minimal **`/dev`** at `DEST`
+    (like bwrap's `--dev`): the standard device nodes (`null`, `zero`,
+    `full`, `random`, `urandom`, `tty`), the stdio symlinks, `/dev/shm`,
+    a fresh devpts at `DEST/pts` with the `ptmx` symlink, and
+    `/dev/console` bound to the host tty when stdin is one
+  - `{"type": "tmpfs", "dest": ..., "perms": ..., "size": ...}` — mount a
+    fresh **tmpfs** at `DEST` (like bwrap's `--tmpfs`, with
+    `MS_NOSUID|MS_NODEV`). `perms` is the octal mode of the mount root
+    (number or string, default `0755`, like bwrap's `--perms`) and `size`
+    the maximum size in bytes (bwrap's `--size`); both are optional
 - `proc` — where to mount a **fresh procfs instance**
   (like bwrap: `MS_NOSUID|MS_NOEXEC|MS_NODEV`). If not given, a fresh
   procfs is mounted at `/proc` automatically
@@ -217,7 +227,6 @@ namespace split.
 
 ## Status
 
-Starter project — the spec file's `ops` (bind, symlink), `proc`,
+Starter project — the spec file's `ops` (bind, symlink, dev, tmpfs), `proc`,
 `net.isolated` and `net.allow` are implemented. Natural next steps would be
-read-only binds, `--dev`, `--tmpfs`, `--die-with-parent`, and
-`--unshare-all`.
+read-only binds, `--die-with-parent`, and `--unshare-all`.

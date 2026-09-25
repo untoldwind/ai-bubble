@@ -8,11 +8,12 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use crate::spec::Op;
+use crate::spec::{Op, TmpfsPerms};
 
 pub(crate) fn die(msg: &str) -> ! {
     eprintln!("rs-bubble: {msg}");
@@ -258,6 +259,33 @@ pub(crate) unsafe fn drop_all_capabilities() {
     }
 }
 
+/// Mount a fresh tmpfs on `dest_abs` (a path inside the new sandbox root),
+/// like bwrap's `setup_op_tmpfs_mount`: `MS_NOSUID | MS_NODEV`, a `mode=`
+/// option and an optional `size=` (bytes; 0 means the kernel default).
+pub(crate) unsafe fn mount_tmpfs(dest_abs: &Path, perms: TmpfsPerms, size: Option<u64>, display: &Path) {
+    let mut options = perms.mount_option();
+    if let Some(bytes) = size {
+        if bytes == 0 {
+            die("Invalid tmpfs size 0");
+        }
+        options.push_str(&format!(",size={bytes}"));
+    }
+    let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
+    let options_c = CString::new(options).unwrap();
+    if unsafe {
+        libc::mount(
+            CString::new("tmpfs").unwrap().as_ptr(),
+            dest_c.as_ptr(),
+            CString::new("tmpfs").unwrap().as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            options_c.as_ptr() as *const libc::c_void,
+        )
+    } != 0
+    {
+        die_with_error(&format!("Can't mount tmpfs on {}", display.display()));
+    }
+}
+
 /// Build the tmpfs sandbox filesystem and exec COMMAND.
 ///
 /// Must run as PID 1 of a fresh PID namespace (see pidns_and_exec) so that
@@ -387,6 +415,133 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
                     ) != 0
                     {
                         die_with_error(&format!("Can't mount proc on {}", dest.display()));
+                    }
+                }
+                Op::Tmpfs { dest, perms, size } => {
+                    if dest
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        die(&format!("Invalid tmpfs mount point {}", dest.display()));
+                    }
+                    mkdir_p(&newroot, dest);
+                    let dest_abs = sandbox_path(&newroot, dest);
+                    mount_tmpfs(&dest_abs, perms.unwrap_or(TmpfsPerms::DEFAULT), *size, dest);
+                }
+                Op::Dev { dest } => {
+                    if dest
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        die(&format!("Invalid dev mount point {}", dest.display()));
+                    }
+                    mkdir_p(&newroot, dest);
+                    let dev_abs = sandbox_path(&newroot, dest);
+                    // Like bwrap's --dev: a fresh mode-0755 tmpfs, populated
+                    // with the standard device nodes and symlinks below.
+                    mount_tmpfs(&dev_abs, TmpfsPerms(0o755), None, dest);
+
+                    /// Bind-mount a host path over `name` inside the dev tmpfs.
+                    unsafe fn bind_into_dev(src: &str, dest_abs: &Path, name: &str) {
+                        let src_c = CString::new(src).unwrap();
+                        let dest_c =
+                            CString::new(dest_abs.join(name).as_os_str().as_bytes()).unwrap();
+                        if unsafe {
+                            libc::mount(
+                                src_c.as_ptr(),
+                                dest_c.as_ptr(),
+                                std::ptr::null(),
+                                libc::MS_BIND,
+                                std::ptr::null(),
+                            )
+                        } != 0
+                        {
+                            die_with_error(&format!("Can't bind mount {src} to /{name}"));
+                        }
+                    }
+
+                    // The device nodes: bwrap creates a read-only placeholder
+                    // file and bind-mounts the host node over it (device
+                    // access works because the bind mount carries it over).
+                    for name in ["null", "zero", "full", "random", "urandom", "tty"] {
+                        let node = dev_abs.join(name);
+                        if fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o444)
+                            .open(&node)
+                            .is_err()
+                        {
+                            die_with_error(&format!("Can't create device placeholder {name}"));
+                        }
+                        bind_into_dev(&format!("/dev/{name}"), &dev_abs, name);
+                    }
+
+                    // The stdio symlinks and the legacy /dev/fd, /dev/core.
+                    for (name, target) in [
+                        ("stdin", "/proc/self/fd/0"),
+                        ("stdout", "/proc/self/fd/1"),
+                        ("stderr", "/proc/self/fd/2"),
+                        ("fd", "/proc/self/fd"),
+                        ("core", "/proc/kcore"),
+                    ] {
+                        let dest_c =
+                            CString::new(dev_abs.join(name).as_os_str().as_bytes()).unwrap();
+                        let target_c = CString::new(target).unwrap();
+                        if libc::symlink(target_c.as_ptr(), dest_c.as_ptr()) != 0 {
+                            die_with_error(&format!("Can't make symlink {name} -> {target}"));
+                        }
+                    }
+
+                    let dir_mode = fs::Permissions::from_mode(0o755);
+                    for name in ["shm", "pts"] {
+                        let dir = dev_abs.join(name);
+                        if fs::create_dir(&dir).is_err() {
+                            die_with_error(&format!("Can't create {name} in dev"));
+                        }
+                        let _ = fs::set_permissions(&dir, dir_mode.clone());
+                    }
+
+                    // A fresh devpts instance on /dev/pts, with the ptmx
+                    // symlink, exactly like bwrap's --dev.
+                    let pts_c = CString::new(dev_abs.join("pts").as_os_str().as_bytes()).unwrap();
+                    if libc::mount(
+                        CString::new("devpts").unwrap().as_ptr(),
+                        pts_c.as_ptr(),
+                        CString::new("devpts").unwrap().as_ptr(),
+                        libc::MS_NOSUID | libc::MS_NOEXEC,
+                        CString::new("newinstance,ptmxmode=0666,mode=620")
+                            .unwrap()
+                            .as_ptr() as *const libc::c_void,
+                    ) != 0
+                    {
+                        die_with_error("Can't mount devpts on /dev/pts");
+                    }
+                    let ptmx_c =
+                        CString::new(dev_abs.join("ptmx").as_os_str().as_bytes()).unwrap();
+                    let target_c = CString::new("pts/ptmx").unwrap();
+                    if libc::symlink(target_c.as_ptr(), ptmx_c.as_ptr()) != 0 {
+                        die_with_error("Can't make symlink ptmx -> pts/ptmx");
+                    }
+
+                    // If stdin is a tty, bind-mount that host device as
+                    // /dev/console so ttyname() works in the sandbox (bwrap
+                    // does the same; it grants no extra access).
+                    let tty = libc::ttyname(0);
+                    if !tty.is_null() {
+                        let host_tty = CStr::from_ptr(tty);
+                        if !host_tty.to_bytes().is_empty() {
+                            if fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .mode(0o444)
+                                .open(dev_abs.join("console"))
+                                .is_err()
+                            {
+                                die_with_error("Can't create device placeholder console");
+                            }
+                            bind_into_dev(&host_tty.to_string_lossy(), &dev_abs, "console");
+                        }
                     }
                 }
                 Op::Symlink { src, dest } => {

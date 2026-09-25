@@ -2,10 +2,14 @@
   "ops": [
     { "type": "bind",    "src": "/usr", "dest": "/usr" },
     { "type": "bind",    "src": "/etc", "dest": "/etc" },
+    { "type": "dev",     "dest": "/dev" },
+    { "type": "tmpfs",   "dest": "/tmp" },
+    { "type": "tmpfs",   "dest": "/run" },
+    { "type": "tmpfs",   "dest": "/home" },
     { "type": "symlink", "src": "usr/lib", "dest": "/lib" },
     { "type": "symlink", "src": "usr/lib64", "dest": "/lib64" },
     { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
   ],
   "proc": "/proc",
-  "net": { "isolated": true, "allow": ["google.com:443"] }
+  "net": { "isolated": true, "allow": ["google.com:443", "opencode.ai:443"] }
 }
