@@ -172,6 +172,47 @@ impl Pattern {
             Walk::CouldReach
         }
     }
+
+    /// If walking `path` leaves the pattern with a next component that is
+    /// purely literal (no wildcards), return that component. Used to
+    /// enumerate the virtual directory entries of `empty` paths below a
+    /// directory the host does not (or only partially) provide.
+    pub fn next_literal(&self, path: &Path) -> Option<String> {
+        let mut pi = 0;
+        for c in path.components() {
+            let Component::Normal(name) = c else {
+                continue;
+            };
+            let name = name.to_str()?;
+            if pi >= self.comps.len() {
+                return None;
+            }
+            match &self.comps[pi] {
+                Comp::DoubleStar => return None,
+                Comp::Chars(tokens) => {
+                    let chars: Vec<char> = name.chars().collect();
+                    if !match_component(tokens, &chars) {
+                        return None;
+                    }
+                }
+            }
+            pi += 1;
+        }
+        match self.comps.get(pi) {
+            Some(Comp::Chars(tokens)) if tokens.iter().all(|t| matches!(t, Token::Literal(_))) => {
+                Some(
+                    tokens
+                        .iter()
+                        .map(|t| match t {
+                            Token::Literal(c) => c.to_string(),
+                            _ => unreachable!("checked above"),
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Walk result of comparing a pattern's components against a path's

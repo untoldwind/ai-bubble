@@ -50,23 +50,15 @@
       "description": "The spec file's `hostfs` section: what the FUSE filesystem mounted at `/host` exposes.",
       "type": "object",
       "properties": {
-        "emptyDirs": {
-          "description": "Absolute paths exposed as **empty, unwritable directories** (mode 0555, no contents), taking *precedence* over `mirror`: nothing below an entry is visible, and the entry itself is shown even when a mirror pattern (or the real host path) covers it. Meant as mount points inside the sandbox, e.g. `/dev`, `/tmp`, `/proc` — or the sandbox root itself with `hostfs.root`.",
-          "default": [],
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "mirror": {
-          "description": "An ordered mapping from glob patterns (absolute host paths) to permissions: matched paths are mirrored read-only under `/host` (`\"mirror\"`) or hidden (`\"hide\"`). Order matters — when a path matches several patterns, the **last** matching pattern decides. Matched paths appear at the same absolute path below `/host` (`/etc/passwd` → `/host/etc/passwd`); matched directories are mirrored recursively (or, when hidden, disappear with their whole subtree). Empty mirrors nothing.",
+        "patterns": {
+          "description": "An ordered mapping from glob patterns (absolute host paths) to permissions: matched paths are mirrored read-only under `/host` (`\"mirror\"`), exposed empty (`\"empty\"` — an empty, unwritable directory, or an empty file when the pattern matches a real file), or hidden (`\"hide\"`). Order matters — when a path matches several patterns, the **last** matching pattern decides. Matched paths appear at the same absolute path below `/host` (`/etc/passwd` → `/host/etc/passwd`); matched directories are mirrored recursively (or, when hidden, disappear with their whole subtree). Nothing below an empty path is visible, and empty paths are shown even when a mirror pattern (or the real host path) covers them. Empty patterns match nothing.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/definitions/Permission"
           }
         },
         "root": {
-          "description": "**Experimental:** use the FUSE filesystem itself as the sandbox root instead of mounting it at `/host`. Everything mirrored appears at its absolute host path; the ops (`dev`, `tmpfs`, `proc`, binds) are mounted on top of it. Because the FUSE filesystem is read-only, every mount point must be listed in `emptyDirs` (or exist in the mirror).",
+          "description": "**Experimental:** use the FUSE filesystem itself as the sandbox root instead of mounting it at `/host`. Everything mirrored appears at its absolute host path; the ops (`dev`, `tmpfs`, `proc`, binds) are mounted on top of it. Because the FUSE filesystem is read-only, every mount point must be listed as `\"empty\"` in `patterns` (or exist in the mirror).",
           "default": false,
           "type": "boolean"
         }
@@ -231,7 +223,7 @@
       ]
     },
     "Permission": {
-      "description": "What happens to a path matched by a `hostfs.mirror` glob pattern: it is mirrored (and readable) under `/host`, or hidden.",
+      "description": "What happens to a path matched by a `hostfs.patterns` glob pattern.",
       "oneOf": [
         {
           "description": "The matched paths are mirrored under `/host` (read-only).",
@@ -245,6 +237,13 @@
           "type": "string",
           "enum": [
             "hide"
+          ]
+        },
+        {
+          "description": "The matched paths are exposed **empty**: as an empty, unwritable directory when the path is (or would be) a directory, or as an empty file when it matches a real file. Nothing below an empty path is visible. Meant as mount points inside the sandbox, e.g. `/dev`, `/tmp`, `/proc`.",
+          "type": "string",
+          "enum": [
+            "empty"
           ]
         }
       ]

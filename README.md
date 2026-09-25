@@ -23,7 +23,7 @@ root, a fresh procfs at `/proc`, and the host network.
   ],
   "proc": "/proc",
   "net": { "isolated": true, "allow": ["example.com:443"] },
-  "hostfs": { "mirror": { "/etc/*.conf": "mirror" } }
+  "hostfs": { "patterns": { "/etc/*.conf": "mirror" } }
 }
 ```
 
@@ -52,24 +52,25 @@ root, a fresh procfs at `/proc`, and the host network.
   rs-bubble process stays on the host and acts as a **TCP proxy**
 - `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`.
   Empty or missing means every target is allowed
-- `hostfs.mirror` — an **ordered** mapping from **glob patterns** of
-  absolute host paths to permissions (`"mirror"` or `"hide"`). Mirrored
-  paths are exposed read-only under **`/host`**: matched paths appear at
-  the same absolute path below `/host` (`/etc/passwd` →
-  `/host/etc/passwd`). A pattern that names a directory exactly
-  (`/usr/share/doc`) mirrors that directory **recursively**; `**` spans
-  directory levels (`/usr/share/**/*.rs`). Ancestor directories are shown
-  so the tree is navigable down to the matched leaves. **Order matters**:
-  when a path matches several patterns, the **last** matching pattern
-  decides — e.g. `{"/etc": "mirror", "/etc/passwd": "hide"}` hides
-  `/etc/passwd`. A hidden directory hides its whole subtree, too. Missing
-  or empty mirrors nothing.
-- `hostfs.emptyDirs` — a list of **absolute paths** exposed as **empty,
-  unwritable directories** (mode 0555, no contents). They take
-  *precedence* over `mirror`: nothing below an entry is visible, and the
-  entry itself is shown even when a mirror pattern covers it. Their
-  purpose is to provide mount points for the sandbox's ops (`dev`,
-  `tmpfs`, `proc`, binds) — see the `hostfs.root` mode below.
+- `hostfs.patterns` — an **ordered** mapping from **glob patterns** of
+  absolute host paths to permissions (`"mirror"`, `"hide"` or
+  `"empty"`). Mirrored paths are exposed read-only under **`/host`**:
+  matched paths appear at the same absolute path below `/host`
+  (`/etc/passwd` → `/host/etc/passwd`). A pattern that names a directory
+  exactly (`/usr/share/doc`) mirrors that directory **recursively**; `**`
+  spans directory levels (`/usr/share/**/*.rs`). Ancestor directories are
+  shown so the tree is navigable down to the matched leaves.
+  **Order matters**: when a path matches several patterns, the **last**
+  matching pattern decides — e.g. `{"/etc": "mirror", "/etc/passwd":
+  "hide"}` hides `/etc/passwd`. A hidden directory hides its whole
+  subtree, too. `"empty"` exposes the matched paths **empty**: as an
+  empty, unwritable directory (mode 0555) when the path is (or would be)
+  a directory — or as an **empty file** when the pattern matches a real
+  file. Empty paths take *precedence* over the mirror: nothing below
+  them is visible, and they are shown even when a mirror pattern covers
+  them. Their purpose is to provide mount points for the sandbox's ops
+  (`dev`, `tmpfs`, `proc`, binds) — see the `hostfs.root` mode below.
+  Missing or empty matches nothing.
 
 Everything on the command line (optionally after a `--` separator) is the
 command to run inside the sandbox:
@@ -243,13 +244,13 @@ namespace split.
 
 The sandbox always gets a read-only FUSE filesystem mounted at `/host`,
 served by a separate forked rs-bubble process. It mirrors the paths
-selected by the spec's ordered `hostfs.mirror` glob → permission map at
+selected by the spec's ordered `hostfs.patterns` glob → permission map at
 their absolute host paths:
 
 ```json
 {
   "hostfs": {
-    "mirror": {
+    "patterns": {
       "/etc/*.conf": "mirror",
       "/usr/share/doc": "mirror",
       "/etc/secret.conf": "hide"
@@ -266,8 +267,10 @@ rs-bubble -- /bin/sh -c 'cat /host/etc/hosts'
   absolute, and `*` does not cross directory separators (use `**` for
   that). A pattern that names a directory exactly mirrors it with its
   whole subtree. Each pattern's value is `"mirror"` (the matched paths are
-  mirrored) or `"hide"` (they are hidden); a hidden directory hides its
-  whole subtree. Since this is a JSON object, the patterns are tried in
+  mirrored), `"hide"` (they are hidden; a hidden directory hides its
+  whole subtree) or `"empty"` (they are exposed empty — an empty,
+  unwritable directory, or an empty file when the pattern matches a real
+  file). Since this is a JSON object, the patterns are tried in
   the order they are written and the **last** match wins — put more
   specific patterns after broader ones, e.g. mirror `/etc` and then hide
   `/etc/ssh`.
@@ -287,14 +290,16 @@ binds) are mounted **on top of** it:
 {
   "hostfs": {
     "root": true,
-    "mirror": {
+    "patterns": {
       "/bin": "mirror",
       "/etc": "mirror",
       "/lib": "mirror",
       "/lib64": "mirror",
-      "/usr": "mirror"
+      "/usr": "mirror",
+      "/dev": "empty",
+      "/tmp": "empty",
+      "/proc": "empty"
     },
-    "emptyDirs": ["/dev", "/tmp", "/proc"]
   },
   "ops": [
     { "type": "dev", "dest": "/dev" },
@@ -308,7 +313,7 @@ binds) are mounted **on top of** it:
 rs-bubble --spec hostfs-root.json -- /bin/sh
 ```
 
-The `emptyDirs` entries are exposed by the FUSE filesystem as empty,
+The `"empty"` entries are exposed by the FUSE filesystem as empty,
 unwritable (mode 0555) directories — pure mount points, taking *precedence*
 over the mirror (nothing below them is visible, and no mirror pattern can
 bring content back). They must exist for every mount point, because the
@@ -327,5 +332,5 @@ the read-only host view.
 ## Status
 
 Starter project — the spec file's `ops` (bind, symlink, dev, tmpfs), `proc`,
-`net.isolated`, `net.allow` and `hostfs.mirror` are implemented. Natural next steps would be
+`net.isolated`, `net.allow` and `hostfs.patterns` are implemented. Natural next steps would be
 read-only binds, `--die-with-parent`, and `--unshare-all`.

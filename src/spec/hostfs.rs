@@ -7,8 +7,7 @@ use serde::Deserialize;
 
 use schemars::JsonSchema;
 
-/// What happens to a path matched by a `hostfs.mirror` glob pattern:
-/// it is mirrored (and readable) under `/host`, or hidden.
+/// What happens to a path matched by a `hostfs.patterns` glob pattern.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
@@ -17,6 +16,12 @@ pub enum Permission {
     /// The matched paths are hidden. A hidden **directory** hides its
     /// whole subtree, too.
     Hide,
+    /// The matched paths are exposed **empty**: as an empty, unwritable
+    /// directory when the path is (or would be) a directory, or as an
+    /// empty file when it matches a real file. Nothing below an empty
+    /// path is visible. Meant as mount points inside the sandbox, e.g.
+    /// `/dev`, `/tmp`, `/proc`.
+    Empty,
 }
 
 impl fmt::Display for Permission {
@@ -24,11 +29,12 @@ impl fmt::Display for Permission {
         f.write_str(match self {
             Permission::Mirror => "mirror",
             Permission::Hide => "hide",
+            Permission::Empty => "empty",
         })
     }
 }
 
-/// The spec's `hostfs.mirror` setting: an *ordered* mapping from glob
+/// The spec's `hostfs.patterns` setting: an *ordered* mapping from glob
 /// patterns (absolute host paths) to [`Permission`]s.
 ///
 /// JSON objects do not guarantee key order, so this is deserialized by
@@ -36,9 +42,9 @@ impl fmt::Display for Permission {
 /// patterns were written in. That order matters: when a path matches
 /// several patterns, the **last** matching pattern decides.
 #[derive(Debug, Default, PartialEq, Clone)]
-pub struct Mirror(pub Vec<(String, Permission)>);
+pub struct Patterns(pub Vec<(String, Permission)>);
 
-impl Mirror {
+impl Patterns {
     /// The pattern/permission pairs, in spec order.
     pub fn iter(&self) -> impl Iterator<Item = &(String, Permission)> {
         self.0.iter()
@@ -49,37 +55,37 @@ impl Mirror {
     }
 }
 
-impl<'de> Deserialize<'de> for Mirror {
+impl<'de> Deserialize<'de> for Patterns {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> serde::de::Visitor<'de> for V {
-            type Value = Mirror;
+            type Value = Patterns;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("an object mapping glob patterns to \"mirror\" or \"hide\"")
+                f.write_str("an object mapping glob patterns to \"mirror\", \"hide\" or \"empty\"")
             }
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
-            ) -> Result<Mirror, A::Error> {
+            ) -> Result<Patterns, A::Error> {
                 let mut entries = Vec::new();
                 while let Some((pattern, permission)) = map.next_entry::<String, Permission>()? {
                     if !pattern.starts_with('/') {
                         return Err(serde::de::Error::custom(format!(
-                            "hostfs mirror pattern {pattern:?} is not an absolute path"
+                            "hostfs pattern {pattern:?} is not an absolute path"
                         )));
                     }
                     entries.push((pattern, permission));
                 }
-                Ok(Mirror(entries))
+                Ok(Patterns(entries))
             }
         }
         deserializer.deserialize_map(V)
     }
 }
 
-impl JsonSchema for Mirror {
+impl JsonSchema for Patterns {
     fn schema_name() -> String {
-        "Mirror".to_string()
+        "Patterns".to_string()
     }
 
     fn is_referenceable() -> bool {
@@ -94,11 +100,12 @@ impl JsonSchema for Mirror {
                 description: Some(
                     "An **ordered** mapping from glob patterns (absolute host paths) to \
                      permissions. Matched paths are mirrored read-only under `/host` \
-                     (`\"mirror\"`) or hidden (`\"hide\"`). Order matters: when a path \
-                     matches several patterns, the **last** matching pattern decides. \
-                     A pattern that names a directory exactly mirrors (or hides) it \
-                     recursively; a hidden directory hides its whole subtree. Empty \
-                     mirrors nothing."
+                     (`\"mirror\"`), exposed empty (`\"empty\"`: an empty, unwritable \
+                     directory — or an empty file when the pattern matches a real file), \
+                     or hidden (`\"hide\"`). Order matters: when a path matches several \
+                     patterns, the **last** matching pattern decides. A pattern that \
+                     names a directory exactly mirrors (or hides) it recursively; a \
+                     hidden directory hides its whole subtree. Empty matches nothing."
                         .to_string(),
                 ),
                 ..Default::default()
@@ -120,27 +127,23 @@ impl JsonSchema for Mirror {
 pub struct HostFsConfig {
     /// An ordered mapping from glob patterns (absolute host paths) to
     /// permissions: matched paths are mirrored read-only under `/host`
-    /// (`"mirror"`) or hidden (`"hide"`). Order matters — when a path
-    /// matches several patterns, the **last** matching pattern decides.
-    /// Matched paths appear at the same absolute path below `/host`
-    /// (`/etc/passwd` → `/host/etc/passwd`); matched directories are
-    /// mirrored recursively (or, when hidden, disappear with their whole
-    /// subtree). Empty mirrors nothing.
-    pub mirror: Mirror,
-    /// Absolute paths exposed as **empty, unwritable directories**
-    /// (mode 0555, no contents), taking *precedence* over `mirror`:
-    /// nothing below an entry is visible, and the entry itself is shown
-    /// even when a mirror pattern (or the real host path) covers it.
-    /// Meant as mount points inside the sandbox, e.g. `/dev`, `/tmp`,
-    /// `/proc` — or the sandbox root itself with `hostfs.root`.
-    #[serde(rename = "emptyDirs")]
-    pub empty_dirs: Vec<String>,
+    /// (`"mirror"`), exposed empty (`"empty"` — an empty, unwritable
+    /// directory, or an empty file when the pattern matches a real file),
+    /// or hidden (`"hide"`). Order matters — when a path matches several
+    /// patterns, the **last** matching pattern decides. Matched paths
+    /// appear at the same absolute path below `/host` (`/etc/passwd` →
+    /// `/host/etc/passwd`); matched directories are mirrored recursively
+    /// (or, when hidden, disappear with their whole subtree). Nothing
+    /// below an empty path is visible, and empty paths are shown even
+    /// when a mirror pattern (or the real host path) covers them.
+    /// Empty patterns match nothing.
+    pub patterns: Patterns,
     /// **Experimental:** use the FUSE filesystem itself as the sandbox
     /// root instead of mounting it at `/host`. Everything mirrored appears
     /// at its absolute host path; the ops (`dev`, `tmpfs`, `proc`, binds)
     /// are mounted on top of it. Because the FUSE filesystem is read-only,
-    /// every mount point must be listed in `emptyDirs` (or exist in the
-    /// mirror).
+    /// every mount point must be listed as `"empty"` in `patterns` (or
+    /// exist in the mirror).
     pub root: bool,
 }
 
@@ -150,13 +153,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hostfs_mirror_parses() {
+    fn hostfs_patterns_parse() {
         let spec = parse(
-            r#"{ "hostfs": { "mirror": { "/etc/*.conf": "mirror", "/home/me/project": "mirror" } } }"#,
+            r#"{ "hostfs": { "patterns": { "/etc/*.conf": "mirror", "/home/me/project": "mirror" } } }"#,
         );
         assert_eq!(
-            spec.hostfs.mirror,
-            Mirror(vec![
+            spec.hostfs.patterns,
+            Patterns(vec![
                 ("/etc/*.conf".to_string(), Permission::Mirror),
                 ("/home/me/project".to_string(), Permission::Mirror)
             ])
@@ -164,29 +167,31 @@ mod tests {
     }
 
     #[test]
-    fn hostfs_mirror_preserves_order_and_permissions() {
-        let spec =
-            parse(r#"{ "hostfs": { "mirror": { "/etc": "mirror", "/etc/passwd": "hide" } } }"#);
+    fn hostfs_patterns_preserve_order_and_permissions() {
+        let spec = parse(
+            r#"{ "hostfs": { "patterns": { "/etc": "mirror", "/etc/passwd": "hide", "/dev": "empty" } } }"#,
+        );
         assert_eq!(
-            spec.hostfs.mirror,
-            Mirror(vec![
+            spec.hostfs.patterns,
+            Patterns(vec![
                 ("/etc".to_string(), Permission::Mirror),
-                ("/etc/passwd".to_string(), Permission::Hide)
+                ("/etc/passwd".to_string(), Permission::Hide),
+                ("/dev".to_string(), Permission::Empty)
             ])
         );
     }
 
     #[test]
-    fn hostfs_mirror_rejects_relative_patterns_and_bad_permissions() {
+    fn hostfs_patterns_reject_relative_patterns_and_bad_permissions() {
         assert!(
             serde_json::from_str::<crate::spec::Spec>(
-                r#"{ "hostfs": { "mirror": { "etc": "mirror" } } }"#
+                r#"{ "hostfs": { "patterns": { "etc": "mirror" } } }"#
             )
             .is_err()
         );
         assert!(
             serde_json::from_str::<crate::spec::Spec>(
-                r#"{ "hostfs": { "mirror": { "/etc": "rw" } } }"#
+                r#"{ "hostfs": { "patterns": { "/etc": "rw" } } }"#
             )
             .is_err()
         );
@@ -195,28 +200,31 @@ mod tests {
     #[test]
     fn hostfs_root_flag_parses() {
         assert!(!parse("{}").hostfs.root);
-        let spec = parse(r#"{ "hostfs": { "root": true, "mirror": { "/etc": "mirror" } } }"#);
+        let spec = parse(r#"{ "hostfs": { "root": true, "patterns": { "/etc": "mirror" } } }"#);
         assert!(spec.hostfs.root);
         assert_eq!(
-            spec.hostfs.mirror,
-            Mirror(vec![("/etc".to_string(), Permission::Mirror)])
+            spec.hostfs.patterns,
+            Patterns(vec![("/etc".to_string(), Permission::Mirror)])
         );
     }
 
     #[test]
-    fn hostfs_empty_dirs_parse() {
-        let spec = parse(r#"{ "hostfs": { "emptyDirs": ["/dev", "/tmp"] } }"#);
+    fn hostfs_empty_permission_parses() {
+        let spec = parse(r#"{ "hostfs": { "patterns": { "/dev": "empty", "/tmp": "empty" } } }"#);
         assert_eq!(
-            spec.hostfs.empty_dirs,
-            ["/dev".to_string(), "/tmp".to_string()]
+            spec.hostfs.patterns,
+            Patterns(vec![
+                ("/dev".to_string(), Permission::Empty),
+                ("/tmp".to_string(), Permission::Empty)
+            ])
         );
-        assert!(parse("{}").hostfs.empty_dirs.is_empty());
+        assert!(parse("{}").hostfs.patterns.is_empty());
     }
 
     #[test]
-    fn hostfs_defaults_to_no_mirror() {
+    fn hostfs_defaults_to_no_patterns() {
         let spec = parse("{}");
-        assert!(spec.hostfs.mirror.is_empty());
+        assert!(spec.hostfs.patterns.is_empty());
     }
 
     #[test]

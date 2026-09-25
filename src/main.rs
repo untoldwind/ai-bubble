@@ -51,12 +51,10 @@ fn main() {
     // it as the sandbox root itself, see below). Only when the spec actually
     // exposes something: a sandbox without any hostfs configuration must not
     // depend on (or fail for the lack of) FUSE.
-    if spec.hostfs.root && spec.hostfs.mirror.is_empty() && spec.hostfs.empty_dirs.is_empty() {
-        sandbox::die(
-            "hostfs.root needs at least one hostfs.mirror pattern or hostfs.emptyDirs entry",
-        );
+    if spec.hostfs.root && spec.hostfs.patterns.is_empty() {
+        sandbox::die("hostfs.root needs at least one hostfs.patterns entry");
     }
-    if spec.hostfs.root || !spec.hostfs.mirror.is_empty() || !spec.hostfs.empty_dirs.is_empty() {
+    if spec.hostfs.root || !spec.hostfs.patterns.is_empty() {
         hostfs::set_root_mode(spec.hostfs.root);
         hostfs::start_host_fs(&spec.hostfs);
     }
