@@ -76,7 +76,7 @@ use crate::spec::internal::{Patterns, Permission};
 pub(crate) mod pattern;
 use pattern::{Pattern, Walk};
 
-/// The effective permission of a host path under the given pattern list,
+/// The effective permission of a mirrored path under the given pattern list,
 /// with the same semantics the FUSE mirror applies:
 ///
 /// * a strict ancestor exposed `empty` shadows everything below it —
@@ -140,7 +140,7 @@ pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
 }
 
 /// The sandbox-absolute path the host filesystem is mounted at.
-pub const SANDBOX_MOUNT_POINT: &str = "/host";
+pub const SANDBOX_MOUNT_POINT: &str = "/mirrored";
 
 /// Whether the host filesystem should become the sandbox root instead of
 /// being mounted at `/host`. Set once before any fork.
@@ -180,8 +180,8 @@ struct MirrorPattern {
 impl MirrorPattern {
     /// Whether the pattern names the path itself (exactly, or via a `**`
     /// that covers it).
-    fn names(&self, host: &Path) -> bool {
-        self.pattern.matches(host)
+    fn names(&self, mirrored: &Path) -> bool {
+        self.pattern.matches(mirrored)
     }
 }
 
@@ -233,91 +233,95 @@ impl HostFs {
         }
     }
 
-    /// Whether the host path is matched with the `empty` permission (by
+    /// Whether the mirrored path is matched with the `empty` permission (by
     /// the last pattern naming it): it is exposed empty — as an empty
     /// directory when it is (or would be) a directory, an empty file when
     /// it matches a real file.
-    fn is_empty(&self, host: &Path) -> bool {
-        self.permission_of(host) == Some(Permission::Empty)
+    fn is_empty(&self, mirrored: &Path) -> bool {
+        self.permission_of(mirrored) == Some(Permission::Empty)
     }
 
-    /// Whether the host path lies strictly *below* an empty path (so it is
+    /// Whether the mirrored path lies strictly *below* an empty path (so it is
     /// shadowed by the empty path's precedence and never visible).
-    fn under_empty(&self, host: &Path) -> bool {
-        host.ancestors().skip(1).any(|a| self.is_empty(a))
+    fn under_empty(&self, mirrored: &Path) -> bool {
+        mirrored.ancestors().skip(1).any(|a| self.is_empty(a))
     }
 
     /// Whether some `empty` pattern could still match something *strictly
-    /// below* the given host path — i.e. the path acts as a (possibly
+    /// below* the given mirrored path — i.e. the path acts as a (possibly
     /// purely virtual) directory leading to empty paths, and must stay
     /// navigable even when the mirror knows nothing about it.
-    fn is_empty_prefix(&self, host: &Path) -> bool {
+    fn is_empty_prefix(&self, mirrored: &Path) -> bool {
         self.patterns
             .iter()
-            .any(|p| p.permission == Permission::Empty && self.pattern_reaches(p, host))
+            .any(|p| p.permission == Permission::Empty && self.pattern_reaches(p, mirrored))
     }
 
     /// Map a sandbox-relative path (as passed by the FUSE bridge, without a
-    /// leading slash) to the mirrored host path. The mirror reproduces full
-    /// host paths, so `/host/etc/passwd` maps to host `/etc/passwd`.
-    fn host_path(&self, path: &OsStr) -> PathBuf {
+    /// leading slash) to the **mirrored** path: the path as the mirror — and
+    /// thus the sandboxed child — sees it. The mirror reproduces full host
+    /// paths, so `/host/etc/passwd` maps to `/etc/passwd`. (Only a redirect
+    /// makes the mirrored path differ from the real host path; see
+    /// [`HostFs::redirect`].)
+    fn mirror_path(&self, path: &OsStr) -> PathBuf {
         let rel = Path::new(path);
-        let mut host = PathBuf::from("/");
+        let mut mirrored = PathBuf::from("/");
         for component in rel.components() {
-            host.push(component);
+            mirrored.push(component);
         }
-        host
+        mirrored
     }
 
-    /// The *real* host path a mirrored (sandbox) path resolves to: the path
-    /// itself — unless a redirect permission remaps it. The **last** pattern
+    /// The **real host path** the given **mirrored path** resolves to:
+    /// the mirrored path itself — unless a redirect permission remaps it.
+    /// The **last** pattern
     /// naming the path decides (as everywhere else); when no pattern names
     /// the path itself, the nearest *directly matched* mirrored ancestor
     /// does: a redirected directory shows its whole subtree, so everything
     /// below it is remapped onto the source plus the remaining path
     /// components. Redirects only ever map literal paths, so the remap is a
     /// simple prefix replacement.
-    fn redirect(&self, host: &Path) -> PathBuf {
+    fn redirect(&self, mirrored: &Path) -> PathBuf {
         let direct = |p: &Path| self.patterns.iter().rev().find(|mp| mp.names(p));
         // The path itself: the last matching pattern says whether (and
         // where) it is redirected.
-        if let Some(p) = direct(host) {
+        if let Some(p) = direct(mirrored) {
             if let Some(source) = p.permission.redirect_source() {
                 return source.to_path_buf();
             }
-            return host.to_path_buf();
+            return mirrored.to_path_buf();
         }
         // Otherwise the nearest directly matched mirrored ancestor decides
         // (the mirror is recursive, so its redirect extends to everything
         // below it). Non-mirrored ancestors are skipped, exactly like in
         // `permission_of`.
-        for ancestor in host.ancestors().skip(1) {
+        for ancestor in mirrored.ancestors().skip(1) {
             if let Some(p) = direct(ancestor)
                 && p.permission.is_mirrored()
             {
                 if let Some(source) = p.permission.redirect_source()
-                    && let Ok(rest) = host.strip_prefix(ancestor)
+                    && let Ok(rest) = mirrored.strip_prefix(ancestor)
                 {
                     return source.join(rest);
                 }
-                return host.to_path_buf();
+                return mirrored.to_path_buf();
             }
         }
-        host.to_path_buf()
+        mirrored.to_path_buf()
     }
 
-    /// Whether a host path matches one of the patterns directly (as a file,
+    /// Whether a mirrored path matches one of the patterns directly (as a file,
     /// symlink, or a directory named by the pattern itself), with the
     /// **last** matching pattern mirroring it. Empty paths and everything
     /// below them take precedence over the mirror.
-    fn matches(&self, host: &Path) -> bool {
-        if self.is_empty(host) || self.under_empty(host) {
+    fn matches(&self, mirrored: &Path) -> bool {
+        if self.is_empty(mirrored) || self.under_empty(mirrored) {
             return false;
         }
-        matches!(self.permission_of(host), Some(p) if p.is_mirrored())
+        matches!(self.permission_of(mirrored), Some(p) if p.is_mirrored())
     }
 
-    /// The spec-level permission that governs **writing** to the host path
+    /// The spec-level permission that governs **writing** to the mirrored path
     /// (modifying its content or metadata, creating or deleting it): the
     /// last pattern naming the path itself decides, or — when no pattern
     /// names it directly — the permission of the *nearest* mirrored
@@ -328,23 +332,23 @@ impl HostFs {
     /// The result is only the *spec* side: the real host filesystem may
     /// still deny the operation (the server acts with the real host
     /// credentials, so the underlying file or directory permissions apply).
-    fn write_permission(&self, host: &Path) -> Option<Permission> {
-        if self.is_empty(host) || self.under_empty(host) || self.hidden(host) {
+    fn write_permission(&self, mirrored: &Path) -> Option<Permission> {
+        if self.is_empty(mirrored) || self.under_empty(mirrored) || self.hidden(mirrored) {
             return None;
         }
-        if let Some(p) = self.permission_of(host) {
+        if let Some(p) = self.permission_of(mirrored) {
             return p.is_mirrored().then_some(p);
         }
-        host.ancestors()
+        mirrored.ancestors()
             .skip(1)
             .find_map(|a| self.permission_of(a).filter(|p| p.is_mirrored()))
     }
 
-    /// Whether writes to the host path are allowed: the spec must say `rw`.
+    /// Whether writes to the mirrored path are allowed: the spec must say `rw`.
     /// (Whether the *real* file or directory actually allows it is decided
     /// by the host filesystem when the operation is performed.)
-    fn writable(&self, host: &Path) -> bool {
-        self.write_permission(host).is_some_and(|p| p.is_writable())
+    fn writable(&self, mirrored: &Path) -> bool {
+        self.write_permission(mirrored).is_some_and(|p| p.is_writable())
     }
 
     /// Whether any pattern grants write access: the FUSE mount is mounted
@@ -356,50 +360,50 @@ impl HostFs {
     /// The permission of the **last** pattern that names the path itself
     /// (exactly, or via a `**` that covers it), or `None` when no pattern
     /// names it.
-    fn permission_of(&self, host: &Path) -> Option<Permission> {
+    fn permission_of(&self, mirrored: &Path) -> Option<Permission> {
         // `*` must not cross directory separators, like in a shell.
         self.patterns
             .iter()
             .rev()
-            .find(|p| p.names(host))
+            .find(|p| p.names(mirrored))
             .map(|p| p.permission.clone())
     }
 
     /// Whether the path is hidden because a pattern hides it directly, or
     /// a hidden pattern names one of its strict ancestors (a hidden
     /// directory hides its whole subtree).
-    fn hidden(&self, host: &Path) -> bool {
+    fn hidden(&self, mirrored: &Path) -> bool {
         self.patterns.iter().any(|p| {
             p.permission == Permission::Hide
-                && (p.names(host) || matches!(p.pattern.walk(host), Walk::Ancestor))
+                && (p.names(mirrored) || matches!(p.pattern.walk(mirrored), Walk::Ancestor))
         })
     }
 
-    /// Whether the mirrored host path exists at all: it either is mirrored
+    /// Whether the mirrored path exists at all: it either is mirrored
     /// by the last matching pattern itself, is empty (an empty dir or
     /// empty file), is an ancestor of something that is (so the tree under
     /// `/host` stays navigable down to the matched leaves), or is an
     /// ancestor leading to an empty path — and nothing hides it directly
     /// or via an ancestor.
-    fn exists(&self, host: &Path) -> bool {
-        if self.under_empty(host) {
+    fn exists(&self, mirrored: &Path) -> bool {
+        if self.under_empty(mirrored) {
             return false;
         }
-        if self.is_empty(host) {
+        if self.is_empty(mirrored) {
             return true;
         }
-        if self.hidden(host) {
+        if self.hidden(mirrored) {
             return false;
         }
-        self.matches(host) || self.dir_prefix(host) || self.is_empty_prefix(host)
+        self.matches(mirrored) || self.dir_prefix(mirrored) || self.is_empty_prefix(mirrored)
     }
 
     /// Whether some **mirrored** pattern could still match something
-    /// *strictly below* the given host path — i.e. the path acts as a
+    /// *strictly below* the given mirrored path — i.e. the path acts as a
     /// (possibly virtual) directory of the mirror, leading to matches
     /// deeper down. Denied patterns never make a path navigable.
-    fn dir_prefix(&self, host: &Path) -> bool {
-        if host == Path::new("/") {
+    fn dir_prefix(&self, mirrored: &Path) -> bool {
+        if mirrored == Path::new("/") {
             return self.patterns.iter().any(|p| {
                 matches!(
                     p.permission,
@@ -409,8 +413,8 @@ impl HostFs {
         }
         self.patterns
             .iter()
-            .any(|p| p.permission.is_mirrored() && self.pattern_reaches(p, host))
-            || self.is_empty_prefix(host)
+            .any(|p| p.permission.is_mirrored() && self.pattern_reaches(p, mirrored))
+            || self.is_empty_prefix(mirrored)
     }
 
     /// Whether the pattern could make the path visible as a directory
@@ -418,9 +422,9 @@ impl HostFs {
     /// consumed, or the path hit (or ends at) a `**`, or the pattern names
     /// a strict ancestor of the path — an exactly-named directory is
     /// mirrored recursively, so everything below it is visible.
-    fn pattern_reaches(&self, p: &MirrorPattern, host: &Path) -> bool {
+    fn pattern_reaches(&self, p: &MirrorPattern, mirrored: &Path) -> bool {
         matches!(
-            p.pattern.walk(host),
+            p.pattern.walk(mirrored),
             Walk::CouldReach | Walk::StarStar | Walk::Ancestor
         )
     }
@@ -456,37 +460,37 @@ impl HostFs {
     /// The `lstat`-style attribute of a mirrored path, or ENOENT. Async: it
     /// stats the real host filesystem (`tokio::fs` runs the syscall on
     /// tokio's blocking pool) and must never run on the FUSE event loop.
-    async fn attr(&self, host: &Path) -> std::io::Result<FileAttr> {
+    async fn attr(&self, mirrored: &Path) -> std::io::Result<FileAttr> {
         // Empty paths take precedence: they appear even when the real host
         // path exists (with different attributes) — as an empty directory
         // when the path is (or would be) a directory, as an empty file
         // when it matches a real file.
-        if self.is_empty(host) {
-            return match tokio_fs::symlink_metadata(host).await {
+        if self.is_empty(mirrored) {
+            return match tokio_fs::symlink_metadata(mirrored).await {
                 Ok(md) if !md.is_dir() => Ok(Self::empty_file_attr(&md)),
                 _ => Ok(self.empty_dir_attr()),
             };
         }
-        let real = self.redirect(host);
+        let real = self.redirect(mirrored);
         match tokio_fs::symlink_metadata(&real).await {
             Ok(md) => Ok(attr_from_metadata(&md)),
             // A purely virtual ancestor of an empty path has no real
             // counterpart; present it as a directory.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.is_empty_prefix(host) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.is_empty_prefix(mirrored) => {
                 Ok(self.empty_dir_attr())
             }
             Err(e) => Err(e),
         }
     }
 
-    /// Whether the host path is a listable directory: a real one, an empty
+    /// Whether the mirrored path is a listable directory: a real one, an empty
     /// path, or a purely virtual ancestor of an empty path. Async: it
     /// stats the real host filesystem (`tokio::fs`).
-    async fn is_listable_dir(&self, host: &Path) -> bool {
-        if self.is_empty(host) || self.is_empty_prefix(host) {
+    async fn is_listable_dir(&self, mirrored: &Path) -> bool {
+        if self.is_empty(mirrored) || self.is_empty_prefix(mirrored) {
             return true;
         }
-        tokio_fs::metadata(self.redirect(host))
+        tokio_fs::metadata(self.redirect(mirrored))
             .await
             .map(|m| m.is_dir())
             .unwrap_or(false)
@@ -501,19 +505,19 @@ impl HostFs {
     /// directory (`tokio::fs`).
     async fn dir_entries(
         &self,
-        host: &Path,
+        mirrored: &Path,
     ) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
         // A directory named by a mirrored pattern itself is a recursive
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
-        let unfiltered = self.matches(host);
-        let mut names: Vec<std::ffi::OsString> = match tokio_fs::read_dir(self.redirect(host)).await
+        let unfiltered = self.matches(mirrored);
+        let mut names: Vec<std::ffi::OsString> = match tokio_fs::read_dir(self.redirect(mirrored)).await
         {
             Ok(mut entries) => {
                 let mut names = Vec::new();
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let name = entry.file_name();
-                    let child = host.join(&name);
+                    let child = mirrored.join(&name);
                     // Empty-path precedence: nothing below an empty path is
                     // visible, not even a mirror match. Denied entries (and
                     // everything below a hidden directory) are hidden even
@@ -536,8 +540,8 @@ impl HostFs {
             if p.permission != Permission::Empty {
                 continue;
             }
-            if let Some(name) = p.pattern.next_literal(host) {
-                let child = host.join(&name);
+            if let Some(name) = p.pattern.next_literal(mirrored) {
+                let child = mirrored.join(&name);
                 if !names.iter().any(|n| n.as_os_str() == OsStr::new(&name)) && self.exists(&child)
                 {
                     names.push(OsString::from(name));
@@ -547,7 +551,7 @@ impl HostFs {
         names.sort();
         let mut entries = Vec::with_capacity(names.len());
         for name in names {
-            let child = host.join(&name);
+            let child = mirrored.join(&name);
             entries.push((name, self.attr(&child).await));
         }
         entries
@@ -634,9 +638,9 @@ impl PathFilesystem for HostFs {
     ) -> Result<ReplyEntry> {
         // The path-based API calls lookup with the parent path; "/" means the
         // root directory itself.
-        let host = self.host_path(parent).join(name);
-        if self.exists(&host) {
-            let attr = self.attr(&host).await?;
+        let mirrored = self.mirror_path(parent).join(name);
+        if self.exists(&mirrored) {
+            let attr = self.attr(&mirrored).await?;
             return Ok(ReplyEntry { ttl: TTL, attr });
         }
         Err(libc::ENOENT.into())
@@ -655,9 +659,9 @@ impl PathFilesystem for HostFs {
                 attr: root_attr(self.uid, self.gid),
             }),
             Some(p) => {
-                let host = self.host_path(p);
-                if self.exists(&host) {
-                    let attr = self.attr(&host).await?;
+                let mirrored = self.mirror_path(p);
+                if self.exists(&mirrored) {
+                    let attr = self.attr(&mirrored).await?;
                     return Ok(ReplyAttr { ttl: TTL, attr });
                 }
                 Err(libc::ENOENT.into())
@@ -667,26 +671,26 @@ impl PathFilesystem for HostFs {
     }
 
     async fn readlink(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyData> {
-        let host = self.host_path(path);
-        if !self.exists(&host) {
+        let mirrored = self.mirror_path(path);
+        if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        let target = tokio_fs::read_link(self.redirect(&host)).await?;
+        let target = tokio_fs::read_link(self.redirect(&mirrored)).await?;
         Ok(ReplyData::from(Bytes::copy_from_slice(
             target.as_os_str().as_encoded_bytes(),
         )))
     }
 
     async fn open(&self, _req: fuse3::raw::Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
-        let host = self.host_path(path);
+        let mirrored = self.mirror_path(path);
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
-        if !self.exists(&host) {
+        if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
-        if tokio_fs::metadata(self.redirect(&host))
+        if tokio_fs::metadata(self.redirect(&mirrored))
             .await
             .map(|m| m.is_dir())
             .unwrap_or(true)
@@ -694,7 +698,7 @@ impl PathFilesystem for HostFs {
             return Err(libc::EISDIR.into());
         }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
-        if write_flags && !self.writable(&host) {
+        if write_flags && !self.writable(&mirrored) {
             // `ro` paths (and anything below an empty or hidden pattern) are
             // never writable; the real file permissions are checked by the
             // host filesystem on the actual write.
@@ -715,17 +719,17 @@ impl PathFilesystem for HostFs {
         let Some(p) = path else {
             return Err(libc::ENOENT.into());
         };
-        let host = self.host_path(p);
-        if !self.exists(&host) {
+        let mirrored = self.mirror_path(p);
+        if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
         // An empty path has no content: an empty file reads as empty (the
         // host file is never opened).
-        if self.is_empty(&host) {
+        if self.is_empty(&mirrored) {
             return Ok(ReplyData::from(Bytes::new()));
         }
         // Stateless IO: reopen the host file for every read.
-        let mut file = tokio_fs::File::open(self.redirect(&host)).await?;
+        let mut file = tokio_fs::File::open(self.redirect(&mirrored)).await?;
         file.seek(SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; size as usize];
         let n = file.read(&mut buf).await?;
@@ -746,11 +750,11 @@ impl PathFilesystem for HostFs {
         let Some(p) = path else {
             return Err(libc::ENOENT.into());
         };
-        let host = self.host_path(p);
-        if !self.exists(&host) {
+        let mirrored = self.mirror_path(p);
+        if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        if !self.writable(&host) {
+        if !self.writable(&mirrored) {
             // The spec must say `rw`; the real file permissions are
             // enforced by the host filesystem on the open below.
             return Err(libc::EACCES.into());
@@ -760,7 +764,7 @@ impl PathFilesystem for HostFs {
         let mut file = tokio_fs::OpenOptions::new()
             .write(true)
             .append(append)
-            .open(self.redirect(&host))
+            .open(self.redirect(&mirrored))
             .await?;
         if !append {
             file.seek(SeekFrom::Start(offset)).await?;
@@ -771,12 +775,12 @@ impl PathFilesystem for HostFs {
     async fn statfs(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyStatFs> {
         // Report the real filesystem holding the mirrored path (or "/" for
         // the root), so tools like `df` behave sensibly.
-        let host = if is_root(path) {
+        let mirrored = if is_root(path) {
             PathBuf::from("/")
         } else {
-            self.redirect(&self.host_path(path))
+            self.redirect(&self.mirror_path(path))
         };
-        let cpath = CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
+        let cpath = CString::new(mirrored.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
         // errno is per-thread: capture the error on the blocking thread.
         blocking(move || {
             let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -807,8 +811,8 @@ impl PathFilesystem for HostFs {
         path: &OsStr,
         _flags: u32,
     ) -> Result<ReplyOpen> {
-        let host = self.host_path(path);
-        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host).await {
+        let mirrored = self.mirror_path(path);
+        if !self.exists(&mirrored) || !is_root(path) && !self.is_listable_dir(&mirrored).await {
             return Err(libc::ENOENT.into());
         }
         Ok(ReplyOpen { fh: 0, flags: 0 })
@@ -822,12 +826,12 @@ impl PathFilesystem for HostFs {
         offset: i64,
     ) -> Result<ReplyDirectory<impl futures_util::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
-        let host = self.host_path(path);
-        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host).await {
+        let mirrored = self.mirror_path(path);
+        if !self.exists(&mirrored) || !is_root(path) && !self.is_listable_dir(&mirrored).await {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
-            .dir_entries(&host)
+            .dir_entries(&mirrored)
             .await
             .into_iter()
             .skip(offset.max(0) as usize)
@@ -857,12 +861,12 @@ impl PathFilesystem for HostFs {
             impl futures_util::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a,
         >,
     > {
-        let host = self.host_path(path);
-        if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host).await {
+        let mirrored = self.mirror_path(path);
+        if !self.exists(&mirrored) || !is_root(path) && !self.is_listable_dir(&mirrored).await {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
-            .dir_entries(&host)
+            .dir_entries(&mirrored)
             .await
             .into_iter()
             .skip(offset as usize)
@@ -887,15 +891,15 @@ impl PathFilesystem for HostFs {
     }
 
     async fn access(&self, _req: fuse3::raw::Request, path: &OsStr, mask: u32) -> Result<()> {
-        let host = self.host_path(path);
-        if !self.exists(&host) {
+        let mirrored = self.mirror_path(path);
+        if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
         // Empty paths (and purely virtual ancestors) are unwritable by
         // definition; answer directly instead of asking the real filesystem.
-        if self.is_empty(&host)
-            || self.is_empty_prefix(&host)
-                && tokio_fs::symlink_metadata(self.redirect(&host))
+        if self.is_empty(&mirrored)
+            || self.is_empty_prefix(&mirrored)
+                && tokio_fs::symlink_metadata(self.redirect(&mirrored))
                     .await
                     .is_err()
         {
@@ -907,7 +911,7 @@ impl PathFilesystem for HostFs {
         // W_OK is answered by the spec: only `rw` paths may be written (the
         // real file permissions are checked when a write is attempted).
         let non_write = mask & !(libc::W_OK as u32);
-        if mask & libc::W_OK as u32 != 0 && !self.writable(&host) {
+        if mask & libc::W_OK as u32 != 0 && !self.writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
         // The rest (R_OK, X_OK) is decided by the real filesystem, with the
@@ -915,7 +919,7 @@ impl PathFilesystem for HostFs {
         if non_write == 0 {
             return Ok(());
         }
-        let real = self.redirect(&host);
+        let real = self.redirect(&mirrored);
         let cpath = CString::new(real.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
         // errno is per-thread: capture the error on the blocking thread.
         blocking(move || {
@@ -940,18 +944,18 @@ impl PathFilesystem for HostFs {
         let Some(p) = path else {
             return Err(libc::ENOENT.into());
         };
-        let host = self.host_path(p);
-        if self.is_empty(&host) {
+        let mirrored = self.mirror_path(p);
+        if self.is_empty(&mirrored) {
             // Empty paths are virtual: nothing to change.
             return Err(libc::EACCES.into());
         }
-        if !self.exists(&host) {
+        if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        if !self.writable(&host) {
+        if !self.writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
-        let real = self.redirect(&host);
+        let real = self.redirect(&mirrored);
         if let Some(size) = set_attr.size {
             let f = tokio_fs::OpenOptions::new().write(true).open(&real).await?;
             f.set_len(size).await?;
@@ -998,7 +1002,7 @@ impl PathFilesystem for HostFs {
             })
             .await?;
         }
-        let attr = self.attr(&host).await?;
+        let attr = self.attr(&mirrored).await?;
         Ok(ReplyAttr { ttl: TTL, attr })
     }
 
@@ -1010,17 +1014,17 @@ impl PathFilesystem for HostFs {
         mode: u32,
         _umask: u32,
     ) -> Result<ReplyEntry> {
-        let host = self.host_path(parent).join(name);
-        if !self.writable(&host) {
+        let mirrored = self.mirror_path(parent).join(name);
+        if !self.writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet.
-        if tokio_fs::symlink_metadata(self.redirect(&host)).await.is_ok() {
+        if tokio_fs::symlink_metadata(self.redirect(&mirrored)).await.is_ok() {
             return Err(libc::EEXIST.into());
         }
         // errno is per-thread: capture the error on the blocking thread.
-        let cpath = cstring_of(&self.redirect(&host))?;
+        let cpath = cstring_of(&self.redirect(&mirrored))?;
         blocking(move || {
             if unsafe { libc::mkdir(cpath.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
                 Err(std::io::Error::last_os_error())
@@ -1030,37 +1034,37 @@ impl PathFilesystem for HostFs {
         })
         .await
         .map_err(fuse3::Errno::from)?;
-        let attr = self.attr(&host).await?;
+        let attr = self.attr(&mirrored).await?;
         Ok(ReplyEntry { ttl: TTL, attr })
     }
 
     async fn unlink(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
-        let host = self.host_path(parent).join(name);
-        if self.is_empty(&host) {
+        let mirrored = self.mirror_path(parent).join(name);
+        if self.is_empty(&mirrored) {
             // Empty paths are virtual mount points; they cannot be removed.
             return Err(libc::EACCES.into());
         }
-        if !self.exists(&host) {
+        if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        if !self.writable(&host) {
+        if !self.writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
-        tokio_fs::remove_file(self.redirect(&host)).await?;
+        tokio_fs::remove_file(self.redirect(&mirrored)).await?;
         Ok(())
     }
     async fn rmdir(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
-        let host = self.host_path(parent).join(name);
-        if self.is_empty(&host) {
+        let mirrored = self.mirror_path(parent).join(name);
+        if self.is_empty(&mirrored) {
             return Err(libc::EACCES.into());
         }
-        if !self.exists(&host) {
+        if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        if !self.writable(&host) {
+        if !self.writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
-        tokio_fs::remove_dir(self.redirect(&host)).await?;
+        tokio_fs::remove_dir(self.redirect(&mirrored)).await?;
         Ok(())
     }
 
@@ -1072,8 +1076,8 @@ impl PathFilesystem for HostFs {
         parent: &OsStr,
         name: &OsStr,
     ) -> Result<()> {
-        let old = self.host_path(origin_parent).join(origin_name);
-        let new = self.host_path(parent).join(name);
+        let old = self.mirror_path(origin_parent).join(origin_name);
+        let new = self.mirror_path(parent).join(name);
         if self.is_empty(&old) || self.is_empty(&new) {
             return Err(libc::EACCES.into());
         }
@@ -1095,13 +1099,13 @@ impl PathFilesystem for HostFs {
         mode: u32,
         flags: u32,
     ) -> Result<ReplyCreated> {
-        let host = self.host_path(parent).join(name);
-        if !self.writable(&host) {
+        let mirrored = self.mirror_path(parent).join(name);
+        if !self.writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet.
-        if tokio_fs::symlink_metadata(self.redirect(&host)).await.is_ok() {
+        if tokio_fs::symlink_metadata(self.redirect(&mirrored)).await.is_ok() {
             return Err(libc::EEXIST.into());
         }
         let mut opts = tokio_fs::OpenOptions::new();
@@ -1112,7 +1116,7 @@ impl PathFilesystem for HostFs {
         if flags & libc::O_APPEND as u32 != 0 {
             opts.append(true);
         }
-        let file = opts.mode(mode & 0o7777).open(self.redirect(&host)).await?;
+        let file = opts.mode(mode & 0o7777).open(self.redirect(&mirrored)).await?;
         let md = file.metadata().await?;
         let attr = attr_from_metadata(&md);
         Ok(ReplyCreated {
@@ -1163,7 +1167,7 @@ pub fn start_host_fs(patterns: &crate::spec::internal::Patterns) {
     let mountpoint = unsafe {
         let raw = libc::mkdtemp(CString::from_vec_with_nul(tmpl).unwrap().into_raw());
         if raw.is_null() {
-            die_with_error("Can't create temporary host-fs mountpoint");
+            die_with_error("Can't create temporary mirrored-fs mountpoint");
         }
         PathBuf::from(CStr::from_ptr(raw).to_string_lossy().into_owned())
     };
@@ -1180,7 +1184,7 @@ pub fn start_host_fs(patterns: &crate::spec::internal::Patterns) {
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
-        die_with_error("Can't fork host-fs server");
+        die_with_error("Can't fork mirrored-fs server");
     }
     if pid == 0 {
         // Child: serve the FUSE filesystem forever (or until the host dies).
@@ -1197,7 +1201,7 @@ pub fn start_host_fs(patterns: &crate::spec::internal::Patterns) {
     if n != 1 {
         // The child printed a detailed error before exiting.
         let _ = std::fs::remove_dir(&mountpoint);
-        crate::sandbox::die("Can't mount host filesystem (is fusermount3 installed?)");
+        crate::sandbox::die("Can't mount mirrored filesystem (is fusermount3 installed?)");
     }
 }
 
@@ -1247,7 +1251,7 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
 
     if let Err(e) = outcome {
         eprintln!(
-            "rs-bubble: Can't mount host filesystem at {}: {e}",
+            "rs-bubble: Can't mount mirrored filesystem at {}: {e}",
             mountpoint.display()
         );
     }
@@ -1506,19 +1510,19 @@ mod tests {
     }
 
     #[test]
-    fn host_path_maps_sandbox_paths_to_absolute_host_paths() {
+    fn mirror_path_maps_sandbox_paths_to_absolute_mirrored_paths() {
         let f = fs(&[]);
         assert_eq!(
-            f.host_path(OsStr::new("/etc/passwd")),
+            f.mirror_path(OsStr::new("/etc/passwd")),
             PathBuf::from("/etc/passwd")
         );
         // The bridge may omit the leading slash.
         assert_eq!(
-            f.host_path(OsStr::new("etc/passwd")),
+            f.mirror_path(OsStr::new("etc/passwd")),
             PathBuf::from("/etc/passwd")
         );
-        assert_eq!(f.host_path(OsStr::new("")), PathBuf::from("/"));
-        assert_eq!(f.host_path(OsStr::new("/")), PathBuf::from("/"));
+        assert_eq!(f.mirror_path(OsStr::new("")), PathBuf::from("/"));
+        assert_eq!(f.mirror_path(OsStr::new("/")), PathBuf::from("/"));
     }
 
     #[test]
