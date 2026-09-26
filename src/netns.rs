@@ -6,7 +6,7 @@
 //!   original (host netns) — the "connector": answers proxy requests with
 //!                           real TCP connections, waits for P, reports P's
 //!                           exit status.
-//!     └─ P — unshares user+network+UTS namespaces, brings up loopback,
+//!     └─ P — unshares user+network+cgroup+UTS namespaces, brings up loopback,
 //!            listens on 127.0.0.2:3128 (HTTP CONNECT) and forwards the
 //!            child's exit status.
 //!         └─ C — unshares the mount namespace, builds the tmpfs sandbox
@@ -115,7 +115,16 @@ unsafe fn isolated_parent(
         // already-mapped ids. As in sandbox::setup_and_exec, the real uid/gid
         // is mapped onto SANDBOX_ID (not 0), so the command never runs as root.
         let old_userns = userns_id();
-        if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWUTS) != 0 {
+        // The cgroup namespace is unshared in the same call (like bwrap's
+        // --unshare-all; it must be combined with CLONE_NEWUSER — see
+        // sandbox::cgroup_ns_flags).
+        if libc::unshare(
+            libc::CLONE_NEWUSER
+                | libc::CLONE_NEWNET
+                | libc::CLONE_NEWUTS
+                | crate::sandbox::cgroup_ns_flags(),
+        ) != 0
+        {
             die_with_error("Can't unshare user/network namespaces");
         }
         crate::sandbox::check_new_userns(old_userns);

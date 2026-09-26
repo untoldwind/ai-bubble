@@ -82,6 +82,22 @@ rs-bubble -- /bin/sh
 rs-bubble --spec custom.json /bin/sh
 ```
 
+### Equivalence with bwrap's namespace flags
+
+Every run of rs-bubble unshares the same namespaces as
+`bwrap --unshare-all` (user, cgroup, ipc, pid, uts, mount). The only knob
+is the network namespace, which corresponds to bwrap's `--share-net`:
+
+- without `net.isolated` → like `bwrap --unshare-all --share-net`
+  (everything unshared, but the command keeps the host network)
+- with `"net": { "isolated": true }` → like plain
+  `bwrap --unshare-all` (a fresh network namespace with only a brought-up
+  loopback interface — bwrap's `loopback_setup()` — plus rs-bubble's proxy)
+
+Not covered by that equivalence (see "Notes" below): rs-bubble's
+`/proc` mounts are always fresh procfs instances and the command always
+runs as PID 1 of its PID namespace, mirroring `--as-pid-1`.
+
 `--die-with-parent` is on by default (it uses `PR_SET_PDEATHSIG`, like
 bwrap's option of the same name): the sandboxed command is killed with
 SIGKILL when rs-bubble — or rs-bubble's parent — dies. Pass
@@ -94,15 +110,17 @@ itself, because the setting does not survive fork.
 Like bwrap, the tool:
 
 1. Sets `PR_SET_NO_NEW_PRIVS`.
-2. Unshares a **user namespace** and a **mount namespace**
-   (this is what makes the sandbox work *without* root).
+2. Unshares a **user namespace**, a **cgroup namespace** (like bwrap's
+   `--unshare-cgroup-try`: only when the kernel supports it, and only because
+   it can be combined with the user-namespace unshare — afterwards the
+   privilege to create one would be gone) and a **mount namespace**.
 3. Maps the real uid/gid to an unprivileged id (`65535`) inside the new
    user namespace — the command therefore runs as a uid/gid that does not
    exist on the host, never as (namespace) root.
-4. Unshares a fresh **PID namespace** and forks: the command becomes
-   **PID 1** of the new namespace (like bwrap's `--unshare-pid` +
-   `--as-pid-1`), while the rs-bubble process supervises it and forwards
-   its exit status.
+4. Unshares fresh **IPC**, **UTS** and **PID namespaces** and forks: the
+   command becomes **PID 1** of the new PID namespace (like bwrap's
+   `--unshare-pid` + `--as-pid-1`), while the rs-bubble process supervises it
+   and forwards its exit status.
 5. Marks the mount tree as a **slave**, so nothing mounted inside
    propagates back to the host.
 6. Creates a fresh **tmpfs** as the sandbox root — unless the spec has
@@ -165,6 +183,10 @@ interface; the sandbox also gets its own UTS namespace) — while the
 rs-bubble process tree provides a proxy **inside** that namespace, so the
 command can reach the outside world transparently.
 
+This mode is the network part of `bwrap --unshare-all`: it unshares the
+network namespace like `bwrap --unshare-net` (loopback up, nothing else).
+Without it, rs-bubble corresponds to `bwrap --unshare-all --share-net`.
+
 ### Architecture
 
 Since `execve` replaces the process, rs-bubble forks into three roles:
@@ -172,8 +194,8 @@ Since `execve` replaces the process, rs-bubble forks into three roles:
 - **connector** (stays in the host network namespace): answers proxy
   requests with real TCP connections (name resolution included, so DNS
   also stays outside), and forwards the final exit status.
-- **proxy** (`P`): unshares user + network + UTS namespaces, brings up
-  loopback, and listens on **`127.0.0.2:3128`** as an **HTTP CONNECT
+- **proxy** (`P`): unshares user + network + cgroup + UTS namespaces, brings
+  up loopback, and listens on **`127.0.0.2:3128`** as an **HTTP CONNECT
   proxy**. It forks the actual sandboxed command.
 - **sandbox** (`C`): unshares the mount namespace, builds the tmpfs
   root and execs COMMAND.
@@ -324,5 +346,8 @@ sandbox-only `/proc` on top of the host view.
 
 Starter project — the spec file's `hostfs.mappings` (ro, rw, hide, empty,
 dev, tmpfs, proc, bind, symlink), `net.isolated` and `net.allow` are
-implemented. Natural next steps would be
-read-only binds, `--die-with-parent`, and `--unshare-all`.
+implemented. Namespace-wise rs-bubble always unshares user, cgroup, ipc,
+pid, uts and mount namespaces (see "Equivalence with bwrap's namespace
+flags" above); the network namespace is unshared with `net.isolated`.
+Natural next steps would be read-only bind mounts and further
+bubblewrap option coverage.

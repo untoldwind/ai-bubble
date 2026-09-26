@@ -105,6 +105,29 @@ pub(crate) fn userns_id() -> Option<(u64, u64)> {
     Some((md.dev(), md.ino()))
 }
 
+/// The cgroup namespace part of the unshare flags, bwrap-style
+/// (`--unshare-cgroup-try`): `CLONE_NEWCGROUP` only when the kernel exposes
+/// `/proc/self/ns/cgroup` (on pre-4.6 kernels it does not exist and the flag
+/// would make unshare() fail with EINVAL), 0 otherwise.
+///
+/// This flag must be combined with `CLONE_NEWUSER` *in the same unshare()/clone
+/// call* — like bubblewrap does in `bubblewrap.c` (clone_flags, around
+/// `clone_flags |= CLONE_NEWCGROUP`). Creating a cgroup namespace requires
+/// `CAP_SYS_ADMIN` in the user namespace owning the *current* cgroup namespace
+/// (the initial one). That authority only exists in the window where
+/// `CLONE_NEWUSER` is being created: the kernel switches the user namespace
+/// first, so the combined call's privilege check happens against the fresh
+/// user namespace. After a separate `unshare(CLONE_NEWUSER)` it is too late —
+/// the caller would no longer have any capabilities in the initial user
+/// namespace and the cgroup unshare would fail with EPERM.
+pub(crate) fn cgroup_ns_flags() -> libc::c_int {
+    if fs::metadata("/proc/self/ns/cgroup").is_ok() {
+        libc::CLONE_NEWCGROUP
+    } else {
+        0
+    }
+}
+
 /// Verify that unshare() really created a new user namespace. Some
 /// sandboxes (seccomp supervisors, gVisor, LSMs) silently strip
 /// CLONE_NEWUSER from the flags, which would otherwise only show up later
@@ -176,7 +199,10 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String], die_with_parent: bo
         // new user namespace and can mount freely. (The mount namespace is
         // unshared in mount_and_exec, shared by both entry points.)
         let old_userns = userns_id();
-        if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+        // The cgroup namespace is unshared in the same call (like bwrap's
+        // --unshare-all; see cgroup_ns_flags for why it must be combined
+        // with CLONE_NEWUSER).
+        if libc::unshare(libc::CLONE_NEWUSER | cgroup_ns_flags()) != 0 {
             die_with_error("Can't unshare user namespace");
         }
         check_new_userns(old_userns);
