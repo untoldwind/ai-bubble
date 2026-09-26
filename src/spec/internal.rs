@@ -96,11 +96,7 @@ impl Op {
             Op::Symlink { src, dest } => format!("symlink {} -> {src}", dest.display()),
             Op::Proc { dest } => format!("procfs at {}", dest.display()),
             Op::Dev { dest } => format!("minimal dev at {}", dest.display()),
-            Op::Tmpfs {
-                dest,
-                perms,
-                size,
-            } => {
+            Op::Tmpfs { dest, perms, size } => {
                 let mut detail = String::new();
                 if let Some(perms) = perms {
                     detail.push_str(&format!(" perms={:04o}", perms.0));

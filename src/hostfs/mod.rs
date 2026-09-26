@@ -168,6 +168,55 @@ pub(crate) static HOST_MOUNT_POINT: std::sync::OnceLock<PathBuf> = std::sync::On
 /// PID of the sandbox (host) process; the FUSE server exits when it dies.
 static HOST_PID: AtomicI32 = AtomicI32::new(0);
 
+/// The per-run session-cache directory (from the spec's `session-cache`
+/// mappings), wiped when rs-bubble terminates. Set by the sandbox parent
+/// before `start_host_fs` forks.
+static SESSION_CACHE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the per-run session-cache directory (see
+/// `crate::spec::hostfs::HostFsConfig::prepare_caches`) and arm its wipe:
+/// an `atexit` handler removes the whole tree when this process exits.
+/// The handler is inherited by every fork — in particular by the mirrored-fs
+/// server, which is the process that survives until the sandbox is done and
+/// then wipes the directory; the sandbox parent itself execs into the
+/// sandboxed command, which clears the handler there. Must be called before
+/// `start_host_fs` forks.
+pub fn set_session_cache_root(path: &Path) {
+    let _ = SESSION_CACHE_ROOT.set(path.to_path_buf());
+    unsafe { libc::atexit(wipe_session_cache) };
+}
+/// Create the fresh per-run session-cache tmp directory (`mkdtemp`, like
+/// the mirrored-fs mountpoint). The caller records it with
+/// [`set_session_cache_root`] so it is wiped when rs-bubble terminates.
+pub fn new_session_cache_dir() -> PathBuf {
+    let mut tmpl: Vec<u8> = b"/tmp/rs-bubble.cache.XXXXXX".to_vec();
+    tmpl.push(0);
+    let raw = unsafe { libc::mkdtemp(CString::from_vec_with_nul(tmpl).unwrap().into_raw()) };
+    if raw.is_null() {
+        die_with_error("Can't create temporary session-cache directory");
+    }
+    PathBuf::from(
+        unsafe { CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Whether any `session-cache` mapping exists (so a per-run tmp directory
+/// must be created); convenience for the run path in `main`.
+pub fn session_cache_needed(has: bool) -> Option<PathBuf> {
+    has.then(new_session_cache_dir)
+}
+
+/// The `atexit` handler: remove the session-cache directory tree, if one
+/// was set. Best effort: a directory that can't be removed (still busy, or
+/// already gone) is left to the next reboot.
+extern "C" fn wipe_session_cache() {
+    if let Some(root) = SESSION_CACHE_ROOT.get() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 const TTL: Duration = Duration::from_secs(1);
 
 /// One compiled mirror pattern, with the permission it carries.
@@ -339,7 +388,8 @@ impl HostFs {
         if let Some(p) = self.permission_of(mirrored) {
             return p.is_mirrored().then_some(p);
         }
-        mirrored.ancestors()
+        mirrored
+            .ancestors()
             .skip(1)
             .find_map(|a| self.permission_of(a).filter(|p| p.is_mirrored()))
     }
@@ -348,7 +398,8 @@ impl HostFs {
     /// (Whether the *real* file or directory actually allows it is decided
     /// by the host filesystem when the operation is performed.)
     fn writable(&self, mirrored: &Path) -> bool {
-        self.write_permission(mirrored).is_some_and(|p| p.is_writable())
+        self.write_permission(mirrored)
+            .is_some_and(|p| p.is_writable())
     }
 
     /// Whether any pattern grants write access: the FUSE mount is mounted
@@ -476,7 +527,9 @@ impl HostFs {
             Ok(md) => Ok(attr_from_metadata(&md)),
             // A purely virtual ancestor of an empty path has no real
             // counterpart; present it as a directory.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.is_empty_prefix(mirrored) => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound && self.is_empty_prefix(mirrored) =>
+            {
                 Ok(self.empty_dir_attr())
             }
             Err(e) => Err(e),
@@ -511,28 +564,28 @@ impl HostFs {
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
         let unfiltered = self.matches(mirrored);
-        let mut names: Vec<std::ffi::OsString> = match tokio_fs::read_dir(self.redirect(mirrored)).await
-        {
-            Ok(mut entries) => {
-                let mut names = Vec::new();
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let name = entry.file_name();
-                    let child = mirrored.join(&name);
-                    // Empty-path precedence: nothing below an empty path is
-                    // visible, not even a mirror match. Denied entries (and
-                    // everything below a hidden directory) are hidden even
-                    // inside a recursively mirrored directory.
-                    if self.under_empty(&child) || self.hidden(&child) {
-                        continue;
+        let mut names: Vec<std::ffi::OsString> =
+            match tokio_fs::read_dir(self.redirect(mirrored)).await {
+                Ok(mut entries) => {
+                    let mut names = Vec::new();
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let name = entry.file_name();
+                        let child = mirrored.join(&name);
+                        // Empty-path precedence: nothing below an empty path is
+                        // visible, not even a mirror match. Denied entries (and
+                        // everything below a hidden directory) are hidden even
+                        // inside a recursively mirrored directory.
+                        if self.under_empty(&child) || self.hidden(&child) {
+                            continue;
+                        }
+                        if unfiltered || self.exists(&child) {
+                            names.push(name);
+                        }
                     }
-                    if unfiltered || self.exists(&child) {
-                        names.push(name);
-                    }
+                    names
                 }
-                names
-            }
-            Err(_) => Vec::new(),
-        };
+                Err(_) => Vec::new(),
+            };
         // Empty-path entries living directly under this directory (also
         // when the real directory itself cannot be listed): every `empty`
         // pattern with a purely literal next component contributes one.
@@ -780,7 +833,8 @@ impl PathFilesystem for HostFs {
         } else {
             self.redirect(&self.mirror_path(path))
         };
-        let cpath = CString::new(mirrored.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
+        let cpath =
+            CString::new(mirrored.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
         // errno is per-thread: capture the error on the blocking thread.
         blocking(move || {
             let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -1020,7 +1074,10 @@ impl PathFilesystem for HostFs {
         }
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet.
-        if tokio_fs::symlink_metadata(self.redirect(&mirrored)).await.is_ok() {
+        if tokio_fs::symlink_metadata(self.redirect(&mirrored))
+            .await
+            .is_ok()
+        {
             return Err(libc::EEXIST.into());
         }
         // errno is per-thread: capture the error on the blocking thread.
@@ -1105,7 +1162,10 @@ impl PathFilesystem for HostFs {
         }
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet.
-        if tokio_fs::symlink_metadata(self.redirect(&mirrored)).await.is_ok() {
+        if tokio_fs::symlink_metadata(self.redirect(&mirrored))
+            .await
+            .is_ok()
+        {
             return Err(libc::EEXIST.into());
         }
         let mut opts = tokio_fs::OpenOptions::new();
@@ -1116,7 +1176,10 @@ impl PathFilesystem for HostFs {
         if flags & libc::O_APPEND as u32 != 0 {
             opts.append(true);
         }
-        let file = opts.mode(mode & 0o7777).open(self.redirect(&mirrored)).await?;
+        let file = opts
+            .mode(mode & 0o7777)
+            .open(self.redirect(&mirrored))
+            .await?;
         let md = file.metadata().await?;
         let attr = attr_from_metadata(&md);
         Ok(ReplyCreated {

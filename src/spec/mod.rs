@@ -61,12 +61,22 @@ pub(crate) mod tests {
                     "EMPTY": ""
                 } }"#,
         );
-        let env: std::collections::BTreeMap<_, _> =
-            spec.env.0.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect();
-        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/me/sandbox"));
+        let env: std::collections::BTreeMap<_, _> = spec
+            .env
+            .0
+            .iter()
+            .map(|(k, v)| (k.clone(), v.0.clone()))
+            .collect();
+        assert_eq!(
+            env.get("HOME").map(String::as_str),
+            Some("/home/me/sandbox")
+        );
         assert_eq!(env.get("EMPTY").map(String::as_str), Some(""));
         let compiled = SandboxConfig::compile(&spec);
-        assert_eq!(compiled.env.get("HOME").map(String::as_str), Some("/home/me/sandbox"));
+        assert_eq!(
+            compiled.env.get("HOME").map(String::as_str),
+            Some("/home/me/sandbox")
+        );
         unsafe { std::env::remove_var("RS_BUBBLE_TEST_ENV_HOME") };
     }
 
@@ -276,6 +286,8 @@ pub(crate) mod tests {
             "symlink",
             "redirect-ro",
             "redirect-rw",
+            "session-cache",
+            "project-cache",
         ] {
             assert!(
                 crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")),

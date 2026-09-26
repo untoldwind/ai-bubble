@@ -137,6 +137,35 @@ pub enum Mapping {
         /// spec file's directory.
         source: String,
     },
+    /// The named path is backed by a **per-run temporary directory**: a
+    /// fresh, empty host directory (created under `/tmp` when the sandbox
+    /// starts) is shown at the path — writable, like `redirect-rw`, but
+    /// nothing it contains outlives the run. Several `session-cache`
+    /// mappings share *one* tmp directory: each path maps onto the tmp
+    /// directory plus its own relative sub-path (e.g. `/home/a/.cache` →
+    /// `<tmpdir>/home/a/.cache`), so unrelated cache directories never
+    /// collide. The tmp directory is wiped once rs-bubble terminates (see
+    /// [`HostFsConfig::prepare_caches`] and
+    /// `crate::hostfs::set_session_cache_root`).
+    ///
+    /// Purely a FUSE redirect (see [`Mapping::op`]); the mapping is
+    /// rewritten into a `redirect-rw` at startup — [`Mapping::SessionCache`]
+    /// mappings only exist in the unresolved config view.
+    #[serde(rename = "session-cache")]
+    SessionCache {
+        /// An absolute sandbox path, named exactly (no wildcards).
+        path: String,
+    },
+    /// Like [`Mapping::SessionCache`], but backed by the **project cache**
+    /// instead of a tmp directory: the path maps onto `cache/<path>` below
+    /// the directory the spec file lives in (`.rs-bubble/cache/...` by
+    /// default), so the content persists across runs — and is shared by
+    /// every sandbox using that spec directory.
+    #[serde(rename = "project-cache")]
+    ProjectCache {
+        /// An absolute sandbox path, named exactly (no wildcards).
+        path: String,
+    },
     /// Create a symlink at `dest` pointing to `src`, like bwrap's
     /// `--symlink`. `src` is relative to the sandbox root (`usr/lib`,
     /// like bwrap's relative symlink targets) or absolute. This mapping
@@ -218,6 +247,16 @@ enum UncheckedMapping {
         dest: String,
         #[serde(deserialize_with = "env_string")]
         source: String,
+    },
+    #[serde(rename = "session-cache")]
+    SessionCache {
+        #[serde(deserialize_with = "env_string")]
+        path: String,
+    },
+    #[serde(rename = "project-cache")]
+    ProjectCache {
+        #[serde(deserialize_with = "env_string")]
+        path: String,
     },
     Symlink {
         #[serde(deserialize_with = "env_string")]
@@ -317,6 +356,12 @@ impl TryFrom<UncheckedMapping> for Mapping {
                 dest: redirect_dest("redirect-rw", dest)?,
                 source: nonempty("redirect-rw", "source", source)?,
             },
+            UncheckedMapping::SessionCache { path } => Mapping::SessionCache {
+                path: redirect_dest("session-cache", path)?,
+            },
+            UncheckedMapping::ProjectCache { path } => Mapping::ProjectCache {
+                path: redirect_dest("project-cache", path)?,
+            },
             UncheckedMapping::Symlink { src, dest } => Mapping::Symlink {
                 src: nonempty("symlink", "src", src)?,
                 dest: absolute("symlink", "dest", dest)?,
@@ -348,6 +393,7 @@ impl Mapping {
             | Mapping::Proc { path } => Some(path),
             Mapping::Bind { src, dest } => Some(dest.as_deref().unwrap_or(src)),
             Mapping::RedirectRo { dest, .. } | Mapping::RedirectRw { dest, .. } => Some(dest),
+            Mapping::SessionCache { path } | Mapping::ProjectCache { path } => Some(path),
             Mapping::Symlink { .. } => None,
         }
     }
@@ -373,6 +419,8 @@ impl Mapping {
             Mapping::RedirectRw { dest, source } => {
                 format!("redirect-rw {source} -> {dest}")
             }
+            Mapping::SessionCache { path } => format!("session-cache {path}"),
+            Mapping::ProjectCache { path } => format!("project-cache {path}"),
             Mapping::Symlink { src, dest } => format!("symlink {dest} -> {src}"),
         }
     }
@@ -394,6 +442,18 @@ impl Mapping {
                 source: PathBuf::from(source),
                 writable: true,
             },
+            Mapping::SessionCache { .. } | Mapping::ProjectCache { .. } => {
+                // A cache mapping *is* a redirect-rw — to its backing
+                // directory. The real source is filled in by
+                // [`HostFsConfig::prepare_caches`] (which rewrites the
+                // mapping into a `redirect-rw`); only `rs-bubble ls` ever
+                // sees mappings in this unresolved state, where the empty
+                // source just means "writable redirect, target not shown".
+                Permission::Redirect {
+                    source: PathBuf::new(),
+                    writable: true,
+                }
+            }
             _ => Permission::Empty,
         }
     }
@@ -501,6 +561,72 @@ impl HostFsConfig {
             }
         }
     }
+
+    /// Resolve the cache mappings (`session-cache`, `project-cache`) into
+    /// plain `redirect-rw` mappings against their backing directories,
+    /// which are created here (empty, when new).
+    ///
+    /// A cache mapping names one absolute sandbox path, which maps onto a
+    /// **relative sub-path** of a shared cache root — so several cache
+    /// mappings can share one backing directory:
+    ///
+    /// * `session-cache`: the per-run tmp directory `session_root`
+    ///   (created by the caller, e.g. `crate::hostfs::new_session_cache_dir`;
+    ///   that caller also arms the wipe at termination).
+    /// * `project-cache`: the `cache` directory inside the spec directory
+    ///   (`spec_dir/cache/<path>`); it persists across runs.
+    ///
+    /// Returns without changing anything when there are no cache mappings.
+    /// Called by `rs-bubble run` (never by `ls`, which only shows the
+    /// unresolved mappings).
+    pub fn prepare_caches(&mut self, spec_dir: &Path, session_root: Option<&Path>) {
+        // The spec dir itself may be relative (e.g. the default
+        // `.rs-bubble`): resolve it against the current directory first,
+        // like `resolve_relative_sources` does.
+        let dir = std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf());
+        for mapping in &mut self.mappings {
+            let (path, source) = match mapping {
+                Mapping::SessionCache { path } => {
+                    let source = session_root
+                        .expect("session root provided whenever session-cache mappings exist")
+                        .join(sub_path(path));
+                    (path, source)
+                }
+                Mapping::ProjectCache { path } => {
+                    let source = dir.join("cache").join(sub_path(path));
+                    (path, source)
+                }
+                _ => continue,
+            };
+            if let Err(e) = std::fs::create_dir_all(&source) {
+                crate::sandbox::die(&format!(
+                    "Can't create cache directory {}: {e}",
+                    source.display()
+                ));
+            }
+            *mapping = Mapping::RedirectRw {
+                dest: path.clone(),
+                source: source.to_string_lossy().into_owned(),
+            };
+        }
+    }
+
+    /// Whether any `session-cache` mapping needs a per-run tmp directory
+    /// (see [`HostFsConfig::prepare_caches`]).
+    pub fn has_session_caches(&self) -> bool {
+        self.mappings
+            .iter()
+            .any(|m| matches!(m, Mapping::SessionCache { .. }))
+    }
+}
+
+/// The cache mapping's path (an absolute sandbox path) as the relative
+/// sub-path it maps onto inside the shared cache root.
+fn sub_path(path: &str) -> PathBuf {
+    Path::new(path)
+        .strip_prefix("/")
+        .unwrap_or_else(|_| Path::new(path))
+        .to_path_buf()
 }
 
 #[cfg(test)]
@@ -728,6 +854,94 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn cache_mappings_parse_and_prepare_caches_rewrites_them() {
+        let dir =
+            std::env::temp_dir().join(format!("rs-bubble-spec-caches-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "session-cache", "path": "/home/me/.cache" },
+                { "type": "session-cache", "path": "/home/other/.local" },
+                { "type": "project-cache", "path": "/home/me/.local" }
+            ] } }"#,
+        );
+        // Before preparation the mappings are pure FUSE (no ops), backed
+        // by writable redirects with a not-yet-resolved source.
+        assert!(spec.hostfs.ops().is_empty());
+        for (_, permission) in spec.hostfs.patterns().0 {
+            assert!(permission.is_writable());
+        }
+        assert!(spec.hostfs.has_session_caches());
+        assert_eq!(
+            spec.hostfs.mappings[0].describe(),
+            "session-cache /home/me/.cache"
+        );
+
+        let root = crate::hostfs::new_session_cache_dir();
+        spec.hostfs.prepare_caches(&dir, Some(&root));
+        // Every cache mapping became a redirect-rw against its backing
+        // directory, which was created (empty).
+        let sources: Vec<_> = spec
+            .hostfs
+            .mappings
+            .iter()
+            .map(|m| match m {
+                Mapping::RedirectRw { dest, source } => (dest.clone(), PathBuf::from(source)),
+                other => panic!("expected a redirect-rw mapping, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(sources[0].0, "/home/me/.cache");
+        assert_eq!(sources[1].0, "/home/other/.local");
+        assert_eq!(sources[2].0, "/home/me/.local");
+        // The two session caches share the same tmp directory, as relative
+        // sub-paths.
+        assert_eq!(sources[0].1, root.join("home/me/.cache"));
+        assert_eq!(sources[1].1, root.join("home/other/.local"));
+        // The project cache maps into the spec directory's `cache` folder.
+        assert_eq!(
+            sources[2].1,
+            std::fs::canonicalize(&dir)
+                .unwrap()
+                .join("cache/home/me/.local")
+        );
+        // The backing directories exist.
+        assert!(sources[0].1.is_dir());
+        assert!(sources[1].1.is_dir());
+        assert!(sources[2].1.is_dir());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prepare_caches_without_cache_mappings_does_nothing() {
+        let mut spec =
+            parse(r#"{ "hostfs": { "mappings": [ { "type": "rw", "glob": "/etc" } ] } }"#);
+        assert!(!spec.hostfs.has_session_caches());
+        spec.hostfs
+            .prepare_caches(Path::new("/nonexistent-rs-bubble-test"), None);
+        assert_eq!(spec.hostfs.mappings.len(), 1);
+    }
+
+    #[test]
+    fn cache_mappings_reject_bad_paths() {
+        for mapping in [
+            r#"{ "type": "session-cache", "path": "home/.cache" }"#,
+            r#"{ "type": "session-cache", "path": "/hom*" }"#,
+            r#"{ "type": "session-cache" }"#,
+            r#"{ "type": "project-cache", "path": "/x?[y]" }"#,
+            r#"{ "type": "project-cache", "path": "/x", "glob": "/x" }"#,
+        ] {
+            assert!(
+                serde_json::from_str::<crate::spec::Spec>(&format!(
+                    r#"{{ "hostfs": {{ "mappings": [ {mapping} ] }} }}"#
+                ))
+                .is_err(),
+                "should reject {mapping}"
+            );
+        }
     }
 
     #[test]

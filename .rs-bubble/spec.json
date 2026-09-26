@@ -19,6 +19,18 @@
         "glob": "/bin"
       },
       {
+        "type": "project-cache",
+        "path": "${HOME}/.local"
+      },
+      {
+        "type": "session-cache",
+        "path": "${HOME}/.cache"
+      },
+      {
+        "type": "project-cache",
+        "path": "${HOME}/.config/opencode"
+      },
+      {
         "type": "redirect-rw",
         "source": "conf",
         "dest": "${HOME}/.config/opencode"
@@ -59,7 +71,9 @@
     "isolated": true,
     "allow": [
       "google.com:443",
-      "opencode.ai:443"
+      "opencode.ai:443",
+      "registry.npmjs.org:443",
+      "api.github.com:443"
     ]
   },
   "env": {

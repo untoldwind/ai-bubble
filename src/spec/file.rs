@@ -14,7 +14,9 @@
 //!     { "type": "dev" },
 //!     { "type": "tmpfs", "path": "/tmp", "perms": "1777", "size": 1048576 },
 //!     { "type": "symlink", "src": "usr/bin", "dest": "/bin" },
-//!     { "type": "redirect-ro", "dest": "/bla", "source": "/otherdir" }
+//!     { "type": "redirect-ro", "dest": "/bla", "source": "/otherdir" },
+//!     { "type": "session-cache", "path": "/home/me/.cache" },
+//!     { "type": "project-cache", "path": "/home/me/.local" }
 //!   ] },
 //!   "net": { "isolated": true, "allow": ["example.com:443"] },
 //!   "env": { "PATH": "${PATH}", "HOME": "${HOME}" }
@@ -31,7 +33,10 @@
 //! a path empty *and* stack the corresponding mount op on top of it;
 //! `symlink` mappings only add a symlink op. All the ops a spec produces
 //! are applied in mapping order. Without any mappings the sandbox gets a
-//! plain tmpfs root and no FUSE filesystem is started.
+//! plain tmpfs root and no FUSE filesystem is started. The cache mappings
+//! (`session-cache`, `project-cache`) are a writable redirect onto a
+//! per-run tmp directory (wiped when rs-bubble terminates) or the spec
+//! directory's `cache` folder, respectively.
 //!
 //! This is only the *file* view: the sandbox machinery runs with the
 //! compiled-down internal representation in `crate::spec::internal`.

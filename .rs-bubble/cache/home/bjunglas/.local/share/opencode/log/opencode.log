@@ -1,0 +1,68 @@
+timestamp=2026-09-26T19:05:45.165Z level=INFO run=e66781fb message="creating instance" directory=/home/bjunglas
+timestamp=2026-09-26T19:05:45.166Z level=INFO run=e66781fb message=fromDirectory directory=/home/bjunglas
+timestamp=2026-09-26T19:05:45.175Z level=INFO run=e66781fb message=bootstrapping directory=/home/bjunglas
+timestamp=2026-09-26T19:05:45.178Z level=INFO run=e66781fb message=loading path=/home/bjunglas/.config/opencode/config.json
+timestamp=2026-09-26T19:05:45.179Z level=INFO run=e66781fb message=loading path=/home/bjunglas/.config/opencode/opencode.json
+timestamp=2026-09-26T19:05:45.179Z level=INFO run=e66781fb message=loading path=/home/bjunglas/.config/opencode/opencode.jsonc
+timestamp=2026-09-26T19:05:45.187Z level=ERROR run=e66781fb message="Failed to fetch models.dev" cause="Cause([Fail(HttpClientError: StatusCode: non 2xx status code (403 GET https://models.opencode.ai/api.json))])"
+timestamp=2026-09-26T19:05:45.211Z level=INFO run=e66781fb message="all LSPs are disabled"
+timestamp=2026-09-26T19:05:45.212Z level=INFO run=e66781fb message="all formatters are disabled"
+timestamp=2026-09-26T19:05:45.212Z level=INFO run=e66781fb message=init
+timestamp=2026-09-26T19:05:45.909Z level=WARN run=e66781fb message="background dependency install failed" dir=/home/bjunglas/.config/opencode error="Cause([Fail(NpmInstallFailedError (cause: Qw: 403 Forbidden - GET https://registry.npmjs.org/@opencode-ai%2fplugin))])"
+timestamp=2026-09-26T19:05:45.955Z level=INFO run=e66781fb message=init count=1
+timestamp=2026-09-26T19:05:45.976Z level=WARN run=e66781fb message="failed to initialize fff" error="Failed to init file picker: Can not run certain FFF features in a file system root or home directories. Consider smaller per-project directories."
+timestamp=2026-09-26T19:05:45.987Z level=INFO run=e66781fb message="watcher backend" directory=/home/bjunglas platform=linux backend=inotify
+timestamp=2026-09-26T19:05:45.988Z level=INFO run=e66781fb message="project copy refresh started" projectID=global
+timestamp=2026-09-26T19:05:45.989Z level=INFO run=e66781fb message="project copy refresh done" projectID=global updated=[] removed=[]
+timestamp=2026-09-26T19:05:46.003Z level=INFO run=e66781fb message="booting location services" directory=/home/bjunglas workspaceID=undefined
+timestamp=2026-09-26T19:06:45.183Z level=INFO run=e1aeb7ce message="creating instance" directory=/
+timestamp=2026-09-26T19:06:45.184Z level=INFO run=e1aeb7ce message=fromDirectory directory=/
+timestamp=2026-09-26T19:06:45.192Z level=INFO run=e1aeb7ce message=bootstrapping directory=/
+timestamp=2026-09-26T19:06:45.195Z level=INFO run=e1aeb7ce message=loading path=/home/bjunglas/.config/opencode/config.json
+timestamp=2026-09-26T19:06:45.196Z level=INFO run=e1aeb7ce message=loading path=/home/bjunglas/.config/opencode/opencode.json
+timestamp=2026-09-26T19:06:45.197Z level=INFO run=e1aeb7ce message=loading path=/home/bjunglas/.config/opencode/opencode.jsonc
+timestamp=2026-09-26T19:06:45.210Z level=ERROR run=e1aeb7ce message="Failed to fetch models.dev" cause="Cause([Fail(HttpClientError: StatusCode: non 2xx status code (403 GET https://models.opencode.ai/api.json))])"
+timestamp=2026-09-26T19:06:45.220Z level=INFO run=e1aeb7ce message="all LSPs are disabled"
+timestamp=2026-09-26T19:06:45.220Z level=INFO run=e1aeb7ce message="all formatters are disabled"
+timestamp=2026-09-26T19:06:45.220Z level=INFO run=e1aeb7ce message=init
+timestamp=2026-09-26T19:06:45.936Z level=INFO run=e1aeb7ce message=init count=1
+timestamp=2026-09-26T19:06:45.974Z level=WARN run=e1aeb7ce message="failed to initialize fff" error="Failed to init file picker: Can not run certain FFF features in a file system root or home directories. Consider smaller per-project directories."
+timestamp=2026-09-26T19:06:45.986Z level=INFO run=e1aeb7ce message="watcher backend" directory=/ platform=linux backend=inotify
+timestamp=2026-09-26T19:06:45.987Z level=INFO run=e1aeb7ce message="project copy refresh started" projectID=global
+timestamp=2026-09-26T19:06:45.989Z level=INFO run=e1aeb7ce message="project copy refresh done" projectID=global updated=[] removed=[]
+timestamp=2026-09-26T19:06:46.004Z level=INFO run=e1aeb7ce message="booting location services" directory=/ workspaceID=undefined
+timestamp=2026-09-26T19:06:46.367Z level=WARN run=e1aeb7ce message="background dependency install failed" dir=/home/bjunglas/.config/opencode error="Cause([Fail(NpmInstallFailedError (cause: FetchError: Invalid response body while trying to fetch https://registry.npmjs.org/@opencode-ai%2fplugin: EACCES: permission denied, mkdir '/home/bjunglas/.npm'))])"
+timestamp=2026-09-26T19:07:17.196Z level=INFO run=d8669f80 message="creating instance" directory=/
+timestamp=2026-09-26T19:07:17.197Z level=INFO run=d8669f80 message=fromDirectory directory=/
+timestamp=2026-09-26T19:07:17.204Z level=INFO run=d8669f80 message=bootstrapping directory=/
+timestamp=2026-09-26T19:07:17.208Z level=INFO run=d8669f80 message=loading path=/home/bjunglas/.config/opencode/config.json
+timestamp=2026-09-26T19:07:17.208Z level=INFO run=d8669f80 message=loading path=/home/bjunglas/.config/opencode/opencode.json
+timestamp=2026-09-26T19:07:17.209Z level=INFO run=d8669f80 message=loading path=/home/bjunglas/.config/opencode/opencode.jsonc
+timestamp=2026-09-26T19:07:17.219Z level=ERROR run=d8669f80 message="Failed to fetch models.dev" cause="Cause([Fail(HttpClientError: StatusCode: non 2xx status code (403 GET https://models.opencode.ai/api.json))])"
+timestamp=2026-09-26T19:07:17.227Z level=INFO run=d8669f80 message="all LSPs are disabled"
+timestamp=2026-09-26T19:07:17.228Z level=INFO run=d8669f80 message="all formatters are disabled"
+timestamp=2026-09-26T19:07:17.228Z level=INFO run=d8669f80 message=init
+timestamp=2026-09-26T19:07:17.994Z level=INFO run=d8669f80 message=init count=1
+timestamp=2026-09-26T19:07:18.011Z level=WARN run=d8669f80 message="failed to initialize fff" error="Failed to init file picker: Can not run certain FFF features in a file system root or home directories. Consider smaller per-project directories."
+timestamp=2026-09-26T19:07:18.022Z level=INFO run=d8669f80 message="watcher backend" directory=/ platform=linux backend=inotify
+timestamp=2026-09-26T19:07:18.025Z level=INFO run=d8669f80 message="project copy refresh started" projectID=global
+timestamp=2026-09-26T19:07:18.026Z level=INFO run=d8669f80 message="project copy refresh done" projectID=global updated=[] removed=[]
+timestamp=2026-09-26T19:07:18.044Z level=INFO run=d8669f80 message="booting location services" directory=/ workspaceID=undefined
+timestamp=2026-09-26T19:07:18.409Z level=WARN run=d8669f80 message="background dependency install failed" dir=/home/bjunglas/.config/opencode error="Cause([Fail(NpmInstallFailedError (cause: FetchError: Invalid response body while trying to fetch https://registry.npmjs.org/@opencode-ai%2fplugin: EACCES: permission denied, mkdir '/home/bjunglas/.npm'))])"
+timestamp=2026-09-26T19:07:32.573Z level=INFO run=69d7171b message="creating instance" directory=/
+timestamp=2026-09-26T19:07:32.574Z level=INFO run=69d7171b message=fromDirectory directory=/
+timestamp=2026-09-26T19:07:32.583Z level=INFO run=69d7171b message=bootstrapping directory=/
+timestamp=2026-09-26T19:07:32.588Z level=INFO run=69d7171b message=loading path=/home/bjunglas/.config/opencode/config.json
+timestamp=2026-09-26T19:07:32.588Z level=INFO run=69d7171b message=loading path=/home/bjunglas/.config/opencode/opencode.json
+timestamp=2026-09-26T19:07:32.589Z level=INFO run=69d7171b message=loading path=/home/bjunglas/.config/opencode/opencode.jsonc
+timestamp=2026-09-26T19:07:32.601Z level=ERROR run=69d7171b message="Failed to fetch models.dev" cause="Cause([Fail(HttpClientError: StatusCode: non 2xx status code (403 GET https://models.opencode.ai/api.json))])"
+timestamp=2026-09-26T19:07:32.609Z level=INFO run=69d7171b message="all LSPs are disabled"
+timestamp=2026-09-26T19:07:32.610Z level=INFO run=69d7171b message="all formatters are disabled"
+timestamp=2026-09-26T19:07:32.610Z level=INFO run=69d7171b message=init
+timestamp=2026-09-26T19:07:33.339Z level=INFO run=69d7171b message=init count=1
+timestamp=2026-09-26T19:07:33.368Z level=WARN run=69d7171b message="failed to initialize fff" error="Failed to init file picker: Can not run certain FFF features in a file system root or home directories. Consider smaller per-project directories."
+timestamp=2026-09-26T19:07:33.381Z level=INFO run=69d7171b message="watcher backend" directory=/ platform=linux backend=inotify
+timestamp=2026-09-26T19:07:33.392Z level=INFO run=69d7171b message="project copy refresh started" projectID=global
+timestamp=2026-09-26T19:07:33.393Z level=INFO run=69d7171b message="project copy refresh done" projectID=global updated=[] removed=[]
+timestamp=2026-09-26T19:07:33.394Z level=INFO run=69d7171b message="booting location services" directory=/ workspaceID=undefined
+timestamp=2026-09-26T19:07:34.005Z level=WARN run=69d7171b message="background dependency install failed" dir=/home/bjunglas/.config/opencode error="Cause([Fail(NpmInstallFailedError (cause: FetchError: Invalid response body while trying to fetch https://registry.npmjs.org/@opencode-ai%2fplugin: EACCES: permission denied, mkdir '/home/bjunglas/.npm'))])"

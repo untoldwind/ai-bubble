@@ -50,12 +50,25 @@ fn main() {
             die_with_parent,
             mut command,
         }) => {
-            let spec = spec::Spec::load(cli.spec.as_deref());
             if command.is_empty() {
                 sandbox::die(
                     "No command given; usage: rs-bubble run [--spec-dir DIR] -- COMMAND [args...]",
                 );
             }
+            let mut spec = spec::Spec::load(cli.spec.as_deref());
+
+            // Resolve the cache mappings (`session-cache`,
+            // `project-cache`) against their backing directories before
+            // anything is compiled: the session-cache tmp directory is
+            // created here and wiped once rs-bubble terminates (the
+            // mirrored-fs server inherits the wipe).
+            let spec_dir = cli
+                .spec
+                .as_deref()
+                .unwrap_or(Path::new(spec::file::DEFAULT_SPEC_DIR));
+            let session_cache = hostfs::session_cache_needed(spec.hostfs.has_session_caches());
+            spec.hostfs
+                .prepare_caches(spec_dir, session_cache.as_deref());
 
             // Compile the config-file spec down into the internal
             // configuration (ops, hostfs patterns, net settings) the
@@ -70,6 +83,9 @@ fn main() {
             // depend on (or fail for the lack of) FUSE.
             if !sandbox_config.patterns.is_empty() {
                 hostfs::set_root_mode(true);
+                if let Some(root) = &session_cache {
+                    hostfs::set_session_cache_root(root);
+                }
                 hostfs::start_host_fs(&sandbox_config.patterns);
             }
 
@@ -142,6 +158,10 @@ fn ls(spec_path: Option<&Path>, path: &Path) {
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let full = target.join(entry.file_name());
-        println!("  {} ({})", entry.file_name().to_string_lossy(), label(permission_of(&full)));
+        println!(
+            "  {} ({})",
+            entry.file_name().to_string_lossy(),
+            label(permission_of(&full))
+        );
     }
 }

@@ -98,7 +98,10 @@ mod tests {
             cli.command,
             Some(Command::Run {
                 die_with_parent: true,
-                command: ["sh", "-c", "echo hi"].iter().map(|s| s.to_string()).collect(),
+                command: ["sh", "-c", "echo hi"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
             })
         );
     }
@@ -125,10 +128,7 @@ mod tests {
     #[test]
     fn spec_dir_before_run_subcommand() {
         let cli = parse(&["rs-bubble", "--spec-dir", "otherdir", "run", "sh"]);
-        assert_eq!(
-            cli.spec.as_deref(),
-            Some(std::path::Path::new("otherdir"))
-        );
+        assert_eq!(cli.spec.as_deref(), Some(std::path::Path::new("otherdir")));
         match cli.command {
             Some(Command::Run { command, .. }) => assert_eq!(command, ["sh"]),
             other => panic!("expected run, got {other:?}"),
@@ -146,7 +146,9 @@ mod tests {
     #[test]
     fn die_with_parent_flag() {
         let run = |args: &[&str]| match parse(args).command {
-            Some(Command::Run { die_with_parent, .. }) => die_with_parent,
+            Some(Command::Run {
+                die_with_parent, ..
+            }) => die_with_parent,
             other => panic!("expected run, got {other:?}"),
         };
         assert!(run(&["rs-bubble", "run", "sh"]));
