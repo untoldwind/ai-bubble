@@ -70,8 +70,69 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::sandbox::die_with_error;
 use crate::spec::internal::{Patterns, Permission};
 
-mod pattern;
+pub(crate) mod pattern;
 use pattern::{Pattern, Walk};
+
+/// The effective permission of a host path under the given pattern list,
+/// with the same semantics the FUSE mirror applies:
+///
+/// * a strict ancestor exposed `empty` shadows everything below it —
+///   nothing below an empty path is visible (`None`),
+/// * otherwise the **last** pattern naming the path itself decides —
+///   including `hide` (a hidden path is not visible) and `empty`,
+/// * otherwise a `hide` pattern naming a strict ancestor hides the
+///   whole subtree (`hide`),
+/// * otherwise the permission of the **nearest** mirrored (`ro`/`rw`)
+///   ancestor is inherited: an exactly-named or `**`-covered directory
+///   is a recursive mirror, so its permission governs everything below,
+/// * otherwise the path is not visible in the sandbox at all (`None`).
+///
+/// This lives with the matcher rather than with [`Patterns`] because the
+/// glob engine is hostfs-internal (and the build-time schema generation
+/// compiles `spec` without it).
+pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
+    let compiled: Vec<(Pattern, Permission)> = patterns
+        .iter()
+        .filter_map(|(pattern, permission)| {
+            Pattern::new(pattern).ok().map(|compiled| (compiled, *permission))
+        })
+        .collect();
+    let direct = |p: &Path| {
+        compiled
+            .iter()
+            .rev()
+            .find(|(compiled, _)| compiled.matches(p))
+            .map(|(_, permission)| *permission)
+    };
+
+    // Everything strictly below an empty path is invisible.
+    if path
+        .ancestors()
+        .skip(1)
+        .any(|a| direct(a) == Some(Permission::Empty))
+    {
+        return None;
+    }
+
+    // The last pattern naming the path itself decides.
+    if let Some(permission) = direct(path) {
+        return Some(permission);
+    }
+
+    // A hidden directory hides its whole subtree.
+    if compiled
+        .iter()
+        .any(|(p, permission)| *permission == Permission::Hide && p.walk(path) == Walk::Ancestor)
+    {
+        return Some(Permission::Hide);
+    }
+
+    // Otherwise the nearest mirrored ancestor governs: the mirror is
+    // recursive, so its permission extends to everything below it.
+    path.ancestors()
+        .skip(1)
+        .find_map(|a| direct(a).filter(|p| p.is_mirrored()))
+}
 
 /// The sandbox-absolute path the host filesystem is mounted at.
 pub const SANDBOX_MOUNT_POINT: &str = "/host";
@@ -1213,6 +1274,69 @@ mod tests {
     /// Alias for readability in the empty-path tests.
     fn fs_with_empties(entries: &[(&str, Permission)]) -> HostFs {
         fs(entries)
+    }
+
+    #[test]
+    fn permission_of_follows_hostfs_semantics() {
+        // Direct matches: the last pattern naming the path decides.
+        let patterns = Patterns(vec![
+            ("/etc".to_string(), Permission::Ro),
+            ("/etc/*.conf".to_string(), Permission::Rw),
+            ("/etc/passwd".to_string(), Permission::Hide),
+            ("/dev".to_string(), Permission::Empty),
+        ]);
+        assert_eq!(
+            permission_of(&patterns, Path::new("/etc")),
+            Some(Permission::Ro)
+        );
+        assert_eq!(
+            permission_of(&patterns, Path::new("/etc/hosts.conf")),
+            Some(Permission::Rw)
+        );
+        assert_eq!(
+            permission_of(&patterns, Path::new("/etc/passwd")),
+            Some(Permission::Hide)
+        );
+        assert_eq!(
+            permission_of(&patterns, Path::new("/dev")),
+            Some(Permission::Empty)
+        );
+
+        // No direct match: mirrored directories are recursive, so their
+        // permission is inherited by everything below them.
+        let patterns = Patterns(vec![("/home/me/project".to_string(), Permission::Rw)]);
+        assert_eq!(
+            permission_of(&patterns, Path::new("/home/me/project/src/main.rs")),
+            Some(Permission::Rw)
+        );
+        // ...and the nearest mirrored ancestor wins over a farther one.
+        let patterns = Patterns(vec![
+            ("/home/me".to_string(), Permission::Rw),
+            ("/home/me/project".to_string(), Permission::Ro),
+        ]);
+        assert_eq!(
+            permission_of(&patterns, Path::new("/home/me/project/src/main.rs")),
+            Some(Permission::Ro)
+        );
+
+        // A hidden directory hides its whole subtree.
+        let patterns = Patterns(vec![
+            ("/home/me".to_string(), Permission::Rw),
+            ("/home/me/project/target".to_string(), Permission::Hide),
+        ]);
+        assert_eq!(
+            permission_of(&patterns, Path::new("/home/me/project/target/debug")),
+            Some(Permission::Hide)
+        );
+
+        // Everything strictly below an empty path is invisible.
+        let patterns = Patterns(vec![
+            ("/etc".to_string(), Permission::Ro),
+            ("/dev".to_string(), Permission::Empty),
+        ]);
+        assert_eq!(permission_of(&patterns, Path::new("/dev/null")), None);
+        // Unrelated paths stay invisible, too.
+        assert_eq!(permission_of(&patterns, Path::new("/opt")), None);
     }
 
     /// The async HostFs methods (`attr`, `dir_entries`, …) run their host

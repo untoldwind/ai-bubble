@@ -68,6 +68,40 @@ impl SandboxConfig {
     }
 }
 
+impl Op {
+    /// One-line human description of the op: what it does and where. Used
+    /// by `rs-bubble ls` to show the mount/symlink "actions" the config
+    /// performs.
+    pub fn describe(&self) -> String {
+        match self {
+            Op::Bind { src, dest } => {
+                if src == &dest.to_string_lossy() {
+                    format!("bind   {src}")
+                } else {
+                    format!("bind   {src} -> {}", dest.display())
+                }
+            }
+            Op::Symlink { src, dest } => format!("symlink {} -> {src}", dest.display()),
+            Op::Proc { dest } => format!("procfs at {}", dest.display()),
+            Op::Dev { dest } => format!("minimal dev at {}", dest.display()),
+            Op::Tmpfs {
+                dest,
+                perms,
+                size,
+            } => {
+                let mut detail = String::new();
+                if let Some(perms) = perms {
+                    detail.push_str(&format!(" perms={:04o}", perms.0));
+                }
+                if let Some(size) = size {
+                    detail.push_str(&format!(" size={size}"));
+                }
+                format!("tmpfs  {}{detail}", dest.display())
+            }
+        }
+    }
+}
+
 /// One sandbox setup operation, applied inside the sandbox in list order
 /// (order matters, exactly like bwrap). Purely internal: the spec file
 /// expresses all of these through `hostfs` mappings — see

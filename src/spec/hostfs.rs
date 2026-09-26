@@ -249,6 +249,25 @@ impl Mapping {
         }
     }
 
+    /// One-line human description of the mapping: its permission/action
+    /// and the paths it selects or mounts. Used by `rs-bubble ls`.
+    pub fn describe(&self) -> String {
+        match self {
+            Mapping::Ro { glob } => format!("ro     {glob}"),
+            Mapping::Rw { glob } => format!("rw     {glob}"),
+            Mapping::Hide { glob } => format!("hide   {glob}"),
+            Mapping::Empty { path } => format!("empty  {path}"),
+            Mapping::Dev { path } => format!("dev    {path}"),
+            Mapping::Tmpfs { path, .. } => format!("tmpfs  {path}"),
+            Mapping::Proc { path } => format!("proc   {path}"),
+            Mapping::Bind { src, dest } => match dest {
+                Some(dest) => format!("bind   {src} -> {dest}"),
+                None => format!("bind   {src}"),
+            },
+            Mapping::Symlink { src, dest } => format!("symlink {dest} -> {src}"),
+        }
+    }
+
     /// The internal permission the mapping expresses. Every mount-point
     /// mapping exposes its path empty, like [`Mapping::Empty`].
     fn permission(&self) -> Permission {

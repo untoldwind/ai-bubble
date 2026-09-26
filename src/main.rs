@@ -20,6 +20,7 @@
 //!   process management.
 
 use clap::Parser;
+use std::path::{Path, PathBuf};
 
 mod cli;
 mod hostfs;
@@ -28,6 +29,8 @@ mod proxy;
 mod sandbox;
 mod spec;
 
+use cli::Command;
+
 /// The JSON Schema for the spec file, generated from `src/spec/mod.rs` by
 /// `build.rs` at compile time. Printed by `--print-schema`; point an
 /// editor (e.g. VS Code's `json.schemas`) at it to get completion and
@@ -35,38 +38,99 @@ mod spec;
 pub const SPEC_SCHEMA: &str = include_str!(concat!(env!("OUT_DIR"), "/rs-bubble-schema.json"));
 
 fn main() {
-    let mut args = cli::Cli::parse();
+    let cli = cli::Cli::parse();
 
-    if args.print_schema {
+    if cli.print_schema {
         print!("{}", SPEC_SCHEMA);
         return;
     }
 
-    let spec = spec::Spec::load(args.spec.as_deref());
-    let command = std::mem::take(&mut args.command);
-    if command.is_empty() {
-        sandbox::die("No command given; usage: rs-bubble [--spec FILE] -- COMMAND [args...]");
-    }
+    match cli.command {
+        Some(Command::Run {
+            die_with_parent,
+            mut command,
+        }) => {
+            let spec = spec::Spec::load(cli.spec.as_deref());
+            if command.is_empty() {
+                sandbox::die(
+                    "No command given; usage: rs-bubble run [--spec FILE] -- COMMAND [args...]",
+                );
+            }
 
-    // Compile the config-file spec down into the internal configuration
-    // (ops, hostfs patterns, net settings) the sandbox machinery runs with.
-    let sandbox = spec::internal::SandboxConfig::compile(&spec);
+            // Compile the config-file spec down into the internal
+            // configuration (ops, hostfs patterns, net settings) the
+            // sandbox machinery runs with.
+            let sandbox_config = spec::internal::SandboxConfig::compile(&spec);
 
-    // Start the host FUSE filesystem server (in its own child process) before
-    // any namespace setup: its filesystem becomes the sandbox root, with the
-    // ops (dev, tmpfs, proc, binds) mounted on top of it. Only when the spec
-    // actually exposes something: a sandbox without any hostfs mappings must
-    // not depend on (or fail for the lack of) FUSE.
-    if !sandbox.patterns.is_empty() {
-        hostfs::set_root_mode(true);
-        hostfs::start_host_fs(&sandbox.patterns);
-    }
+            // Start the host FUSE filesystem server (in its own child
+            // process) before any namespace setup: its filesystem becomes
+            // the sandbox root, with the ops (dev, tmpfs, proc, binds)
+            // mounted on top of it. Only when the spec actually exposes
+            // something: a sandbox without any hostfs mappings must not
+            // depend on (or fail for the lack of) FUSE.
+            if !sandbox_config.patterns.is_empty() {
+                hostfs::set_root_mode(true);
+                hostfs::start_host_fs(&sandbox_config.patterns);
+            }
 
-    unsafe {
-        if sandbox.net.isolated {
-            netns::run(&sandbox.ops, &command, &sandbox.net, args.die_with_parent);
-        } else {
-            sandbox::setup_and_exec(&sandbox.ops, &command, args.die_with_parent);
+            let command = std::mem::take(&mut command);
+            unsafe {
+                if sandbox_config.net.isolated {
+                    netns::run(&sandbox_config.ops, &command, &sandbox_config.net, die_with_parent);
+                } else {
+                    sandbox::setup_and_exec(&sandbox_config.ops, &command, die_with_parent);
+                }
+            }
         }
+
+        Some(Command::Ls { path }) => ls(cli.spec.as_deref(), &path),
+
+        None => sandbox::die("No sub-command given; usage: rs-bubble run|ls ..."),
+    }
+}
+
+/// The `ls` sub-command: list `path` on the host filesystem, annotated
+/// with the effective sandbox permission of the current config, and show
+/// the config's mappings (permissions/actions).
+fn ls(spec_path: Option<&Path>, path: &Path) {
+    let spec = spec::Spec::load(spec_path);
+
+    // The mappings of the current config: permissions and mount/symlink
+    // actions, in spec order.
+    let shown_spec = spec_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".rs-bubble.json"));
+    println!("mappings ({}):", shown_spec.display());
+    for mapping in &spec.hostfs.mappings {
+        println!("  {}", mapping.describe());
+    }
+    for op in spec.hostfs.ops() {
+        println!("  {}", op.describe());
+    }
+
+    // The listed path itself, and every entry, with the effective
+    // permission the config gives it (the last matching pattern wins;
+    // `None` means not visible in the sandbox at all).
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(err) => sandbox::die(&format!("cannot list {}: {err}", path.display())),
+    };
+    let patterns = spec.hostfs.patterns();
+    let permission_of = |p: &Path| hostfs::permission_of(&patterns, p);
+
+    let label = |permission: Option<spec::internal::Permission>| match permission {
+        Some(p) => format!("{p}"),
+        None => "-".to_string(),
+    };
+    println!("{} ({}):", target.display(), label(permission_of(&target)));
+
+    let mut entries: Vec<_> = match std::fs::read_dir(&target) {
+        Ok(entries) => entries.filter_map(|e| e.ok()).collect(),
+        Err(err) => sandbox::die(&format!("cannot list {}: {err}", target.display())),
+    };
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let full = target.join(entry.file_name());
+        println!("  {} ({})", entry.file_name().to_string_lossy(), label(permission_of(&full)));
     }
 }
