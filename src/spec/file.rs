@@ -34,6 +34,14 @@
 //!
 //! This is only the *file* view: the sandbox machinery runs with the
 //! compiled-down internal representation in `crate::spec::internal`.
+//!
+//! Environment variables: the path-like fields of the hostfs mappings
+//! (`glob`, `path`, `src`, `dest`, `source`) may reference environment
+//! variables as `${VAR}` (e.g. `"glob": "${HOME}/project"`). Expansion
+//! happens per field, while the spec is deserialized (see
+//! [`super::hostfs::env_string`]) — so everything downstream only ever
+//! sees the fully expanded text. Other fields (e.g. `net.allow`) are
+//! never expanded. Referencing an unset variable is an error.
 
 use std::path::Path;
 
@@ -108,4 +116,43 @@ impl Spec {
             Err(e) => crate::sandbox::die(&format!("Invalid spec file {}: {e}", path.display())),
         }
     }
+}
+
+/// Expand the `${VAR}` references in one string. Only the `${VAR}` form
+/// is recognized (not bare `$VAR`), so a literal `$` stays untouched.
+/// Used by the path-like mapping fields (see
+/// [`super::hostfs::env_string`]); unset variables (and empty or
+/// unterminated references) are errors, so typos don't silently produce
+/// bogus paths.
+pub(crate) fn expand_str(s: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find('}') {
+            Some(end) => {
+                let name = &after[..end];
+                if name.is_empty() {
+                    return Err("empty environment-variable reference \"${}\"".to_string());
+                }
+                match std::env::var(name) {
+                    Ok(value) => out.push_str(&value),
+                    Err(_) => {
+                        return Err(format!(
+                            "environment variable {name:?} referenced as {s:?} is not set"
+                        ));
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                // No closing brace: leave the rest as it is.
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
 }

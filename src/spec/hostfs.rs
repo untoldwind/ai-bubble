@@ -5,6 +5,13 @@
 //! [`HostFsConfig::ops`] compile it down onto the internal [`Patterns`]
 //! and [`Op`] types ([`super::internal`]) that the FUSE filesystem and
 //! the sandbox itself work with.
+//!
+//! Environment variables: every path-like mapping field (`glob`, `path`,
+//! `src`, `dest`, `source`) may reference environment variables as
+//! `${VAR}` (see [`env_string`]). They are expanded while the field is
+//! deserialized — before validation and everything downstream — so the
+//! rest of the code only ever sees the fully expanded text. Other string
+//! fields (the mapping `type` tag, `net.allow`, ...) are never expanded.
 
 use std::path::{Path, PathBuf};
 
@@ -155,54 +162,87 @@ fn default_proc_path() -> String {
 }
 
 /// The mapping as it is written in the spec file, before validation.
+///
+/// Every path-like field uses [`env_string`] as its deserializer, so
+/// `${VAR}` environment references are expanded while the field is read
+/// (before the `TryFrom` validation below sees it).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum UncheckedMapping {
     Ro {
+        #[serde(deserialize_with = "env_string")]
         glob: String,
     },
     Rw {
+        #[serde(deserialize_with = "env_string")]
         glob: String,
     },
     Hide {
+        #[serde(deserialize_with = "env_string")]
         glob: String,
     },
     Empty {
+        #[serde(deserialize_with = "env_string")]
         path: String,
     },
     Dev {
-        #[serde(default = "default_dev_path")]
+        #[serde(default = "default_dev_path", deserialize_with = "env_string")]
         path: String,
     },
     Tmpfs {
+        #[serde(deserialize_with = "env_string")]
         path: String,
         perms: Option<TmpfsPerms>,
         size: Option<u64>,
     },
     Proc {
-        #[serde(default = "default_proc_path")]
+        #[serde(default = "default_proc_path", deserialize_with = "env_string")]
         path: String,
     },
     Bind {
-        #[serde(alias = "path")]
+        #[serde(alias = "path", deserialize_with = "env_string")]
         src: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "env_opt_string")]
         dest: Option<String>,
     },
     #[serde(rename = "redirect-ro")]
     RedirectRo {
+        #[serde(deserialize_with = "env_string")]
         dest: String,
+        #[serde(deserialize_with = "env_string")]
         source: String,
     },
     #[serde(rename = "redirect-rw")]
     RedirectRw {
+        #[serde(deserialize_with = "env_string")]
         dest: String,
+        #[serde(deserialize_with = "env_string")]
         source: String,
     },
     Symlink {
+        #[serde(deserialize_with = "env_string")]
         src: String,
+        #[serde(deserialize_with = "env_string")]
         dest: String,
     },
+}
+
+/// Deserialize a path-like mapping field with `${VAR}` environment
+/// expansion (see [`super::file::expand_str`]): the field is read as a
+/// plain string, then the references are resolved — before validation
+/// and everything downstream sees it. Only the path-like fields of the
+/// mappings use this; other string fields (`net.allow`, ...) are never
+/// expanded. An unset variable is a deserialization error.
+fn env_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let raw = String::deserialize(deserializer)?;
+    super::file::expand_str(&raw).map_err(serde::de::Error::custom)
+}
+
+/// Like [`env_string`], for `Option<String>` fields.
+fn env_opt_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    env_string(deserializer).map(Some)
 }
 
 impl TryFrom<UncheckedMapping> for Mapping {

@@ -21,15 +21,15 @@
       {
         "type": "redirect-rw",
         "source": "conf",
-        "dest": "/home/bjunglas/.config/opencode"
+        "dest": "${HOME}/.config/opencode"
       },
       {
         "type": "rw",
-        "glob": "/home/bjunglas/workspaces"
+        "glob": "${HOME}/workspaces"
       },
       {
         "type": "hide",
-        "glob": "/home/bjunglas/workspaces/**/target"
+        "glob": "${HOME}/workspaces/**/target"
       },
       {
         "type": "dev"

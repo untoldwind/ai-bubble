@@ -276,4 +276,135 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(spec.net.isolated);
     }
+
+    #[test]
+    fn env_vars_are_expanded_in_spec_strings() {
+        // Every string value in the spec file may reference environment
+        // variables as ${VAR}: they are expanded right after the file is
+        // read, so the parsed spec only ever sees the expanded text.
+        let dir = std::env::temp_dir().join(format!("rs-bubble-spec-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::spec::file::SPEC_FILE);
+        std::fs::write(
+            &path,
+            r#"{ "hostfs": { "mappings": [
+                { "type": "rw", "glob": "${RS_BUBBLE_TEST_HOME}/project" },
+                { "type": "bind", "src": "${RS_BUBBLE_TEST_HOME}/etc" }
+            ] } }"#,
+        )
+        .unwrap();
+        // SAFETY: tests are single-threaded per process here and the
+        // variable name is unique to this test.
+        unsafe { std::env::set_var("RS_BUBBLE_TEST_HOME", "/home/me") };
+        let spec = Spec::load(Some(&dir));
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_HOME") };
+        std::fs::remove_dir_all(&dir).ok();
+        use crate::spec::hostfs::Mapping;
+        match &spec.hostfs.mappings[0] {
+            Mapping::Rw { glob } => assert_eq!(glob, "/home/me/project"),
+            other => panic!("expected an rw mapping, got {other:?}"),
+        }
+        match &spec.hostfs.mappings[1] {
+            Mapping::Bind { src, dest: None } => assert_eq!(src, "/home/me/etc"),
+            other => panic!("expected a bind mapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unset_env_vars_are_an_error_and_literals_pass_through() {
+        use crate::spec::file::expand_str;
+        // An unset variable is an error, so typos don't silently produce
+        // bogus paths.
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_UNSET") };
+        assert!(expand_str("${RS_BUBBLE_TEST_UNSET}/x").is_err());
+        // A set variable expands, several times in one string.
+        unsafe { std::env::set_var("RS_BUBBLE_TEST_VAR", "v") };
+        assert_eq!(
+            expand_str("${RS_BUBBLE_TEST_VAR}/${RS_BUBBLE_TEST_VAR}").unwrap(),
+            "v/v"
+        );
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_VAR") };
+        // Only the ${VAR} form is recognized: a bare $ stays untouched,
+        // as does an unterminated ${.
+        assert_eq!(expand_str("$HOME/x").unwrap(), "$HOME/x");
+        assert_eq!(expand_str("/a${b").unwrap(), "/a${b");
+    }
+
+    #[test]
+    fn env_expansion_applies_only_to_path_like_mapping_fields() {
+        unsafe { std::env::set_var("RS_BUBBLE_TEST_HOME", "/home/me") };
+        // The path-like mapping fields are expanded...
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "ro", "glob": "${RS_BUBBLE_TEST_HOME}/project" },
+                { "type": "empty", "path": "${RS_BUBBLE_TEST_HOME}/empty" },
+                { "type": "dev", "path": "${RS_BUBBLE_TEST_HOME}/dev" },
+                { "type": "tmpfs", "path": "${RS_BUBBLE_TEST_HOME}/tmp" },
+                { "type": "proc", "path": "${RS_BUBBLE_TEST_HOME}/proc" },
+                { "type": "bind", "src": "${RS_BUBBLE_TEST_HOME}/src", "dest": "${RS_BUBBLE_TEST_HOME}/dest" },
+                { "type": "redirect-rw", "dest": "${RS_BUBBLE_TEST_HOME}/at", "source": "${RS_BUBBLE_TEST_HOME}/src" },
+                { "type": "symlink", "src": "${RS_BUBBLE_TEST_HOME}/target", "dest": "/link" }
+            ] } }"#,
+        );
+        let patterns: Vec<_> = spec
+            .hostfs
+            .patterns()
+            .0
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert_eq!(
+            patterns,
+            vec![
+                "/home/me/project",
+                "/home/me/empty",
+                "/home/me/dev",
+                "/home/me/tmp",
+                "/home/me/proc",
+                "/home/me/dest",
+                "/home/me/at",
+            ]
+        );
+        let ops = spec.hostfs.ops();
+        if let [
+            Op::Dev { .. },
+            Op::Tmpfs { .. },
+            Op::Proc { .. },
+            Op::Bind { src, dest },
+            Op::Symlink {
+                src: symlink_src, ..
+            },
+        ] = &ops[..]
+        {
+            assert_eq!(src, "/home/me/src");
+            assert_eq!(dest, &PathBuf::from("/home/me/dest"));
+            assert_eq!(symlink_src, "/home/me/target");
+        } else {
+            panic!("unexpected ops: {ops:?}");
+        }
+        // ...while other string fields are left untouched: an ${VAR}
+        // reference in net.allow or $schema is a literal (and here just
+        // an odd, but legal, allow entry).
+        let spec = parse(r#"{ "net": { "allow": ["${RS_BUBBLE_TEST_HOME}:443"] } }"#);
+        assert_eq!(spec.net.allow, ["${RS_BUBBLE_TEST_HOME}:443"]);
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_HOME") };
+    }
+
+    #[test]
+    fn unset_env_var_in_a_mapping_field_is_a_deserialize_error() {
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_UNSET") };
+        assert!(
+            serde_json::from_str::<Spec>(
+                r#"{ "hostfs": { "mappings": [ { "type": "ro", "glob": "${RS_BUBBLE_TEST_UNSET}/x" } ] } }"#
+            )
+            .is_err()
+        );
+        // The same reference outside the mapping fields is accepted.
+        assert!(
+            serde_json::from_str::<Spec>(
+                r#"{ "net": { "allow": ["${RS_BUBBLE_TEST_UNSET}:443"] } }"#
+            )
+            .is_ok()
+        );
+    }
 }

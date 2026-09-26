@@ -52,6 +52,13 @@ root, no mounts at all (not even procfs), and the host network.
   rs-bubble process stays on the host and acts as a **TCP proxy**
 - `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`.
   Empty or missing means every target is allowed
+- **Environment variables** — the path-like mapping fields (`glob`,
+  `path`, `src`, `dest`, `source`) may reference environment variables
+  as `${VAR}` (e.g. `"glob": "${HOME}/project"`); the references are
+  expanded while the spec is read, so everything downstream only ever
+  sees the fully expanded text. Other fields (`net.allow`, ...) are
+  never expanded. Referencing an unset variable is an error; only the
+  `${VAR}` form is recognized (a bare `$` stays untouched)
 - `hostfs.mappings` — an **ordered** array of mappings, each selecting
   host paths for one treatment (`type`): `ro`, `rw` or `hide` select
   paths with a **glob** pattern of absolute host paths (`"glob"`);
