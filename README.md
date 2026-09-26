@@ -21,7 +21,6 @@ root, a fresh procfs at `/proc`, and the host network.
     { "type": "dev",   "path": "/dev" },
     { "type": "tmpfs", "path": "/tmp", "perms": "1777" }
   ] },
-  "proc": "/proc",
   "net": { "isolated": true, "allow": ["example.com:443"] }
 }
 ```
@@ -55,10 +54,10 @@ root, a fresh procfs at `/proc`, and the host network.
     `MS_NOSUID|MS_NODEV`). `perms` is the octal mode of the mount root
     (number or string, default `0755`, like bwrap's `--perms`) and `size`
     the maximum size in bytes (bwrap's `--size`); both are optional
-- `proc` — where to mount a **fresh procfs instance**
-  (like bwrap: `MS_NOSUID|MS_NOEXEC|MS_NODEV`). If not given, a fresh
-  procfs is mounted at `/proc` automatically — unless the spec mounts
-  proc itself (a `proc` mapping or `proc` op)
+- `proc` — a fresh procfs instance is mounted at `/proc` automatically
+  (like bwrap: `MS_NOSUID|MS_NOEXEC|MS_NODEV`). There is no separate
+  `proc` config: to mount it elsewhere — or to suppress it — use a
+  `{"type": "proc", "path": ...}` mapping (or a `proc` op)
 - `net.isolated` — run the command in a fresh **network namespace**
   (no interfaces besides loopback, which rs-bubble brings up) while the
   rs-bubble process stays on the host and acts as a **TCP proxy**
@@ -119,7 +118,7 @@ Like bwrap, the tool:
    `hostfs` mappings, in which case the FUSE filesystem itself becomes
    the root (see below).
 7. Applies the filesystem ops (from the `hostfs` mappings, then the
-   spec's `proc` and `ops`) **in the
+   spec's `ops`) **in the
    order they were given** (order matters, exactly like bwrap). Because
    the PID namespace is created before the mounts (the mounting process
    is PID 1 of it), a fresh procfs instance only ever shows the
@@ -278,10 +277,9 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
       { "type": "ro", "glob": "/usr" },
       { "type": "dev", "path": "/dev" },
       { "type": "tmpfs", "path": "/tmp", "perms": "1777" },
-      { "type": "empty", "path": "/proc" }
+      { "type": "proc", "path": "/proc" }
     ]
-  },
-  "proc": "/proc"
+  }
 }
 ```
 
@@ -320,8 +318,8 @@ and no mirror pattern can bring content back). It must exist for every
 mount point, because rs-bubble does not create directories on the FUSE
 filesystem itself — which is exactly why the mount-point mappings provide
 it automatically. The `dev` and `tmpfs` mounts (and the fresh procfs,
-whether from a `proc` mapping, the top-level `proc` field, or the default)
-then cover the empty dirs, giving a writable `/dev` and `/tmp` and a
+whether from a `proc` mapping, a `proc` op, or the default) then cover
+the empty dirs, giving a writable `/dev` and `/tmp` and a
 sandbox-only `/proc` on top of the host view.
 
 ## Requirements
@@ -333,6 +331,7 @@ sandbox-only `/proc` on top of the host view.
 
 ## Status
 
-Starter project — the spec file's `ops` (bind, symlink, dev, tmpfs), `proc`,
-`net.isolated`, `net.allow` and `hostfs.mappings` are implemented. Natural next steps would be
+Starter project — the spec file's `hostfs.mappings` (ro, rw, hide, empty,
+dev, tmpfs, proc, bind), `ops` (bind, symlink, dev, tmpfs, proc),
+`net.isolated` and `net.allow` are implemented. Natural next steps would be
 read-only binds, `--die-with-parent`, and `--unshare-all`.

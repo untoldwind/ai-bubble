@@ -22,15 +22,15 @@
 //!     { "type": "dev",   "path": "/dev" },
 //!     { "type": "tmpfs", "path": "/tmp", "perms": "1777", "size": 1048576 }
 //!   ] },
-//!   "proc": "/proc",
 //!   "net": { "isolated": true, "allow": ["example.com:443"] }
 //! }
 //! ```
 //!
-//! All fields are optional: `proc` defaults to `/proc` (a fresh procfs
-//! instance), and without `net.isolated` the command shares the host
-//! network. `allow` is the proxy allow-list; an empty list (or a missing
-//! `allow`) allows every target. The `hostfs` mappings make the FUSE
+//! All fields are optional: without `net.isolated` the command shares the
+//! host network. `allow` is the proxy allow-list; an empty list (or a
+//! missing `allow`) allows every target. A fresh procfs at `/proc` is
+//! mounted automatically unless the spec mounts proc itself (a `proc`
+//! mapping or `proc` op). The `hostfs` mappings make the FUSE
 //! filesystem the sandbox root — `ro`/`rw`/`hide` mirror or hide host
 //! paths, while the mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`,
 //! `bind`) expose a path empty *and* stack the corresponding mount op on
@@ -65,9 +65,6 @@ pub struct Spec {
     /// everything that cannot be expressed as a mapping — symlinks, or a
     /// bind from a *different* source path.
     pub ops: Vec<Op>,
-    /// Where to mount a fresh procfs instance. `None` mounts nothing;
-    /// see [`Spec::filesystem_ops`] for the default of `/proc`.
-    pub proc: Option<PathBuf>,
     /// Isolated-network configuration.
     pub net: NetConfig,
     /// The host filesystem: it is always the sandbox root, exposing the
@@ -123,17 +120,19 @@ impl Spec {
     ///
     /// The sandboxed command runs in its own PID namespace, so a *fresh*
     /// procfs instance (which only shows the sandbox's processes, like bwrap
-    /// with `--unshare-pid --proc /proc`) is what the child needs. If the
-    /// spec set `proc` explicitly, that is used instead; otherwise a fresh
-    /// procfs is mounted at `/proc` unless the spec already mounts proc
-    /// itself (via a `proc` mapping or a `proc` op).
+    /// with `--unshare-pid --proc /proc`) is what the child needs. A fresh
+    /// procfs at `/proc` is mounted automatically unless the spec already
+    /// mounts proc itself (a `proc` mapping or a `proc` op — which is also
+    /// how a procfs at a different location is chosen).
     pub fn filesystem_ops(&self) -> Vec<Op> {
         let mapped = self.hostfs.ops();
         let mut ops = Vec::new();
-        if let Some(dest) = self.proc.clone() {
-            // Explicit "proc": used verbatim, prepended in front of the ops.
-            ops.push(Op::Proc { dest });
-        } else if !self.ops.iter().chain(&mapped).any(|op| matches!(op, Op::Proc { .. })) {
+        if !self
+            .ops
+            .iter()
+            .chain(&mapped)
+            .any(|op| matches!(op, Op::Proc { .. }))
+        {
             ops.push(Op::Proc {
                 dest: PathBuf::from("/proc"),
             });
@@ -190,8 +189,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn explicit_proc_is_used_verbatim() {
-        let spec = parse(r#"{ "proc": "/sys/proc" }"#);
+    fn explicit_proc_op_relocates_procfs() {
+        // Without a top-level "proc" field, a procfs at a different
+        // location is chosen with a proc op (or a proc mapping).
+        let spec = parse(r#"{ "ops": [ { "type": "proc", "dest": "/sys/proc" } ] }"#);
         assert_eq!(
             spec.filesystem_ops(),
             vec![Op::Proc {
@@ -286,6 +287,9 @@ pub(crate) mod tests {
     #[test]
     fn unknown_fields_are_rejected() {
         assert!(serde_json::from_str::<Spec>(r#"{ "nope": true }"#).is_err());
+        // The top-level "proc" field is gone: procfs is configured with a
+        // `proc` mapping (or op) instead.
+        assert!(serde_json::from_str::<Spec>(r#"{ "proc": "/proc" }"#).is_err());
     }
 
     #[test]

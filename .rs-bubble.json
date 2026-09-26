@@ -35,7 +35,7 @@
         "path": "/etc"
       },
       {
-        "type": "empty",
+        "type": "proc",
         "path": "/proc"
       },
       {
@@ -52,7 +52,6 @@
       }
     ]
   },
-  "proc": "/proc",
   "net": {
     "isolated": true,
     "allow": [

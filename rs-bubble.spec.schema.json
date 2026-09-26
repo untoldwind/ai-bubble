@@ -34,14 +34,6 @@
       "items": {
         "$ref": "#/definitions/Op"
       }
-    },
-    "proc": {
-      "description": "Where to mount a fresh procfs instance. `None` mounts nothing; see [`Spec::filesystem_ops`] for the default of `/proc`.",
-      "default": null,
-      "type": [
-        "string",
-        "null"
-      ]
     }
   },
   "additionalProperties": false,
