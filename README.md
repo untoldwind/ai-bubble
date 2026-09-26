@@ -11,7 +11,7 @@ the current directory; `--spec FILE` points it at a different file.
 ## Spec file format
 
 All fields are optional. A missing `.rs-bubble.json` means: empty tmpfs
-root, a fresh procfs at `/proc`, and the host network.
+root, no mounts at all (not even procfs), and the host network.
 
 ```json
 {
@@ -54,10 +54,10 @@ root, a fresh procfs at `/proc`, and the host network.
     `MS_NOSUID|MS_NODEV`). `perms` is the octal mode of the mount root
     (number or string, default `0755`, like bwrap's `--perms`) and `size`
     the maximum size in bytes (bwrap's `--size`); both are optional
-- `proc` — a fresh procfs instance is mounted at `/proc` automatically
-  (like bwrap: `MS_NOSUID|MS_NOEXEC|MS_NODEV`). There is no separate
-  `proc` config: to mount it elsewhere — or to suppress it — use a
-  `{"type": "proc", "path": ...}` mapping (or a `proc` op)
+- `proc` — there is no separate `proc` config: procfs is only mounted
+  where the spec asks for it, with a `{"type": "proc", "path": ...}`
+  mapping (or a `proc` op, mounted with
+  `MS_NOSUID|MS_NOEXEC|MS_NODEV`)
 - `net.isolated` — run the command in a fresh **network namespace**
   (no interfaces besides loopback, which rs-bubble brings up) while the
   rs-bubble process stays on the host and acts as a **TCP proxy**
@@ -318,7 +318,7 @@ and no mirror pattern can bring content back). It must exist for every
 mount point, because rs-bubble does not create directories on the FUSE
 filesystem itself — which is exactly why the mount-point mappings provide
 it automatically. The `dev` and `tmpfs` mounts (and the fresh procfs,
-whether from a `proc` mapping, a `proc` op, or the default) then cover
+from a `proc` mapping or `proc` op) then cover
 the empty dirs, giving a writable `/dev` and `/tmp` and a
 sandbox-only `/proc` on top of the host view.
 

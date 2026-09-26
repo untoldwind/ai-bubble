@@ -509,10 +509,6 @@ mod tests {
         assert_eq!(
             spec.filesystem_ops(),
             vec![
-                // default proc, prepended
-                Op::Proc {
-                    dest: PathBuf::from("/proc")
-                },
                 // the dev mapping's op
                 Op::Dev {
                     dest: PathBuf::from("/dev")
@@ -527,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn proc_mapping_suppresses_the_default_proc() {
+    fn proc_mapping_mounts_procfs() {
         let spec = parse(r#"{ "hostfs": { "mappings": [ { "type": "proc", "path": "/proc" } ] } }"#);
         assert_eq!(
             spec.filesystem_ops(),
@@ -535,5 +531,9 @@ mod tests {
                 dest: PathBuf::from("/proc")
             }]
         );
+        // And without any mount-point mapping, no procfs (and nothing
+        // else) is mounted.
+        let spec = parse(r#"{ "hostfs": { "mappings": [ { "type": "ro", "glob": "/etc" } ] } }"#);
+        assert_eq!(spec.filesystem_ops(), vec![]);
     }
 }

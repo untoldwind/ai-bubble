@@ -28,9 +28,9 @@
 //!
 //! All fields are optional: without `net.isolated` the command shares the
 //! host network. `allow` is the proxy allow-list; an empty list (or a
-//! missing `allow`) allows every target. A fresh procfs at `/proc` is
-//! mounted automatically unless the spec mounts proc itself (a `proc`
-//! mapping or `proc` op). The `hostfs` mappings make the FUSE
+//! missing `allow`) allows every target. Nothing is mounted
+//! automatically: procfs only appears where the spec asks for it (a
+//! `proc` mapping or `proc` op). The `hostfs` mappings make the FUSE
 //! filesystem the sandbox root — `ro`/`rw`/`hide` mirror or hide host
 //! paths, while the mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`,
 //! `bind`) expose a path empty *and* stack the corresponding mount op on
@@ -42,7 +42,7 @@ pub mod net;
 pub mod op;
 pub mod tmpfs;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
 
@@ -80,7 +80,7 @@ pub struct Spec {
 impl Spec {
     /// Load the spec from `path` (typically `--spec FILE` or the default
     /// `.rs-bubble.json`). A missing default file is fine: an empty spec
-    /// (empty root, fresh `/proc`, host network) is used in that case,
+    /// (empty root, no mounts, host network) is used in that case,
     /// while an explicit `--spec` file that cannot be read is a hard error.
     pub fn load(explicit: Option<&Path>) -> Spec {
         match explicit {
@@ -107,7 +107,7 @@ impl Spec {
         }
     }
 
-    /// The filesystem setup operations, with `/proc` ensured.
+    /// The filesystem setup operations.
     ///
     /// The ops come from two places, applied in this order:
     ///
@@ -118,34 +118,22 @@ impl Spec {
     ///    expressed as a mapping, e.g. symlinks or a bind from a
     ///    *different* source path).
     ///
-    /// The sandboxed command runs in its own PID namespace, so a *fresh*
-    /// procfs instance (which only shows the sandbox's processes, like bwrap
-    /// with `--unshare-pid --proc /proc`) is what the child needs. A fresh
-    /// procfs at `/proc` is mounted automatically unless the spec already
-    /// mounts proc itself (a `proc` mapping or a `proc` op — which is also
-    /// how a procfs at a different location is chosen).
+    /// Nothing is mounted automatically — in particular, procfs is only
+    /// mounted when the spec says so: a `proc` mapping (or a `proc` op)
+    /// chooses where (and whether at all) a fresh procfs instance appears.
     pub fn filesystem_ops(&self) -> Vec<Op> {
-        let mapped = self.hostfs.ops();
-        let mut ops = Vec::new();
-        if !self
-            .ops
-            .iter()
-            .chain(&mapped)
-            .any(|op| matches!(op, Op::Proc { .. }))
-        {
-            ops.push(Op::Proc {
-                dest: PathBuf::from("/proc"),
-            });
-        }
-        ops.extend(mapped);
-        ops.extend(self.ops.iter().cloned());
-        ops
+        self.hostfs
+            .ops()
+            .into_iter()
+            .chain(self.ops.iter().cloned())
+            .collect()
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// Parse a spec file from a JSON snippet, like `serde_json::from_str`.
     pub(crate) fn parse(json: &str) -> Spec {
@@ -190,8 +178,8 @@ pub(crate) mod tests {
 
     #[test]
     fn explicit_proc_op_relocates_procfs() {
-        // Without a top-level "proc" field, a procfs at a different
-        // location is chosen with a proc op (or a proc mapping).
+        // Procfs only appears where the spec asks for it: a proc op (or a
+        // proc mapping) chooses where — and whether at all.
         let spec = parse(r#"{ "ops": [ { "type": "proc", "dest": "/sys/proc" } ] }"#);
         assert_eq!(
             spec.filesystem_ops(),
@@ -202,17 +190,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn default_proc_is_prepended_once() {
-        // Without "proc": a fresh procfs at /proc is prepended, in front of
-        // the spec's ops so they can layer on top of it.
+    fn no_proc_mount_without_a_proc_mapping_or_op() {
+        // Neither an explicit ops list nor mappings mount procfs on their
+        // own: no default /proc mount happens.
         let spec = parse(r#"{ "ops": [ { "type": "bind", "src": "/usr", "dest": "/usr" } ] }"#);
-        assert_eq!(
-            spec.filesystem_ops()[0],
-            Op::Proc {
-                dest: PathBuf::from("/proc")
-            }
+        assert_eq!(spec.filesystem_ops().len(), 1);
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [ { "type": "dev", "path": "/dev" } ] } }"#,
         );
-        assert_eq!(spec.filesystem_ops().len(), 2);
+        assert_eq!(spec.filesystem_ops().len(), 1);
     }
 
     #[test]
