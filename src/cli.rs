@@ -1,8 +1,8 @@
 //! Command-line parsing (clap derive).
 //!
 //! All sandbox configuration — mounts and networking — lives in the spec
-//! file (see `spec`); the command line selects which spec file to use
-//! (`--spec FILE`, default `.rs-bubble.json`) and a sub-command:
+//! file (see `spec`); the command line selects which spec directory to use
+//! (`--spec-dir DIR`, default `.rs-bubble`) and a sub-command:
 //!
 //! * `run` — run COMMAND inside the sandbox configured by the spec file
 //!   (the original, and still the default-ish, behaviour),
@@ -13,8 +13,8 @@ use std::path::PathBuf;
 
 /// rs-bubble: a minimal bubblewrap-like sandbox.
 ///
-/// Configured entirely via the spec file (`--spec FILE`, default
-/// `.rs-bubble.json`); see the sub-commands for what it can do.
+/// Configured entirely via the spec file (`--spec-dir DIR`, default
+/// `.rs-bubble`); see the sub-commands for what it can do.
 #[derive(Parser, Debug)]
 #[command(
     name = "rs-bubble",
@@ -22,16 +22,17 @@ use std::path::PathBuf;
     about = "Minimal bubblewrap-like sandboxing CLI, configured via a spec file"
 )]
 pub struct Cli {
-    /// Path to the sandbox spec file. Defaults to `.rs-bubble.json` in the
-    /// current directory.
-    #[arg(long = "spec", value_name = "FILE", global = true)]
+    /// Path to the sandbox spec directory (expected to contain a
+    /// `spec.json` file). Defaults to `.rs-bubble` in the current
+    /// directory.
+    #[arg(long = "spec-dir", value_name = "DIR", global = true)]
     pub spec: Option<PathBuf>,
 
     /// Print the JSON Schema for the spec file to stdout and exit. Useful
     /// to hand to editors: point `json.schemas` (VS Code) or a similar
     /// setting at the output of
     /// `rs-bubble --print-schema > rs-bubble.schema.json` to get
-    /// completion and validation for `.rs-bubble.json`.
+    /// completion and validation for `.rs-bubble/spec.json`.
     #[arg(long = "print-schema")]
     pub print_schema: bool,
 
@@ -81,18 +82,18 @@ mod tests {
     }
 
     #[test]
-    fn spec_and_run_command() {
+    fn spec_dir_and_run_command() {
         let cli = parse(&[
             "rs-bubble",
-            "--spec",
-            "s.json",
+            "--spec-dir",
+            "somedir",
             "run",
             "--",
             "sh",
             "-c",
             "echo hi",
         ]);
-        assert_eq!(cli.spec.as_deref(), Some(std::path::Path::new("s.json")));
+        assert_eq!(cli.spec.as_deref(), Some(std::path::Path::new("somedir")));
         assert_eq!(
             cli.command,
             Some(Command::Run {
@@ -122,11 +123,11 @@ mod tests {
     }
 
     #[test]
-    fn spec_before_run_subcommand() {
-        let cli = parse(&["rs-bubble", "--spec", "other.json", "run", "sh"]);
+    fn spec_dir_before_run_subcommand() {
+        let cli = parse(&["rs-bubble", "--spec-dir", "otherdir", "run", "sh"]);
         assert_eq!(
             cli.spec.as_deref(),
-            Some(std::path::Path::new("other.json"))
+            Some(std::path::Path::new("otherdir"))
         );
         match cli.command {
             Some(Command::Run { command, .. }) => assert_eq!(command, ["sh"]),
@@ -135,11 +136,11 @@ mod tests {
     }
 
     #[test]
-    fn spec_without_value_is_an_error() {
-        let err = Cli::try_parse_from(["rs-bubble", "--spec"])
+    fn spec_dir_without_value_is_an_error() {
+        let err = Cli::try_parse_from(["rs-bubble", "--spec-dir"])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--spec"), "{err}");
+        assert!(err.contains("--spec-dir"), "{err}");
     }
 
     #[test]
@@ -173,9 +174,9 @@ mod tests {
     }
 
     #[test]
-    fn ls_takes_a_path_and_a_global_spec() {
-        let cli = parse(&["rs-bubble", "--spec", "s.json", "ls", "/etc"]);
-        assert_eq!(cli.spec.as_deref(), Some(std::path::Path::new("s.json")));
+    fn ls_takes_a_path_and_a_global_spec_dir() {
+        let cli = parse(&["rs-bubble", "--spec-dir", "somedir", "ls", "/etc"]);
+        assert_eq!(cli.spec.as_deref(), Some(std::path::Path::new("somedir")));
         match cli.command {
             Some(Command::Ls { path }) => assert_eq!(path, PathBuf::from("/etc")),
             other => panic!("expected ls, got {other:?}"),

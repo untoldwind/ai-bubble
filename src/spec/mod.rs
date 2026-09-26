@@ -5,7 +5,8 @@
 //!
 //! * The config file — [`file::Spec`] and its sections ([`hostfs`],
 //!   [`net`], [`tmpfs`]): everything that maps 1:1 onto what the user
-//!   writes in the JSON spec file (`.rs-bubble.json`, or `--spec FILE`).
+//!   writes in the JSON spec file (`.rs-bubble/spec.json`, or
+//!   `--spec-dir DIR`).
 //!   These types carry the serde and JSON-schema attributes and are
 //!   documented for the file format.
 //! * The internal configuration — [`internal`]: what the sandbox
@@ -220,12 +221,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn explicit_spec_file_is_required() {
+    fn explicit_spec_dir_is_required() {
         let dir = std::env::temp_dir().join(format!("rs-bubble-spec-test2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("s.json");
+        let path = dir.join(crate::spec::file::SPEC_FILE);
         std::fs::write(&path, r#"{ "net": { "isolated": true } }"#).unwrap();
-        let spec = Spec::load(Some(&path));
+        let spec = Spec::load(Some(&dir));
         std::fs::remove_dir_all(&dir).ok();
         assert!(spec.net.isolated);
     }

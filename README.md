@@ -5,12 +5,13 @@ A minimal Rust reimplementation of the basic functionality of
 simple CLI on top of [clap](https://docs.rs/clap).
 
 The sandbox is configured through a **spec file** (JSON), not through
-command-line options. By default rs-bubble looks for `.rs-bubble.json` in
-the current directory; `--spec FILE` points it at a different file.
+command-line options. By default rs-bubble looks for `.rs-bubble/spec.json`
+in the current directory; `--spec-dir DIR` points it at a different spec
+directory.
 
 ## Spec file format
 
-All fields are optional. A missing `.rs-bubble.json` means: empty tmpfs
+All fields are optional. A missing `.rs-bubble/spec.json` means: empty tmpfs
 root, no mounts at all (not even procfs), and the host network.
 
 ```json
@@ -79,7 +80,7 @@ command to run inside the sandbox:
 
 ```sh
 rs-bubble -- /bin/sh
-rs-bubble --spec custom.json /bin/sh
+rs-bubble --spec-dir custom /bin/sh
 ```
 
 ### Equivalence with bwrap's namespace flags
@@ -215,7 +216,7 @@ besides loopback and no routes to the host, so direct connections
 ### Usage
 
 ```sh
-rs-bubble --spec isolated.json -- /bin/sh
+rs-bubble --spec-dir isolated -- /bin/sh
 ```
 
 with `isolated.json`:
@@ -321,7 +322,7 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
 ### The "empty" mappings are the mount points
 
 ```sh
-rs-bubble --spec hostfs.json -- /bin/sh
+rs-bubble --spec-dir hostfs -- /bin/sh
 ```
 
 The mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`, `bind`) expose

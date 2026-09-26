@@ -34,7 +34,7 @@ use cli::Command;
 /// The JSON Schema for the spec file, generated from `src/spec/mod.rs` by
 /// `build.rs` at compile time. Printed by `--print-schema`; point an
 /// editor (e.g. VS Code's `json.schemas`) at it to get completion and
-/// validation for `.rs-bubble.json`.
+/// validation for `.rs-bubble/spec.json`.
 pub const SPEC_SCHEMA: &str = include_str!(concat!(env!("OUT_DIR"), "/rs-bubble-schema.json"));
 
 fn main() {
@@ -53,7 +53,7 @@ fn main() {
             let spec = spec::Spec::load(cli.spec.as_deref());
             if command.is_empty() {
                 sandbox::die(
-                    "No command given; usage: rs-bubble run [--spec FILE] -- COMMAND [args...]",
+                    "No command given; usage: rs-bubble run [--spec-dir DIR] -- COMMAND [args...]",
                 );
             }
 
@@ -99,7 +99,7 @@ fn ls(spec_path: Option<&Path>, path: &Path) {
     // actions, in spec order.
     let shown_spec = spec_path
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(".rs-bubble.json"));
+        .unwrap_or_else(|| PathBuf::from(spec::file::DEFAULT_SPEC_DIR));
     println!("mappings ({}):", shown_spec.display());
     for mapping in &spec.hostfs.mappings {
         println!("  {}", mapping.describe());

@@ -1,8 +1,8 @@
 //! The spec file itself (JSON): the config-file view of the sandbox
 //! specification, and everything that maps 1:1 onto what the user writes.
 //!
-//! The default location is `.rs-bubble.json` in the current directory;
-//! `--spec FILE` on the command line overrides it.
+//! The default location is `.rs-bubble/spec.json` in the current
+//! directory; `--spec-dir DIR` on the command line overrides it.
 //!
 //! Format:
 //!
@@ -43,8 +43,12 @@ use schemars::JsonSchema;
 use super::hostfs::HostFsConfig;
 use super::net::NetConfig;
 
-/// The default spec file, looked up relative to the current directory.
-pub const DEFAULT_SPEC: &str = ".rs-bubble.json";
+/// The default spec directory, looked up relative to the current
+/// directory.
+pub const DEFAULT_SPEC_DIR: &str = ".rs-bubble";
+
+/// The name of the spec file inside the spec directory.
+pub const SPEC_FILE: &str = "spec.json";
 
 /// The whole sandbox specification, as written by the user. Parsing
 /// only — no side effects beyond reading the file. The sandbox machinery
@@ -66,17 +70,19 @@ pub struct Spec {
 }
 
 impl Spec {
-    /// Load the spec from `path` (typically `--spec FILE` or the default
-    /// `.rs-bubble.json`). A missing default file is fine: an empty spec
-    /// (empty root, no mounts, host network) is used in that case,
-    /// while an explicit `--spec` file that cannot be read is a hard error.
+    /// Load the spec from the spec directory (typically `--spec-dir DIR`
+    /// or the default `.rs-bubble`). The directory is expected to contain
+    /// a `spec.json` file. A missing default spec directory is fine: an
+    /// empty spec (empty root, no mounts, host network) is used in that
+    /// case, while an explicit `--spec-dir` that cannot be read is a hard
+    /// error.
     pub fn load(explicit: Option<&Path>) -> Spec {
         match explicit {
-            Some(path) => Self::read(path),
+            Some(dir) => Self::read(&dir.join(SPEC_FILE)),
             None => {
-                let path = Path::new(DEFAULT_SPEC);
+                let path = Path::new(DEFAULT_SPEC_DIR).join(SPEC_FILE);
                 if path.exists() {
-                    Self::read(path)
+                    Self::read(&path)
                 } else {
                     Spec::default()
                 }

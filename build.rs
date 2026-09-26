@@ -8,7 +8,7 @@
 //! `--print-schema`. Point a spec file's editor at it (e.g. VS Code's
 //! `json.schemas`, or `"$schema"` once the schema lives somewhere the
 //! editor can find) to get completion and validation for
-//! `.rs-bubble.json`.
+//! `.rs-bubble/spec.json`.
 //!
 //! Because the schema is generated from the very same source files that
 //! do the deserialization, it can never drift from what the program
