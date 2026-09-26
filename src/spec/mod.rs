@@ -186,6 +186,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn redirect_sources_are_resolved_relative_to_the_spec_dir() {
+        let dir =
+            std::env::temp_dir().join(format!("rs-bubble-spec-redirect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::spec::file::SPEC_FILE);
+        std::fs::write(
+            &path,
+            r#"{ "hostfs": { "mappings": [
+                { "type": "redirect-ro", "dest": "/bla", "source": "otherdir" },
+                { "type": "redirect-rw", "dest": "/abs", "source": "/elsewhere" }
+            ] } }"#,
+        )
+        .unwrap();
+        let spec = Spec::load(Some(&dir));
+        use crate::spec::hostfs::Mapping;
+        use std::path::Path;
+        match &spec.hostfs.mappings[0] {
+            Mapping::RedirectRo { source, .. } => {
+                // The relative source is resolved against the spec file's
+                // directory (canonicalized, like the dir itself).
+                assert_eq!(
+                    Path::new(source),
+                    std::fs::canonicalize(&dir).unwrap().join("otherdir")
+                );
+            }
+            other => panic!("expected a redirect-ro mapping, got {other:?}"),
+        }
+        // An absolute source is left alone.
+        match &spec.hostfs.mappings[1] {
+            Mapping::RedirectRw { source, .. } => assert_eq!(source, "/elsewhere"),
+            other => panic!("expected a redirect-rw mapping, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn embedded_schema_is_valid_json_and_covers_all_mapping_types() {
         let schema: serde_json::Value = serde_json::from_str(crate::SPEC_SCHEMA).unwrap();
         assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
@@ -193,7 +229,17 @@ pub(crate) mod tests {
         // The mappings are a "type"-tagged enum: every variant's tag must
         // show up in the generated schema.
         for tag in [
-            "ro", "rw", "hide", "empty", "dev", "tmpfs", "proc", "bind", "symlink",
+            "ro",
+            "rw",
+            "hide",
+            "empty",
+            "dev",
+            "tmpfs",
+            "proc",
+            "bind",
+            "symlink",
+            "redirect-ro",
+            "redirect-rw",
         ] {
             assert!(
                 crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")),

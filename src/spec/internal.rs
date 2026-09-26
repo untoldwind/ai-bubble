@@ -7,7 +7,7 @@
 //! (de)serialized from the spec file: the config-file types are compiled
 //! down into these by [`SandboxConfig::compile`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::Spec;
 use super::net::NetConfig;
@@ -146,7 +146,7 @@ pub enum Op {
 /// The permission a hostfs pattern grants inside the sandbox: the
 /// internal representation of a mapping's `type` (see
 /// [`crate::spec::hostfs::Mapping`]).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Permission {
     /// The matched paths are mirrored into the sandbox **read-only**: they can
     /// be read (and executed, when the underlying file or directory has the
@@ -165,17 +165,46 @@ pub enum Permission {
     /// path is visible. Meant as mount points inside the sandbox, e.g.
     /// `/dev`, `/tmp`, `/proc`.
     Empty,
+    /// The matched paths are **redirected**: instead of showing the host
+    /// content that lives at the path itself, the host path `source`
+    /// (a single file or directory) is shown in its place — the FUSE
+    /// equivalent of a bind mount, but routed through the host
+    /// filesystem (and thus monitored with it). A redirected directory
+    /// shows its whole subtree; everything the pattern names is mapped
+    /// onto the source (the path itself maps to the source, and paths
+    /// below it to the source plus the remaining path components).
+    /// `writable` decides between redirect-ro and redirect-rw; as with
+    /// plain mirrors, writes additionally require the real host
+    /// permissions to allow them.
+    Redirect { source: PathBuf, writable: bool },
 }
 
 impl Permission {
-    /// Whether the permission mirrors real host content (`ro` or `rw`).
-    pub fn is_mirrored(self) -> bool {
-        matches!(self, Permission::Ro | Permission::Rw)
+    /// Whether the permission mirrors real host content (`ro`, `rw` or
+    /// a redirect).
+    pub fn is_mirrored(&self) -> bool {
+        matches!(
+            self,
+            Permission::Ro | Permission::Rw | Permission::Redirect { .. }
+        )
     }
 
-    /// Whether the permission additionally allows writing (`rw` only).
-    pub fn is_writable(self) -> bool {
-        self == Permission::Rw
+    /// Whether the permission additionally allows writing (`rw` and
+    /// redirect-rw).
+    pub fn is_writable(&self) -> bool {
+        match self {
+            Permission::Rw => true,
+            Permission::Redirect { writable, .. } => *writable,
+            _ => false,
+        }
+    }
+
+    /// The host path the permission redirects to, if any.
+    pub fn redirect_source(&self) -> Option<&Path> {
+        match self {
+            Permission::Redirect { source, .. } => Some(source),
+            _ => None,
+        }
     }
 }
 
@@ -186,6 +215,8 @@ impl std::fmt::Display for Permission {
             Permission::Rw => "rw",
             Permission::Hide => "hide",
             Permission::Empty => "empty",
+            Permission::Redirect { writable, .. } if *writable => "redirect-rw",
+            Permission::Redirect { .. } => "redirect-ro",
         })
     }
 }

@@ -13,7 +13,8 @@
 //!     { "type": "bind",  "path": "/etc" },
 //!     { "type": "dev" },
 //!     { "type": "tmpfs", "path": "/tmp", "perms": "1777", "size": 1048576 },
-//!     { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
+//!     { "type": "symlink", "src": "usr/bin", "dest": "/bin" },
+//!     { "type": "redirect-ro", "dest": "/bla", "source": "/otherdir" }
 //!   ] },
 //!   "net": { "isolated": true, "allow": ["example.com:443"] }
 //! }
@@ -95,8 +96,15 @@ impl Spec {
             Ok(text) => text,
             Err(e) => crate::sandbox::die(&format!("Can't read spec file {}: {e}", path.display())),
         };
-        match serde_json::from_str(&text) {
-            Ok(spec) => spec,
+        match serde_json::from_str::<Spec>(&text) {
+            Ok(mut spec) => {
+                // Redirect sources may be relative: they are resolved
+                // relative to the directory the spec file lives in.
+                if let Some(dir) = path.parent() {
+                    spec.hostfs.resolve_relative_sources(dir);
+                }
+                spec
+            }
             Err(e) => crate::sandbox::die(&format!("Invalid spec file {}: {e}", path.display())),
         }
     }

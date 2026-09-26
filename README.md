@@ -38,7 +38,11 @@ root, no mounts at all (not even procfs), and the host network.
   `bind` the host path `src` at `dest` (which defaults to `src`). The
   `symlink` mapping creates a symlink at `dest` pointing to `src` (like
   bwrap's `--symlink`; `src` may be relative to the sandbox root) without
-  touching the host filesystem. All generated ops are applied in
+  touching the host filesystem. The `redirect-ro`/`redirect-rw` mappings
+  show the host file or directory `source` at the sandbox path `dest` —
+  a lightweight bind routed through the FUSE host filesystem (no mount
+  happens; `source` may be relative to the spec directory). All generated
+  ops are applied in
   mapping order, exactly like bwrap's command line
 - `proc` — there is no separate `proc` config: procfs is only mounted
   where the spec asks for it, with a `{"type": "proc", "path": ...}`
@@ -306,7 +310,12 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
   far as its permissions allow), `hide` (they are hidden; a hidden
   directory hides its whole subtree) or `empty` (the named path is
   exposed empty — an empty, unwritable directory, or an empty file when
-  it matches a real file). The mappings are tried in the order they are
+  it matches a real file) or `redirect-ro`/`redirect-rw` (the absolute
+  path `dest` is named exactly and shows the host path `source` in its
+  place — a lightweight bind routed through the FUSE filesystem, so it
+  is monitored and permission-checked like any mirrored path; no mount
+  happens, and `source` may be relative to the spec directory). The
+  mappings are tried in the order they are
   written and the **last** match wins — put more specific mappings after
   broader ones, e.g. mirror `/etc` and then hide `/etc/ssh`.
 - The host tree is **not** crawled at startup: every FUSE operation
@@ -346,7 +355,8 @@ sandbox-only `/proc` on top of the host view.
 ## Status
 
 Starter project — the spec file's `hostfs.mappings` (ro, rw, hide, empty,
-dev, tmpfs, proc, bind, symlink), `net.isolated` and `net.allow` are
+dev, tmpfs, proc, bind, symlink, redirect-ro, redirect-rw), `net.isolated`
+and `net.allow` are
 implemented. Namespace-wise rs-bubble always unshares user, cgroup, ipc,
 pid, uts and mount namespaces (see "Equivalence with bwrap's namespace
 flags" above); the network namespace is unshared with `net.isolated`.

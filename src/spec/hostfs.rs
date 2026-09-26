@@ -6,7 +6,7 @@
 //! and [`Op`] types ([`super::internal`]) that the FUSE filesystem and
 //! the sandbox itself work with.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -99,6 +99,37 @@ pub enum Mapping {
         #[serde(default)]
         dest: Option<String>,
     },
+    /// A **lightweight bind** routed through the host filesystem: the
+    /// host file or directory `source` is shown *in the FUSE mirror* at
+    /// the sandbox path `dest` — like a bind mount, but no mount at all
+    /// happens, so it works without mount privileges and is monitored
+    /// (and permission-checked) by the host filesystem like any mirrored
+    /// path. A redirected directory shows its whole subtree, redirected
+    /// paths may be files or directories. A relative `source` is
+    /// resolved relative to the directory the spec file lives in.
+    ///
+    /// Produces no mount op: the redirect lives entirely in the FUSE
+    /// filesystem (see [`Mapping::pattern`]).
+    #[serde(rename = "redirect-ro")]
+    RedirectRo {
+        /// An absolute sandbox path to show the source at (named
+        /// exactly, no wildcards).
+        dest: String,
+        /// The host path to show there; absolute, or relative to the
+        /// spec file's directory.
+        source: String,
+    },
+    /// Like [`Mapping::RedirectRo`], but the redirected path is also
+    /// writable (as far as the real host permissions allow).
+    #[serde(rename = "redirect-rw")]
+    RedirectRw {
+        /// An absolute sandbox path to show the source at (named
+        /// exactly, no wildcards).
+        dest: String,
+        /// The host path to show there; absolute, or relative to the
+        /// spec file's directory.
+        source: String,
+    },
     /// Create a symlink at `dest` pointing to `src`, like bwrap's
     /// `--symlink`. `src` is relative to the sandbox root (`usr/lib`,
     /// like bwrap's relative symlink targets) or absolute. This mapping
@@ -158,6 +189,16 @@ enum UncheckedMapping {
         #[serde(default)]
         dest: Option<String>,
     },
+    #[serde(rename = "redirect-ro")]
+    RedirectRo {
+        dest: String,
+        source: String,
+    },
+    #[serde(rename = "redirect-rw")]
+    RedirectRw {
+        dest: String,
+        source: String,
+    },
     Symlink {
         src: String,
         dest: String,
@@ -182,6 +223,19 @@ impl TryFrom<UncheckedMapping> for Mapping {
                 Err(format!("hostfs {kind} mapping: {field} must not be empty"))
             } else {
                 Ok(value)
+            }
+        }
+        /// A redirect destination: absolute, and wildcard-free (a redirect
+        /// maps one specific path; wildcards could not be resolved onto a
+        /// single source anyway).
+        fn redirect_dest(kind: &str, value: String) -> Result<String, String> {
+            let dest = absolute(kind, "dest", value)?;
+            if dest.contains(['*', '?', '[']) {
+                Err(format!(
+                    "hostfs {kind} mapping: dest {dest:?} must not contain wildcards"
+                ))
+            } else {
+                Ok(dest)
             }
         }
         Ok(match raw {
@@ -215,6 +269,14 @@ impl TryFrom<UncheckedMapping> for Mapping {
                     None => None,
                 },
             },
+            UncheckedMapping::RedirectRo { dest, source } => Mapping::RedirectRo {
+                dest: redirect_dest("redirect-ro", dest)?,
+                source: nonempty("redirect-ro", "source", source)?,
+            },
+            UncheckedMapping::RedirectRw { dest, source } => Mapping::RedirectRw {
+                dest: redirect_dest("redirect-rw", dest)?,
+                source: nonempty("redirect-rw", "source", source)?,
+            },
             UncheckedMapping::Symlink { src, dest } => Mapping::Symlink {
                 src: nonempty("symlink", "src", src)?,
                 dest: absolute("symlink", "dest", dest)?,
@@ -245,6 +307,7 @@ impl Mapping {
             | Mapping::Tmpfs { path, .. }
             | Mapping::Proc { path } => Some(path),
             Mapping::Bind { src, dest } => Some(dest.as_deref().unwrap_or(src)),
+            Mapping::RedirectRo { dest, .. } | Mapping::RedirectRw { dest, .. } => Some(dest),
             Mapping::Symlink { .. } => None,
         }
     }
@@ -264,17 +327,33 @@ impl Mapping {
                 Some(dest) => format!("bind   {src} -> {dest}"),
                 None => format!("bind   {src}"),
             },
+            Mapping::RedirectRo { dest, source } => {
+                format!("redirect-ro {source} -> {dest}")
+            }
+            Mapping::RedirectRw { dest, source } => {
+                format!("redirect-rw {source} -> {dest}")
+            }
             Mapping::Symlink { src, dest } => format!("symlink {dest} -> {src}"),
         }
     }
 
     /// The internal permission the mapping expresses. Every mount-point
-    /// mapping exposes its path empty, like [`Mapping::Empty`].
+    /// mapping exposes its path empty, like [`Mapping::Empty`]; the
+    /// redirect mappings carry their `source` as a
+    /// [`Permission::Redirect`] parameter.
     fn permission(&self) -> Permission {
         match self {
             Mapping::Ro { .. } => Permission::Ro,
             Mapping::Rw { .. } => Permission::Rw,
             Mapping::Hide { .. } => Permission::Hide,
+            Mapping::RedirectRo { source, .. } => Permission::Redirect {
+                source: PathBuf::from(source),
+                writable: false,
+            },
+            Mapping::RedirectRw { source, .. } => Permission::Redirect {
+                source: PathBuf::from(source),
+                writable: true,
+            },
             _ => Permission::Empty,
         }
     }
@@ -282,7 +361,8 @@ impl Mapping {
     /// The op the mapping stands for, if any. The mount-point mappings
     /// (`dev`, `tmpfs`, `proc`, `bind`) produce the op that is stacked on
     /// top of the empty path they expose, and `symlink` produces the
-    /// symlink op; every other mapping produces none.
+    /// symlink op; every other mapping — including the redirects, which
+    /// live entirely inside the FUSE filesystem — produces none.
     pub fn op(&self) -> Option<Op> {
         match self {
             Mapping::Dev { path } => Some(Op::Dev {
@@ -336,8 +416,10 @@ impl HostFsConfig {
     /// The internal pattern → permission list, in spec order. The
     /// mount-point mappings (`dev`, `tmpfs`, `proc`, `bind`) contribute
     /// an `empty` pattern for their path, exactly like [`Mapping::Empty`];
-    /// `symlink` mappings contribute nothing (they touch only the sandbox
-    /// root, not the host filesystem).
+    /// the redirect mappings contribute their `dest` with a
+    /// [`Permission::Redirect`] permission; `symlink` mappings contribute
+    /// nothing (they touch only the sandbox root, not the host
+    /// filesystem).
     pub fn patterns(&self) -> Patterns {
         Patterns(
             self.mappings
@@ -351,6 +433,33 @@ impl HostFsConfig {
     /// mount-point and symlink mappings contribute — see [`Mapping::op`]).
     pub fn ops(&self) -> Vec<Op> {
         self.mappings.iter().filter_map(Mapping::op).collect()
+    }
+
+    /// Resolve relative redirect `source`s against `spec_dir` (the
+    /// directory the spec file lives in). Called by [`Spec::load`]
+    /// (see [`super::file::Spec`]); sources that are already absolute
+    /// are left alone.
+    pub(crate) fn resolve_relative_sources(&mut self, spec_dir: &Path) {
+        // The spec dir itself may be relative (e.g. the default
+        // `.rs-bubble`): resolve it against the current directory first,
+        // so the redirect sources end up unambiguous.
+        let dir = std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf());
+        for mapping in &mut self.mappings {
+            let source = match mapping {
+                Mapping::RedirectRo { source, .. } | Mapping::RedirectRw { source, .. } => source,
+                _ => continue,
+            };
+            if !source.starts_with('/') {
+                let resolved = dir.join(&*source);
+                // Clean up `./` and `../` components for the error and
+                // `ls` output.
+                if let Ok(cleaned) = resolved.canonicalize() {
+                    *source = cleaned.to_string_lossy().into_owned();
+                } else {
+                    *source = resolved.to_string_lossy().into_owned();
+                }
+            }
+        }
     }
 }
 
@@ -578,6 +687,77 @@ mod tests {
                     dest: PathBuf::from("/proc")
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn redirect_mappings_parse_and_contribute_a_redirect_permission() {
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "redirect-ro", "dest": "/bla", "source": "/otherdir" },
+                { "type": "redirect-rw", "dest": "/data", "source": "/home/me/data" }
+            ] } }"#,
+        );
+        assert_eq!(
+            spec.hostfs.patterns(),
+            Patterns(vec![
+                (
+                    "/bla".to_string(),
+                    Permission::Redirect {
+                        source: PathBuf::from("/otherdir"),
+                        writable: false
+                    }
+                ),
+                (
+                    "/data".to_string(),
+                    Permission::Redirect {
+                        source: PathBuf::from("/home/me/data"),
+                        writable: true
+                    }
+                ),
+            ])
+        );
+        // Redirects are pure FUSE: they produce no sandbox ops.
+        assert!(spec.hostfs.ops().is_empty());
+        assert_eq!(
+            spec.hostfs.mappings[0].describe(),
+            "redirect-ro /otherdir -> /bla"
+        );
+        assert_eq!(
+            spec.hostfs.mappings[1].describe(),
+            "redirect-rw /home/me/data -> /data"
+        );
+    }
+
+    #[test]
+    fn redirect_mappings_reject_bad_destinations() {
+        for mapping in [
+            // dest must be absolute and wildcard-free...
+            r#"{ "type": "redirect-ro", "dest": "bla", "source": "/otherdir" }"#,
+            r#"{ "type": "redirect-ro", "dest": "/bl*", "source": "/otherdir" }"#,
+            r#"{ "type": "redirect-ro", "dest": "/bl?", "source": "/otherdir" }"#,
+            r#"{ "type": "redirect-ro", "dest": "/bl[a]", "source": "/otherdir" }"#,
+            // ...and both fields must be present and non-empty.
+            r#"{ "type": "redirect-ro", "dest": "/bla" }"#,
+            r#"{ "type": "redirect-ro", "source": "/otherdir" }"#,
+            r#"{ "type": "redirect-rw", "dest": "/bla", "source": "" }"#,
+        ] {
+            assert!(
+                serde_json::from_str::<crate::spec::Spec>(&format!(
+                    r#"{{ "hostfs": {{ "mappings": [ {mapping} ] }} }}"#
+                ))
+                .is_err(),
+                "should reject {mapping}"
+            );
+        }
+        // A relative source is fine (it is resolved against the spec dir
+        // at load time) — unlike a relative dest.
+        assert!(
+            parse(r#"{ "hostfs": { "mappings": [ { "type": "redirect-ro", "dest": "/bla", "source": "otherdir" } ] } }"#)
+                .hostfs
+                .mappings[0]
+                .describe()
+                .contains("otherdir")
         );
     }
 

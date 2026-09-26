@@ -3,10 +3,6 @@
   "hostfs": {
     "mappings": [
       {
-        "type": "rw",
-        "glob": "/home/bjunglas/workspaces"
-      },
-      {
         "type": "ro",
         "glob": "/usr"
       },
@@ -21,6 +17,15 @@
       {
         "type": "ro",
         "glob": "/bin"
+      },
+      {
+        "type": "redirect-rw",
+        "source": "conf",
+        "dest": "/home/bjunglas/.config/opencode"
+      },
+      {
+        "type": "rw",
+        "glob": "/home/bjunglas/workspaces"
       },
       {
         "type": "hide",

@@ -256,6 +256,58 @@
           "additionalProperties": false
         },
         {
+          "description": "A **lightweight bind** routed through the host filesystem: the host file or directory `source` is shown *in the FUSE mirror* at the sandbox path `dest` — like a bind mount, but no mount at all happens, so it works without mount privileges and is monitored (and permission-checked) by the host filesystem like any mirrored path. A redirected directory shows its whole subtree, redirected paths may be files or directories. A relative `source` is resolved relative to the directory the spec file lives in.\n\nProduces no mount op: the redirect lives entirely in the FUSE filesystem (see [`Mapping::pattern`]).",
+          "type": "object",
+          "required": [
+            "dest",
+            "source",
+            "type"
+          ],
+          "properties": {
+            "dest": {
+              "description": "An absolute sandbox path to show the source at (named exactly, no wildcards).",
+              "type": "string"
+            },
+            "source": {
+              "description": "The host path to show there; absolute, or relative to the spec file's directory.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "redirect-ro"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Like [`Mapping::RedirectRo`], but the redirected path is also writable (as far as the real host permissions allow).",
+          "type": "object",
+          "required": [
+            "dest",
+            "source",
+            "type"
+          ],
+          "properties": {
+            "dest": {
+              "description": "An absolute sandbox path to show the source at (named exactly, no wildcards).",
+              "type": "string"
+            },
+            "source": {
+              "description": "The host path to show there; absolute, or relative to the spec file's directory.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "redirect-rw"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Create a symlink at `dest` pointing to `src`, like bwrap's `--symlink`. `src` is relative to the sandbox root (`usr/lib`, like bwrap's relative symlink targets) or absolute. This mapping does not expose anything in the host filesystem — it only generates the symlink op (applied in mapping order, together with the other mount ops).",
           "type": "object",
           "required": [

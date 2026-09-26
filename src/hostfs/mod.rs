@@ -4,8 +4,11 @@
 //! FUSE. The mirrored paths are selected by the spec's ordered
 //! `hostfs.mappings` list, each carrying a permission (`"ro"` mirrors a
 //! matched path read-only, `"rw"` mirrors it read-write, `"hide"` hides it,
-//! `"empty"` exposes it empty; when a path matches several mappings, the
-//! last match wins); the result is the sandbox root: the **full host paths**
+//! `"empty"` exposes it empty, `"redirect-ro"`/`"redirect-rw"` show a
+//! *different* host path (the mapping's `source`) at the matched path —
+//! a lightweight bind routed through the mirror itself; when a path matches
+//! several mappings, the last match wins); the result is the sandbox root:
+//! the **full host paths**
 //! are reproduced — a mapping `/etc/*.conf` makes `/etc/foo.conf` available
 //! at `/etc/foo.conf`. A pattern that matches a directory exactly
 //! (`/usr/share/doc`) mirrors that directory recursively (or, when hidden,
@@ -94,7 +97,9 @@ pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
     let compiled: Vec<(Pattern, Permission)> = patterns
         .iter()
         .filter_map(|(pattern, permission)| {
-            Pattern::new(pattern).ok().map(|compiled| (compiled, *permission))
+            Pattern::new(pattern)
+                .ok()
+                .map(|compiled| (compiled, permission.clone()))
         })
         .collect();
     let direct = |p: &Path| {
@@ -102,7 +107,7 @@ pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
             .iter()
             .rev()
             .find(|(compiled, _)| compiled.matches(p))
-            .map(|(_, permission)| *permission)
+            .map(|(_, permission)| permission.clone())
     };
 
     // Everything strictly below an empty path is invisible.
@@ -196,7 +201,10 @@ impl MirrorPattern {
 ///
 /// Permissions: the **last** pattern that names a path (exactly or via
 /// `**`) decides whether it is mirrored read-only (`ro`), mirrored
-/// read-write (`rw`), empty (`empty`) or hidden (`hide`); a hidden path —
+/// read-write (`rw`), empty (`empty`), hidden (`hide`) or redirected
+/// (`redirect-ro`/`redirect-rw`: the host path the mapping's `source`
+/// names is shown at the matched path instead of the path's own
+/// content); a hidden path —
 /// or one below a hidden directory — is not visible at all. Ancestors of
 /// visible matches stay navigable as long as no hidden pattern stands
 /// between them and the matches below. Writes additionally require the
@@ -215,7 +223,7 @@ impl HostFs {
             .iter()
             .map(|(p, perm)| MirrorPattern {
                 pattern: compile(p),
-                permission: *perm,
+                permission: perm.clone(),
             })
             .collect();
         HostFs {
@@ -261,6 +269,43 @@ impl HostFs {
         host
     }
 
+    /// The *real* host path a mirrored (sandbox) path resolves to: the path
+    /// itself — unless a redirect permission remaps it. The **last** pattern
+    /// naming the path decides (as everywhere else); when no pattern names
+    /// the path itself, the nearest *directly matched* mirrored ancestor
+    /// does: a redirected directory shows its whole subtree, so everything
+    /// below it is remapped onto the source plus the remaining path
+    /// components. Redirects only ever map literal paths, so the remap is a
+    /// simple prefix replacement.
+    fn redirect(&self, host: &Path) -> PathBuf {
+        let direct = |p: &Path| self.patterns.iter().rev().find(|mp| mp.names(p));
+        // The path itself: the last matching pattern says whether (and
+        // where) it is redirected.
+        if let Some(p) = direct(host) {
+            if let Some(source) = p.permission.redirect_source() {
+                return source.to_path_buf();
+            }
+            return host.to_path_buf();
+        }
+        // Otherwise the nearest directly matched mirrored ancestor decides
+        // (the mirror is recursive, so its redirect extends to everything
+        // below it). Non-mirrored ancestors are skipped, exactly like in
+        // `permission_of`.
+        for ancestor in host.ancestors().skip(1) {
+            if let Some(p) = direct(ancestor)
+                && p.permission.is_mirrored()
+            {
+                if let Some(source) = p.permission.redirect_source()
+                    && let Ok(rest) = host.strip_prefix(ancestor)
+                {
+                    return source.join(rest);
+                }
+                return host.to_path_buf();
+            }
+        }
+        host.to_path_buf()
+    }
+
     /// Whether a host path matches one of the patterns directly (as a file,
     /// symlink, or a directory named by the pattern itself), with the
     /// **last** matching pattern mirroring it. Empty paths and everything
@@ -299,7 +344,7 @@ impl HostFs {
     /// (Whether the *real* file or directory actually allows it is decided
     /// by the host filesystem when the operation is performed.)
     fn writable(&self, host: &Path) -> bool {
-        self.write_permission(host) == Some(Permission::Rw)
+        self.write_permission(host).is_some_and(|p| p.is_writable())
     }
 
     /// Whether any pattern grants write access: the FUSE mount is mounted
@@ -317,7 +362,7 @@ impl HostFs {
             .iter()
             .rev()
             .find(|p| p.names(host))
-            .map(|p| p.permission)
+            .map(|p| p.permission.clone())
     }
 
     /// Whether the path is hidden because a pattern hides it directly, or
@@ -422,7 +467,8 @@ impl HostFs {
                 _ => Ok(self.empty_dir_attr()),
             };
         }
-        match tokio_fs::symlink_metadata(host).await {
+        let real = self.redirect(host);
+        match tokio_fs::symlink_metadata(&real).await {
             Ok(md) => Ok(attr_from_metadata(&md)),
             // A purely virtual ancestor of an empty path has no real
             // counterpart; present it as a directory.
@@ -440,7 +486,7 @@ impl HostFs {
         if self.is_empty(host) || self.is_empty_prefix(host) {
             return true;
         }
-        tokio_fs::metadata(host)
+        tokio_fs::metadata(self.redirect(host))
             .await
             .map(|m| m.is_dir())
             .unwrap_or(false)
@@ -461,7 +507,8 @@ impl HostFs {
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
         let unfiltered = self.matches(host);
-        let mut names: Vec<std::ffi::OsString> = match tokio_fs::read_dir(host).await {
+        let mut names: Vec<std::ffi::OsString> = match tokio_fs::read_dir(self.redirect(host)).await
+        {
             Ok(mut entries) => {
                 let mut names = Vec::new();
                 while let Ok(Some(entry)) = entries.next_entry().await {
@@ -624,7 +671,7 @@ impl PathFilesystem for HostFs {
         if !self.exists(&host) {
             return Err(libc::ENOENT.into());
         }
-        let target = tokio_fs::read_link(&host).await?;
+        let target = tokio_fs::read_link(self.redirect(&host)).await?;
         Ok(ReplyData::from(Bytes::copy_from_slice(
             target.as_os_str().as_encoded_bytes(),
         )))
@@ -639,7 +686,7 @@ impl PathFilesystem for HostFs {
         }
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
-        if tokio_fs::metadata(&host)
+        if tokio_fs::metadata(self.redirect(&host))
             .await
             .map(|m| m.is_dir())
             .unwrap_or(true)
@@ -678,7 +725,7 @@ impl PathFilesystem for HostFs {
             return Ok(ReplyData::from(Bytes::new()));
         }
         // Stateless IO: reopen the host file for every read.
-        let mut file = tokio_fs::File::open(&host).await?;
+        let mut file = tokio_fs::File::open(self.redirect(&host)).await?;
         file.seek(SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; size as usize];
         let n = file.read(&mut buf).await?;
@@ -713,7 +760,7 @@ impl PathFilesystem for HostFs {
         let mut file = tokio_fs::OpenOptions::new()
             .write(true)
             .append(append)
-            .open(&host)
+            .open(self.redirect(&host))
             .await?;
         if !append {
             file.seek(SeekFrom::Start(offset)).await?;
@@ -727,7 +774,7 @@ impl PathFilesystem for HostFs {
         let host = if is_root(path) {
             PathBuf::from("/")
         } else {
-            self.host_path(path)
+            self.redirect(&self.host_path(path))
         };
         let cpath = CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
         // errno is per-thread: capture the error on the blocking thread.
@@ -847,7 +894,10 @@ impl PathFilesystem for HostFs {
         // Empty paths (and purely virtual ancestors) are unwritable by
         // definition; answer directly instead of asking the real filesystem.
         if self.is_empty(&host)
-            || self.is_empty_prefix(&host) && tokio_fs::symlink_metadata(&host).await.is_err()
+            || self.is_empty_prefix(&host)
+                && tokio_fs::symlink_metadata(self.redirect(&host))
+                    .await
+                    .is_err()
         {
             if mask & libc::W_OK as u32 != 0 {
                 return Err(libc::EACCES.into());
@@ -865,7 +915,8 @@ impl PathFilesystem for HostFs {
         if non_write == 0 {
             return Ok(());
         }
-        let cpath = CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
+        let real = self.redirect(&host);
+        let cpath = CString::new(real.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
         // errno is per-thread: capture the error on the blocking thread.
         blocking(move || {
             if unsafe { libc::access(cpath.as_ptr(), non_write as libc::c_int) } != 0 {
@@ -900,16 +951,17 @@ impl PathFilesystem for HostFs {
         if !self.writable(&host) {
             return Err(libc::EACCES.into());
         }
+        let real = self.redirect(&host);
         if let Some(size) = set_attr.size {
-            let f = tokio_fs::OpenOptions::new().write(true).open(&host).await?;
+            let f = tokio_fs::OpenOptions::new().write(true).open(&real).await?;
             f.set_len(size).await?;
         }
         if let Some(mode) = set_attr.mode {
             let perms = std::fs::Permissions::from_mode(mode);
-            tokio_fs::set_permissions(&host, perms).await?;
+            tokio_fs::set_permissions(&real, perms).await?;
         }
         if set_attr.uid.is_some() || set_attr.gid.is_some() {
-            let cpath = cstring_of(&host)?;
+            let cpath = cstring_of(&real)?;
             let uid = set_attr.uid.unwrap_or(u32::MAX);
             let gid = set_attr.gid.unwrap_or(u32::MAX);
             // errno is per-thread: capture the error on the blocking thread.
@@ -927,7 +979,7 @@ impl PathFilesystem for HostFs {
                 ts_to_timespec(set_attr.atime),
                 ts_to_timespec(set_attr.mtime),
             ];
-            let cpath = cstring_of(&host)?;
+            let cpath = cstring_of(&real)?;
             // errno is per-thread: capture the error on the blocking thread.
             blocking(move || {
                 if unsafe {
@@ -964,11 +1016,11 @@ impl PathFilesystem for HostFs {
         }
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet.
-        if tokio_fs::symlink_metadata(&host).await.is_ok() {
+        if tokio_fs::symlink_metadata(self.redirect(&host)).await.is_ok() {
             return Err(libc::EEXIST.into());
         }
         // errno is per-thread: capture the error on the blocking thread.
-        let cpath = cstring_of(&host)?;
+        let cpath = cstring_of(&self.redirect(&host))?;
         blocking(move || {
             if unsafe { libc::mkdir(cpath.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
                 Err(std::io::Error::last_os_error())
@@ -994,7 +1046,7 @@ impl PathFilesystem for HostFs {
         if !self.writable(&host) {
             return Err(libc::EACCES.into());
         }
-        tokio_fs::remove_file(&host).await?;
+        tokio_fs::remove_file(self.redirect(&host)).await?;
         Ok(())
     }
     async fn rmdir(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
@@ -1008,7 +1060,7 @@ impl PathFilesystem for HostFs {
         if !self.writable(&host) {
             return Err(libc::EACCES.into());
         }
-        tokio_fs::remove_dir(&host).await?;
+        tokio_fs::remove_dir(self.redirect(&host)).await?;
         Ok(())
     }
 
@@ -1031,7 +1083,7 @@ impl PathFilesystem for HostFs {
         if !self.writable(&old) || !self.writable(&new) {
             return Err(libc::EACCES.into());
         }
-        tokio_fs::rename(&old, &new).await?;
+        tokio_fs::rename(self.redirect(&old), self.redirect(&new)).await?;
         Ok(())
     }
 
@@ -1049,7 +1101,7 @@ impl PathFilesystem for HostFs {
         }
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet.
-        if tokio_fs::symlink_metadata(&host).await.is_ok() {
+        if tokio_fs::symlink_metadata(self.redirect(&host)).await.is_ok() {
             return Err(libc::EEXIST.into());
         }
         let mut opts = tokio_fs::OpenOptions::new();
@@ -1060,7 +1112,7 @@ impl PathFilesystem for HostFs {
         if flags & libc::O_APPEND as u32 != 0 {
             opts.append(true);
         }
-        let file = opts.mode(mode & 0o7777).open(&host).await?;
+        let file = opts.mode(mode & 0o7777).open(self.redirect(&host)).await?;
         let md = file.metadata().await?;
         let attr = attr_from_metadata(&md);
         Ok(ReplyCreated {
@@ -1266,7 +1318,7 @@ mod tests {
         HostFs::collect(&Patterns(
             entries
                 .iter()
-                .map(|(p, perm)| (p.to_string(), *perm))
+                .map(|(p, perm)| (p.to_string(), perm.clone()))
                 .collect(),
         ))
     }
@@ -1467,6 +1519,133 @@ mod tests {
         );
         assert_eq!(f.host_path(OsStr::new("")), PathBuf::from("/"));
         assert_eq!(f.host_path(OsStr::new("/")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn redirect_resolves_to_the_source_path() {
+        let f = HostFs::collect(&Patterns(vec![
+            (
+                "/bla".to_string(),
+                Permission::Redirect {
+                    source: PathBuf::from("/otherdir"),
+                    writable: false,
+                },
+            ),
+            ("/etc/passwd".to_string(), Permission::Ro),
+        ]));
+
+        // The redirect destination maps exactly onto the source.
+        assert_eq!(f.redirect(Path::new("/bla")), PathBuf::from("/otherdir"));
+        // ...and everything below it onto the source plus the rest.
+        assert_eq!(
+            f.redirect(Path::new("/bla/sub/file.txt")),
+            PathBuf::from("/otherdir/sub/file.txt")
+        );
+        // Non-redirected paths resolve to themselves.
+        assert_eq!(
+            f.redirect(Path::new("/etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        assert_eq!(f.redirect(Path::new("/")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn redirect_obeys_last_match_wins() {
+        // A later plain mapping naming the redirected path (or something
+        // below it) wins over the redirect, like with every mapping.
+        let f = HostFs::collect(&Patterns(vec![
+            (
+                "/bla".to_string(),
+                Permission::Redirect {
+                    source: PathBuf::from("/otherdir"),
+                    writable: false,
+                },
+            ),
+            ("/bla/plain".to_string(), Permission::Ro),
+        ]));
+        // /bla itself is still redirected...
+        assert_eq!(f.redirect(Path::new("/bla")), PathBuf::from("/otherdir"));
+        // ...but /bla/plain is mirrored plainly (its own last match), and
+        // /bla/plain/x inherits the *plain* mirror, not the redirect.
+        assert_eq!(
+            f.redirect(Path::new("/bla/plain")),
+            PathBuf::from("/bla/plain")
+        );
+        assert_eq!(
+            f.redirect(Path::new("/bla/plain/x")),
+            PathBuf::from("/bla/plain/x")
+        );
+        // Everything else below /bla follows the redirect.
+        assert_eq!(
+            f.redirect(Path::new("/bla/other/x")),
+            PathBuf::from("/otherdir/other/x")
+        );
+    }
+
+    #[test]
+    fn redirected_paths_show_the_source_content() {
+        let base = std::env::temp_dir().join(format!(
+            "rs-bubble-hostfs-redirect-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(base.join("real/sub")).unwrap();
+        std::fs::write(base.join("real/file.txt"), b"redirected").unwrap();
+
+        let f = HostFs::collect(&Patterns(vec![(
+            "/virtual".to_string(),
+            Permission::Redirect {
+                source: base.join("real"),
+                writable: false,
+            },
+        )]));
+
+        // The redirected path is visible and shows the source's content.
+        assert!(f.exists(Path::new("/virtual")));
+        assert!(f.matches(Path::new("/virtual")));
+        let attr = block(f.attr(Path::new("/virtual"))).unwrap();
+        assert_eq!(attr.kind, FileType::Directory);
+
+        // Its entries are the source dir's entries, listed under the
+        // redirected name.
+        let mut names: Vec<_> = block(f.dir_entries(Path::new("/virtual")))
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["file.txt", "sub"]);
+
+        // A file below the redirect reads the real source file.
+        let attr = block(f.attr(Path::new("/virtual/file.txt"))).unwrap();
+        assert_eq!(attr.kind, FileType::RegularFile);
+        assert_eq!(attr.size, 10);
+
+        // Read-only: not writable despite existing.
+        assert!(!f.writable(Path::new("/virtual/file.txt")));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn redirect_rw_is_writable_and_ro_is_not() {
+        let ro = HostFs::collect(&Patterns(vec![(
+            "/a".to_string(),
+            Permission::Redirect {
+                source: PathBuf::from("/x"),
+                writable: false,
+            },
+        )]));
+        let rw = HostFs::collect(&Patterns(vec![(
+            "/a".to_string(),
+            Permission::Redirect {
+                source: PathBuf::from("/x"),
+                writable: true,
+            },
+        )]));
+        assert!(!ro.writable(Path::new("/a/f")));
+        assert!(!ro.has_writable_patterns());
+        assert!(rw.writable(Path::new("/a/f")));
+        assert!(rw.has_writable_patterns());
     }
 
     #[test]
