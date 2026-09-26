@@ -1,62 +1,14 @@
 {
   "$schema": "./rs-bubble.spec.schema.json",
-  "ops": [
-    {
-      "type": "bind",
-      "src": "/usr",
-      "dest": "/usr"
-    },
-    {
-      "type": "bind",
-      "src": "/etc",
-      "dest": "/etc"
-    },
-    {
-      "type": "dev",
-      "dest": "/dev"
-    },
-    {
-      "type": "tmpfs",
-      "dest": "/tmp"
-    },
-    {
-      "type": "tmpfs",
-      "dest": "/run"
-    }
-  ],
   "hostfs": {
     "mappings": [
       {
-        "type": "empty",
-        "path": "/dev"
-      },
-      {
-        "type": "empty",
-        "path": "/usr"
-      },
-      {
-        "type": "empty",
-        "path": "/etc"
-      },
-      {
-        "type": "empty",
-        "path": "/proc"
-      },
-      {
-        "type": "empty",
-        "path": "/net"
-      },
-      {
-        "type": "empty",
-        "path": "/run"
-      },
-      {
-        "type": "empty",
-        "path": "/tmp"
-      },
-      {
         "type": "rw",
         "glob": "/home/bjunglas/workspaces"
+      },
+      {
+        "type": "ro",
+        "glob": "/usr"
       },
       {
         "type": "ro",
@@ -73,6 +25,30 @@
       {
         "type": "hide",
         "glob": "/home/bjunglas/workspaces/**/target"
+      },
+      {
+        "type": "dev",
+        "path": "/dev"
+      },
+      {
+        "type": "bind",
+        "path": "/etc"
+      },
+      {
+        "type": "empty",
+        "path": "/proc"
+      },
+      {
+        "type": "empty",
+        "path": "/net"
+      },
+      {
+        "type": "tmpfs",
+        "path": "/run"
+      },
+      {
+        "type": "tmpfs",
+        "path": "/tmp"
       }
     ]
   },

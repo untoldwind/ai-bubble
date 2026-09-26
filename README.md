@@ -15,20 +15,31 @@ root, a fresh procfs at `/proc`, and the host network.
 
 ```json
 {
-  "ops": [
-    { "type": "bind",    "src": "/usr", "dest": "/usr" },
-    { "type": "symlink", "src": "usr/lib", "dest": "/lib" },
-    { "type": "symlink", "src": "usr/lib64", "dest": "/lib64" },
-    { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
-  ],
+  "hostfs": { "mappings": [
+    { "type": "ro",    "glob": "/usr" },
+    { "type": "bind",  "path": "/etc" },
+    { "type": "dev",   "path": "/dev" },
+    { "type": "tmpfs", "path": "/tmp", "perms": "1777" }
+  ] },
   "proc": "/proc",
-  "net": { "isolated": true, "allow": ["example.com:443"] },
-  "hostfs": { "mappings": [ { "type": "ro", "glob": "/etc/*.conf" } ] }
+  "net": { "isolated": true, "allow": ["example.com:443"] }
 }
 ```
 
-- `ops` — the mount operations, applied **in this order** (order matters,
-  exactly like bwrap):
+- `hostfs.mappings` — an **ordered** array of mappings, each selecting
+  host paths for one treatment (`type`); see below for the details.
+  The mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`, `bind`)
+  name a single absolute path (`"path"`) exactly and do two things at
+  once: expose the path empty in the host filesystem (a mount point) and
+  stack the corresponding mount op on top of it inside the sandbox —
+  `dev` a minimal `/dev`, `tmpfs` a fresh tmpfs (with optional `perms`
+  and `size`, like the tmpfs op), `proc` a fresh procfs instance, and
+  `bind` the real host directory. The generated ops are applied in
+  mapping order, **before** the explicit `ops` (which stay available for
+  what a mapping cannot express: symlinks, or a bind from a different
+  source path)
+- `ops` — explicit mount operations, applied **after** the ops generated
+  by the mappings, in this order (order matters, exactly like bwrap):
   - `{"type": "bind", "src": ..., "dest": ...}` — bind-mount `SRC` at
     `DEST` inside the sandbox (read-write, non-recursive)
   - `{"type": "symlink", "src": ..., "dest": ...}` — create a symlink at
@@ -46,7 +57,8 @@ root, a fresh procfs at `/proc`, and the host network.
     the maximum size in bytes (bwrap's `--size`); both are optional
 - `proc` — where to mount a **fresh procfs instance**
   (like bwrap: `MS_NOSUID|MS_NOEXEC|MS_NODEV`). If not given, a fresh
-  procfs is mounted at `/proc` automatically
+  procfs is mounted at `/proc` automatically — unless the spec mounts
+  proc itself (a `proc` mapping or `proc` op)
 - `net.isolated` — run the command in a fresh **network namespace**
   (no interfaces besides loopback, which rs-bubble brings up) while the
   rs-bubble process stays on the host and acts as a **TCP proxy**
@@ -75,8 +87,8 @@ root, a fresh procfs at `/proc`, and the host network.
   file** when it matches a real file. Empty paths take
   *precedence* over the mirror: nothing below them is visible, and they
   are shown even when a mirror mapping (or the real host path) covers
-  them. Their purpose is to provide mount points for the sandbox's ops
-  (`dev`, `tmpfs`, `proc`, binds) — see the hostfs root below. Missing
+  them. Their purpose is to provide mount points for the mount-point
+  mappings (`dev`, `tmpfs`, `proc`, `bind`) — see below. Missing
   or empty mappings expose nothing.
 
 Everything on the command line (optionally after a `--` separator) is the
@@ -106,7 +118,8 @@ Like bwrap, the tool:
 6. Creates a fresh **tmpfs** as the sandbox root — unless the spec has
    `hostfs` mappings, in which case the FUSE filesystem itself becomes
    the root (see below).
-7. Applies the filesystem ops (the spec's `proc` and `ops`) **in the
+7. Applies the filesystem ops (from the `hostfs` mappings, then the
+   spec's `proc` and `ops`) **in the
    order they were given** (order matters, exactly like bwrap). Because
    the PID namespace is created before the mounts (the mounting process
    is PID 1 of it), a fresh procfs instance only ever shows the
@@ -263,15 +276,11 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
       { "type": "ro", "glob": "/lib" },
       { "type": "ro", "glob": "/lib64" },
       { "type": "ro", "glob": "/usr" },
-      { "type": "empty", "path": "/dev" },
-      { "type": "empty", "path": "/tmp" },
+      { "type": "dev", "path": "/dev" },
+      { "type": "tmpfs", "path": "/tmp", "perms": "1777" },
       { "type": "empty", "path": "/proc" }
     ]
   },
-  "ops": [
-    { "type": "dev", "dest": "/dev" },
-    { "type": "tmpfs", "dest": "/tmp", "perms": "1777" }
-  ],
   "proc": "/proc"
 }
 ```
@@ -304,14 +313,16 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
 rs-bubble --spec hostfs.json -- /bin/sh
 ```
 
-The `"empty"` mappings are exposed by the FUSE filesystem as empty,
-unwritable (mode 0555) directories — pure mount points, taking *precedence*
-over the mirror (nothing below them is visible, and no mirror pattern can
-bring content back). They must exist for every mount point, because
-rs-bubble does not create directories on the FUSE filesystem itself. The
-`dev` and `tmpfs` mounts (and the fresh procfs) then cover the empty dirs,
-giving a writable `/dev` and `/tmp` and a sandbox-only `/proc` on top of
-the host view.
+The mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`, `bind`) expose
+their path as an empty, unwritable (mode 0555) directory — a pure mount
+point, taking *precedence* over the mirror (nothing below it is visible,
+and no mirror pattern can bring content back). It must exist for every
+mount point, because rs-bubble does not create directories on the FUSE
+filesystem itself — which is exactly why the mount-point mappings provide
+it automatically. The `dev` and `tmpfs` mounts (and the fresh procfs,
+whether from a `proc` mapping, the top-level `proc` field, or the default)
+then cover the empty dirs, giving a writable `/dev` and `/tmp` and a
+sandbox-only `/proc` on top of the host view.
 
 ## Requirements
 
