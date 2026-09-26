@@ -32,15 +32,21 @@ use std::path::{Path, PathBuf};
 
 use crate::proxy::{PROXY_ADDR, PROXY_URL};
 use crate::sandbox::{
-    die, die_with_error, exit_with_status, pidns_and_exec, userns_id, write_id_map,
+    die, die_with_error, exit_with_status, handle_die_with_parent, pidns_and_exec, userns_id,
+    write_id_map,
 };
 use crate::spec::internal::{Net, Op};
 
 /// Temporary host directory holding the proxy socket. It is bind-mounted
 /// at /net inside the sandbox so that the (network-isolated) child can
 /// reach the connector.
-pub unsafe fn run(ops: &[Op], command: &[String], net: &Net) -> ! {
+pub unsafe fn run(ops: &[Op], command: &[String], net: &Net, die_with_parent: bool) -> ! {
     unsafe {
+        // The connector binds its lifecycle to rs-bubble's caller (see
+        // handle_die_with_parent); P and the sandboxed child set their own
+        // PDEATHSIG after the forks below.
+        handle_die_with_parent(die_with_parent);
+
         let netdir = create_socket_dir();
         let listener = match StdUnixListener::bind(netdir.join("sock")) {
             Ok(l) => l,
@@ -56,7 +62,7 @@ pub unsafe fn run(ops: &[Op], command: &[String], net: &Net) -> ! {
         }
         if pid == 0 {
             drop(listener);
-            isolated_parent(&netdir, net, ops, command);
+            isolated_parent(&netdir, net, ops, command, die_with_parent);
         }
 
         // Connector: serve proxy connections from the host side and watch
@@ -82,8 +88,19 @@ pub unsafe fn run(ops: &[Op], command: &[String], net: &Net) -> ! {
 /// P: owns the sandbox network namespace and runs the HTTP CONNECT proxy on
 /// 127.0.0.2. Forks C for the filesystem sandbox and exec, then reports C's
 /// exit status.
-unsafe fn isolated_parent(netdir: &Path, net: &Net, ops: &[Op], command: &[String]) -> ! {
+unsafe fn isolated_parent(
+    netdir: &Path,
+    net: &Net,
+    ops: &[Op],
+    command: &[String],
+    die_with_parent: bool,
+) -> ! {
     unsafe {
+        // P binds its lifecycle to the connector (which itself set
+        // PR_SET_PDEATHSIG in netns::run); PR_SET_PDEATHSIG does not survive
+        // fork, so P sets it again for itself here.
+        handle_die_with_parent(die_with_parent);
+
         // Prevent gaining privileges via execve of setuid binaries. C inherits
         // this, which is what matters (C is the process that execs).
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -149,7 +166,7 @@ unsafe fn isolated_parent(netdir: &Path, net: &Net, ops: &[Op], command: &[Strin
         }
         if child_pid == 0 {
             // PID 1 of its own PID namespace (see pidns_and_exec).
-            pidns_and_exec(&child_ops, command);
+            pidns_and_exec(&child_ops, command, die_with_parent);
         }
 
         // Serve CONNECT requests while the command runs.

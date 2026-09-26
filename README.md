@@ -82,6 +82,13 @@ rs-bubble -- /bin/sh
 rs-bubble --spec custom.json /bin/sh
 ```
 
+`--die-with-parent` is on by default (it uses `PR_SET_PDEATHSIG`, like
+bwrap's option of the same name): the sandboxed command is killed with
+SIGKILL when rs-bubble — or rs-bubble's parent — dies. Pass
+`--no-die-with-parent` to switch this off. Every process in the chain
+(launcher, isolated-net parent and connector, sandboxed child) sets it for
+itself, because the setting does not survive fork.
+
 ## How it works
 
 Like bwrap, the tool:

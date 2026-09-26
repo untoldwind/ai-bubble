@@ -120,6 +120,26 @@ pub(crate) fn check_new_userns(old_userns: Option<(u64, u64)>) {
     }
 }
 
+/// If `--die-with-parent` was given, ask the kernel to SIGKILL this process
+/// when its parent dies — bubblewrap's `handle_die_with_parent()`:
+///
+///     if (opt_die_with_parent && prctl (PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0)
+///         die_with_error ("prctl");
+///
+/// PR_SET_PDEATHSIG is cleared in a forked child but survives execve, so
+/// every process in the chain must set it for itself: the launcher (in
+/// `setup_and_exec`, or `netns::run` for the connector and
+/// `netns::isolated_parent` for P) and the sandboxed child before exec (in
+/// `pidns_and_exec`). That way the death of rs-bubble's caller ripples down
+/// and kills the whole process tree including the exec'd command.
+pub(crate) unsafe fn handle_die_with_parent(enabled: bool) {
+    unsafe {
+        if enabled && libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+            die_with_error("Can't set PR_SET_PDEATHSIG");
+        }
+    }
+}
+
 /// The uid/gid the sandboxed command runs as inside the user namespace.
 /// This id is deliberately *not* mapped from any host account: only the
 /// caller's own real uid/gid is mapped, and it is mapped onto this id, so
@@ -134,8 +154,13 @@ const CAP_LAST: libc::c_ulong = 40; // CAP_CHECKPOINT_RESTORE
 
 /// Non-isolated entry point: new user + mount namespaces with fresh id
 /// mappings, then the sandbox filesystem and exec.
-pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
+pub unsafe fn setup_and_exec(ops: &[Op], command: &[String], die_with_parent: bool) -> ! {
     unsafe {
+        // Optionally bind our lifecycle to that of the caller: when rs-bubble's
+        // parent dies, the kernel SIGKILLs this launcher (the sandboxed child
+        // sets its own PDEATHSIG in pidns_and_exec, mirroring bwrap).
+        handle_die_with_parent(die_with_parent);
+
         // Prevent gaining privileges via execve of setuid binaries.
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             die_with_error("Can't set PR_SET_NO_NEW_PRIVS");
@@ -186,7 +211,7 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
 
         // The command must also run in its own PID namespace (and get a
         // fresh /proc), like bwrap's --unshare-pid + --proc.
-        pidns_and_exec(ops, command);
+        pidns_and_exec(ops, command, die_with_parent);
     }
 }
 
@@ -214,7 +239,7 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String]) -> ! {
 /// corresponds to bwrap's `--as-pid-1` mode.
 ///
 /// The parent keeps waiting for the child and forwards its exit status.
-pub(crate) unsafe fn pidns_and_exec(ops: &[Op], command: &[String]) -> ! {
+pub(crate) unsafe fn pidns_and_exec(ops: &[Op], command: &[String], die_with_parent: bool) -> ! {
     unsafe {
         if libc::unshare(libc::CLONE_NEWIPC) != 0 {
             die_with_error("Can't unshare IPC namespace");
@@ -227,6 +252,10 @@ pub(crate) unsafe fn pidns_and_exec(ops: &[Op], command: &[String]) -> ! {
             die_with_error("Can't fork sandboxed command");
         }
         if pid == 0 {
+            // Like bwrap's child: PR_SET_PDEATHSIG does not survive fork, so
+            // the sandboxed process must bind its own lifecycle to the
+            // launcher before doing anything else.
+            handle_die_with_parent(die_with_parent);
             mount_and_exec(ops, command);
         }
 

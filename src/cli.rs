@@ -33,6 +33,16 @@ pub struct Cli {
     #[arg(long = "print-schema")]
     pub print_schema: bool,
 
+    /// Use PR_SET_PDEATHSIG so the sandboxed command is killed with SIGKILL
+    /// when rs-bubble (or rs-bubble's parent) dies — on by default, like
+    /// bubblewrap's `--die-with-parent`. This option switches it off.
+    #[arg(
+        long = "no-die-with-parent",
+        action = clap::ArgAction::SetFalse,
+        default_value_t = true
+    )]
+    pub die_with_parent: bool,
+
     /// The command to run inside the sandbox (everything after the first
     /// bare argument or after `--`). `parse_args` inserts a `--` before the
     /// command so that its own flags (e.g. `ls -l`) pass through verbatim.
@@ -84,6 +94,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--spec"), "{err}");
+    }
+
+    #[test]
+    fn die_with_parent_flag() {
+        assert!(parse(&["rs-bubble", "sh"]).die_with_parent);
+        assert!(!parse(&["rs-bubble", "--no-die-with-parent", "sh"]).die_with_parent);
     }
 
     #[test]

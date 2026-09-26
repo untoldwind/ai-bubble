@@ -64,9 +64,9 @@ fn main() {
 
     unsafe {
         if sandbox.net.isolated {
-            netns::run(&sandbox.ops, &command, &sandbox.net);
+            netns::run(&sandbox.ops, &command, &sandbox.net, args.die_with_parent);
         } else {
-            sandbox::setup_and_exec(&sandbox.ops, &command);
+            sandbox::setup_and_exec(&sandbox.ops, &command, args.die_with_parent);
         }
     }
 }
