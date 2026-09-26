@@ -4,6 +4,7 @@
 //! Everything in this module runs *inside* the namespace-building process;
 //! it never touches the network (that is `netns`/`proxy` territory).
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
@@ -177,7 +178,14 @@ const CAP_LAST: libc::c_ulong = 40; // CAP_CHECKPOINT_RESTORE
 
 /// Non-isolated entry point: new user + mount namespaces with fresh id
 /// mappings, then the sandbox filesystem and exec.
-pub unsafe fn setup_and_exec(ops: &[Op], command: &[String], die_with_parent: bool) -> ! {
+///
+/// `env` is the sandbox's isolated environment (see [`mount_and_exec`]).
+pub unsafe fn setup_and_exec(
+    ops: &[Op],
+    command: &[String],
+    env: &BTreeMap<String, String>,
+    die_with_parent: bool,
+) -> ! {
     unsafe {
         // Optionally bind our lifecycle to that of the caller: when rs-bubble's
         // parent dies, the kernel SIGKILLs this launcher (the sandboxed child
@@ -237,7 +245,7 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String], die_with_parent: bo
 
         // The command must also run in its own PID namespace (and get a
         // fresh /proc), like bwrap's --unshare-pid + --proc.
-        pidns_and_exec(ops, command, die_with_parent);
+        pidns_and_exec(ops, command, env, die_with_parent);
     }
 }
 
@@ -265,7 +273,12 @@ pub unsafe fn setup_and_exec(ops: &[Op], command: &[String], die_with_parent: bo
 /// corresponds to bwrap's `--as-pid-1` mode.
 ///
 /// The parent keeps waiting for the child and forwards its exit status.
-pub(crate) unsafe fn pidns_and_exec(ops: &[Op], command: &[String], die_with_parent: bool) -> ! {
+pub(crate) unsafe fn pidns_and_exec(
+    ops: &[Op],
+    command: &[String],
+    env: &BTreeMap<String, String>,
+    die_with_parent: bool,
+) -> ! {
     unsafe {
         if libc::unshare(libc::CLONE_NEWIPC) != 0 {
             die_with_error("Can't unshare IPC namespace");
@@ -282,7 +295,7 @@ pub(crate) unsafe fn pidns_and_exec(ops: &[Op], command: &[String], die_with_par
             // the sandboxed process must bind its own lifecycle to the
             // launcher before doing anything else.
             handle_die_with_parent(die_with_parent);
-            mount_and_exec(ops, command);
+            mount_and_exec(ops, command, env);
         }
 
         // Parent: supervise the PID-1 child and forward its exit status.
@@ -404,12 +417,22 @@ pub(crate) unsafe fn mount_tmpfs(
 /// Must run as PID 1 of a fresh PID namespace (see pidns_and_exec) so that
 /// a fresh procfs instance (`Op::Proc`) is bound to it.
 ///
+/// The command runs with an *isolated* environment: `env` is the complete
+/// set of variables it sees (compiled from the spec's `env` section, plus
+/// the proxy variables on the netns path — see `netns::isolated_parent`).
+/// Everything inherited from the host is dropped first, so nothing leaks
+/// in by accident; the spec decides what exists.
+///
 /// Unshares the mount namespace. This requires CAP_SYS_ADMIN over the user
 /// namespace owning the *current* mount namespace, so the isolated path
 /// must reach this in the child that inherited the fresh user namespace
 /// created by `netns::isolated_parent` (the new mount namespace is then
 /// owned by that same user namespace).
-pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
+pub(crate) unsafe fn mount_and_exec(
+    ops: &[Op],
+    command: &[String],
+    env: &BTreeMap<String, String>,
+) -> ! {
     unsafe {
         if libc::unshare(libc::CLONE_NEWNS) != 0 {
             die_with_error("Can't unshare mount namespace");
@@ -742,6 +765,24 @@ pub(crate) unsafe fn mount_and_exec(ops: &[Op], command: &[String]) -> ! {
         // authority as possible: no capabilities at all, and as a uid/gid
         // that does not exist on the host.
         drop_all_capabilities();
+
+        // Isolated environment: drop everything inherited from the host,
+        // then set exactly what the spec (and, on the netns path, the
+        // proxy setup) provides. `execvp` searches PATH from the process
+        // environment — with no PATH in the spec, that falls back to the
+        // default confstr path (/bin:/usr/bin), like execvp with an empty
+        // environment always does.
+        for (key, _) in std::env::vars_os() {
+            std::env::remove_var(&key);
+        }
+        for (key, value) in env {
+            // Guard against set_var's panic conditions with a clean
+            // message instead.
+            if key.is_empty() || key.contains('=') || key.contains('\0') {
+                die(&format!("Invalid environment variable name {key:?}"));
+            }
+            std::env::set_var(key, value);
+        }
 
         let argv: Vec<CString> = command
             .iter()

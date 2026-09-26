@@ -12,6 +12,14 @@
         "null"
       ]
     },
+    "env": {
+      "description": "The isolated environment: the *complete* set of environment variables the sandboxed command sees. Nothing is inherited from the host; use `${VAR}` in the values to copy host variables in explicitly (see [`super::env`]).",
+      "allOf": [
+        {
+          "$ref": "#/definitions/EnvConfig"
+        }
+      ]
+    },
     "hostfs": {
       "description": "The host filesystem: it is always the sandbox root, exposing the paths selected by its mappings.",
       "allOf": [
@@ -31,6 +39,17 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "EnvConfig": {
+      "description": "The `env` section: variable name → value. A `BTreeMap` keeps the iteration order deterministic.\n\nThe variable names are used as-is (they become the names the sandboxed command sees); only the values are `${VAR}`-expanded.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/EnvVar"
+      }
+    },
+    "EnvVar": {
+      "description": "One environment value: a string whose `${VAR}` references are expanded from the **host** environment while the spec is read (see [`super::file::expand_str`]), so everything downstream only ever sees the fully expanded text.",
+      "type": "string"
+    },
     "HostFsConfig": {
       "description": "The spec file's `hostfs` section: what the FUSE filesystem — which is always the sandbox root — exposes of the host.",
       "type": "object",

@@ -24,6 +24,7 @@
 //! that actually runs async code — a forked child must never share a
 //! runtime with its parent, and the exec'd command must not inherit one.
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -40,7 +41,16 @@ use crate::spec::internal::{Net, Op};
 /// Temporary host directory holding the proxy socket. It is bind-mounted
 /// at /net inside the sandbox so that the (network-isolated) child can
 /// reach the connector.
-pub unsafe fn run(ops: &[Op], command: &[String], net: &Net, die_with_parent: bool) -> ! {
+///
+/// `env` is the sandbox's isolated environment (the spec's `env` section);
+/// the proxy variables are merged into it below.
+pub unsafe fn run(
+    ops: &[Op],
+    command: &[String],
+    net: &Net,
+    env: &BTreeMap<String, String>,
+    die_with_parent: bool,
+) -> ! {
     unsafe {
         // The connector binds its lifecycle to rs-bubble's caller (see
         // handle_die_with_parent); P and the sandboxed child set their own
@@ -62,7 +72,7 @@ pub unsafe fn run(ops: &[Op], command: &[String], net: &Net, die_with_parent: bo
         }
         if pid == 0 {
             drop(listener);
-            isolated_parent(&netdir, net, ops, command, die_with_parent);
+            isolated_parent(&netdir, net, ops, command, env, die_with_parent);
         }
 
         // Connector: serve proxy connections from the host side and watch
@@ -93,6 +103,7 @@ unsafe fn isolated_parent(
     net: &Net,
     ops: &[Op],
     command: &[String],
+    env: &BTreeMap<String, String>,
     die_with_parent: bool,
 ) -> ! {
     unsafe {
@@ -148,8 +159,12 @@ unsafe fn isolated_parent(
         };
         let _ = libc::fcntl(proxy_listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
 
-        // Make standard tools (curl, wget, git, ...) use the proxy.
-        for (key, val) in [
+        // Make standard tools (curl, wget, git, ...) use the proxy by
+        // adding the proxy variables to the sandbox's isolated
+        // environment. Entries from the spec's `env` section are applied
+        // afterwards and so win over these: an explicit spec value is the
+        // user's authoritative choice.
+        let mut child_env: BTreeMap<String, String> = [
             ("http_proxy", PROXY_URL),
             ("HTTP_PROXY", PROXY_URL),
             ("https_proxy", PROXY_URL),
@@ -158,9 +173,11 @@ unsafe fn isolated_parent(
             ("ALL_PROXY", PROXY_URL),
             ("NO_PROXY", "localhost,127.0.0.1,::1"),
             ("RS_BUBBLE_PROXY", "/net/sock"),
-        ] {
-            std::env::set_var(key, val);
-        }
+        ]
+        .into_iter()
+        .map(|(key, val)| (key.to_string(), val.to_string()))
+        .collect();
+        child_env.extend(env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
         let child_ops: Vec<Op> = std::iter::once(Op::Bind {
             src: netdir.display().to_string(),
@@ -175,7 +192,7 @@ unsafe fn isolated_parent(
         }
         if child_pid == 0 {
             // PID 1 of its own PID namespace (see pidns_and_exec).
-            pidns_and_exec(&child_ops, command, die_with_parent);
+            pidns_and_exec(&child_ops, command, &child_env, die_with_parent);
         }
 
         // Serve CONNECT requests while the command runs.

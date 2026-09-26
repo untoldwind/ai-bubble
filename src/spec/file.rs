@@ -16,7 +16,8 @@
 //!     { "type": "symlink", "src": "usr/bin", "dest": "/bin" },
 //!     { "type": "redirect-ro", "dest": "/bla", "source": "/otherdir" }
 //!   ] },
-//!   "net": { "isolated": true, "allow": ["example.com:443"] }
+//!   "net": { "isolated": true, "allow": ["example.com:443"] },
+//!   "env": { "PATH": "${PATH}", "HOME": "${HOME}" }
 //! }
 //! ```
 //!
@@ -42,6 +43,13 @@
 //! [`super::hostfs::env_string`]) — so everything downstream only ever
 //! sees the fully expanded text. Other fields (e.g. `net.allow`) are
 //! never expanded. Referencing an unset variable is an error.
+//!
+//! The environment: the sandboxed command does *not* inherit the host's
+//! environment — like the filesystem, the environment is isolated, and
+//! the `env` section decides what exists inside it (see
+//! [`super::env`]). Values may use `${VAR}` to copy host variables in
+//! explicitly. Without an `env` section (or with an empty one) the
+//! command runs with an empty environment.
 
 use std::path::Path;
 
@@ -49,6 +57,7 @@ use serde::Deserialize;
 
 use schemars::JsonSchema;
 
+use super::env::EnvConfig;
 use super::hostfs::HostFsConfig;
 use super::net::NetConfig;
 
@@ -71,6 +80,11 @@ pub struct Spec {
     /// The host filesystem: it is always the sandbox root, exposing the
     /// paths selected by its mappings.
     pub hostfs: HostFsConfig,
+    /// The isolated environment: the *complete* set of environment
+    /// variables the sandboxed command sees. Nothing is inherited from
+    /// the host; use `${VAR}` in the values to copy host variables in
+    /// explicitly (see [`super::env`]).
+    pub env: EnvConfig,
     /// Accepted for editor tooling only: it names the JSON schema
     /// (`--print-schema`) so the spec file can get completion and
     /// validation. Never serialized back out.

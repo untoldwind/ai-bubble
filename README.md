@@ -22,9 +22,18 @@ root, no mounts at all (not even procfs), and the host network.
     { "type": "dev" },
     { "type": "tmpfs", "path": "/tmp", "perms": "1777" }
   ] },
-  "net": { "isolated": true, "allow": ["example.com:443"] }
+  "net": { "isolated": true, "allow": ["example.com:443"] },
+  "env": { "PATH": "${PATH}", "HOME": "${HOME}" }
 }
 ```
+
+- `env` — the sandbox's **isolated environment**: the *complete* set of
+  environment variables the command sees. Nothing is inherited from the
+  host; a missing (or empty) `env` section means the command runs with an
+  empty environment. Values may reference host variables as `${VAR}`, so
+  the variables the sandbox needs are copied over explicitly, one by one
+  (e.g. `"PATH": "${PATH}"`). Referencing an unset host variable is an
+  error
 
 - `hostfs.mappings` — an **ordered** array of mappings, each selecting
   host paths for one treatment (`type`); see below for the details.
@@ -242,7 +251,9 @@ with `isolated.json`:
 }
 ```
 
-Standard tools automatically use the proxy, because the sandbox sets:
+Standard tools automatically use the proxy, because the sandbox sets the
+following variables in its (isolated) environment — entries from the
+spec's `env` section win over these:
 
 - `http_proxy` / `HTTP_PROXY` = `http://127.0.0.2:3128`
 - `https_proxy` / `HTTPS_PROXY` = same

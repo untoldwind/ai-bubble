@@ -61,5 +61,10 @@
       "google.com:443",
       "opencode.ai:443"
     ]
+  },
+  "env": {
+    "PATH": "${PATH}",
+    "HOME": "${HOME}",
+    "TERM": "${TERM}"
   }
 }

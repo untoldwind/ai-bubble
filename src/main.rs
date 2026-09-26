@@ -4,7 +4,7 @@
 //!
 //! * `cli`     — argument parsing only (clap derive); no side effects.
 //! * `spec`    — the sandbox spec file (JSON), in two layers: the
-//!   config-file view (`spec`, `hostfs`, `net`, `tmpfs`) and the internal
+//!   config-file view (`spec`, `env`, `hostfs`, `net`, `tmpfs`) and the internal
 //!   configuration (`spec::internal`) the sandbox machinery runs with,
 //!   compiled down from the parsed file. Parsing only; no side effects
 //!   beyond reading the file.
@@ -76,9 +76,20 @@ fn main() {
             let command = std::mem::take(&mut command);
             unsafe {
                 if sandbox_config.net.isolated {
-                    netns::run(&sandbox_config.ops, &command, &sandbox_config.net, die_with_parent);
+                    netns::run(
+                        &sandbox_config.ops,
+                        &command,
+                        &sandbox_config.net,
+                        &sandbox_config.env,
+                        die_with_parent,
+                    );
                 } else {
-                    sandbox::setup_and_exec(&sandbox_config.ops, &command, die_with_parent);
+                    sandbox::setup_and_exec(
+                        &sandbox_config.ops,
+                        &command,
+                        &sandbox_config.env,
+                        die_with_parent,
+                    );
                 }
             }
         }

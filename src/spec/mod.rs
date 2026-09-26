@@ -3,8 +3,8 @@
 //!
 //! The module is split into two deliberately separate layers:
 //!
-//! * The config file — [`file::Spec`] and its sections ([`hostfs`],
-//!   [`net`], [`tmpfs`]): everything that maps 1:1 onto what the user
+//! * The config file — [`file::Spec`] and its sections ([`env`],
+//!   [`hostfs`], [`net`], [`tmpfs`]): everything that maps 1:1 onto what the user
 //!   writes in the JSON spec file (`.rs-bubble/spec.json`, or
 //!   `--spec-dir DIR`).
 //!   These types carry the serde and JSON-schema attributes and are
@@ -22,6 +22,7 @@
 //! `crate::SPEC_SCHEMA` and prints it via `--print-schema`, so editors
 //! can validate and auto-complete spec files against it.
 
+pub mod env;
 pub mod file;
 pub mod hostfs;
 pub mod internal;
@@ -45,6 +46,41 @@ pub(crate) mod tests {
     /// The compiled-down ops of a spec file snippet.
     pub(crate) fn compile_ops(json: &str) -> Vec<Op> {
         SandboxConfig::compile(&parse(json)).ops
+    }
+
+    #[test]
+    fn env_section_is_parsed_and_expanded() {
+        unsafe { std::env::set_var("RS_BUBBLE_TEST_ENV_HOME", "/home/me") };
+        // The env section gives the sandbox its complete environment:
+        // values are ${VAR}-expanded from the host, like the path-like
+        // mapping fields.
+        let spec = parse(
+            r#"{ "env": {
+                    "PATH": "${PATH}",
+                    "HOME": "${RS_BUBBLE_TEST_ENV_HOME}/sandbox",
+                    "EMPTY": ""
+                } }"#,
+        );
+        let env: std::collections::BTreeMap<_, _> =
+            spec.env.0.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect();
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/me/sandbox"));
+        assert_eq!(env.get("EMPTY").map(String::as_str), Some(""));
+        let compiled = SandboxConfig::compile(&spec);
+        assert_eq!(compiled.env.get("HOME").map(String::as_str), Some("/home/me/sandbox"));
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_ENV_HOME") };
+    }
+
+    #[test]
+    fn unset_env_var_in_env_section_is_a_deserialize_error() {
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_UNSET") };
+        // Referencing an unset host variable is an error, so a typo in
+        // the env section doesn't silently drop the variable.
+        assert!(
+            serde_json::from_str::<Spec>(r#"{ "env": { "PATH": "${RS_BUBBLE_TEST_UNSET}" } }"#)
+                .is_err()
+        );
+        // But a plain, non-referencing value is always fine.
+        assert!(serde_json::from_str::<Spec>(r#"{ "env": { "FOO": "bar" } }"#).is_ok());
     }
 
     #[test]
