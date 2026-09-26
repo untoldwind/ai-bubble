@@ -73,7 +73,7 @@ fn ensure_dir(newroot: &Path, dest: &Path) {
             Ok(_) => {}
             Err(_) => die(&format!(
                 "Mount point {} does not exist in the hostfs root; \
-                 add a ro/rw pattern for it (or a parent directory) to hostfs.patterns",
+                 add a ro/rw mapping for it (or a parent directory) to hostfs.mappings",
                 dest.display()
             )),
         }

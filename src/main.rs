@@ -47,16 +47,14 @@ fn main() {
     }
 
     // Start the host FUSE filesystem server (in its own child process) before
-    // any namespace setup, so the sandbox can bind-mount it at /host (or use
-    // it as the sandbox root itself, see below). Only when the spec actually
-    // exposes something: a sandbox without any hostfs configuration must not
-    // depend on (or fail for the lack of) FUSE.
-    if spec.hostfs.root && spec.hostfs.patterns.is_empty() {
-        sandbox::die("hostfs.root needs at least one hostfs.patterns entry");
-    }
-    if spec.hostfs.root || !spec.hostfs.patterns.is_empty() {
-        hostfs::set_root_mode(spec.hostfs.root);
-        hostfs::start_host_fs(&spec.hostfs);
+    // any namespace setup: its filesystem becomes the sandbox root, with the
+    // ops (dev, tmpfs, proc, binds) mounted on top of it. Only when the spec
+    // actually exposes something: a sandbox without any hostfs mappings must
+    // not depend on (or fail for the lack of) FUSE.
+    let patterns = spec.hostfs.patterns();
+    if !patterns.is_empty() {
+        hostfs::set_root_mode(true);
+        hostfs::start_host_fs(&patterns);
     }
 
     let net = &spec.net;

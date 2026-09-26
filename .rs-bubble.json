@@ -1,29 +1,87 @@
 {
   "$schema": "./rs-bubble.spec.schema.json",
   "ops": [
-    { "type": "bind",    "src": "/usr", "dest": "/usr" },
-    { "type": "bind",    "src": "/etc", "dest": "/etc" },
-    { "type": "dev",     "dest": "/dev" },
-    { "type": "tmpfs",   "dest": "/tmp" },
-    { "type": "tmpfs",   "dest": "/run" }
+    {
+      "type": "bind",
+      "src": "/usr",
+      "dest": "/usr"
+    },
+    {
+      "type": "bind",
+      "src": "/etc",
+      "dest": "/etc"
+    },
+    {
+      "type": "dev",
+      "dest": "/dev"
+    },
+    {
+      "type": "tmpfs",
+      "dest": "/tmp"
+    },
+    {
+      "type": "tmpfs",
+      "dest": "/run"
+    }
   ],
   "hostfs": {
-    "root": true,
-    "patterns": {
-      "/home/bjunglas/workspaces": "rw",
-      "/lib": "ro",
-      "/lib64": "ro",
-      "/bin": "ro",
-      "/home/bjunglas/workspaces/**/target": "hide",
-      "/dev": "empty",
-      "/usr": "empty",
-      "/etc": "empty",
-      "/proc": "empty",
-      "/net": "empty",
-      "/run": "empty",
-      "/tmp": "empty"
-    }
+    "mappings": [
+      {
+        "type": "empty",
+        "path": "/dev"
+      },
+      {
+        "type": "empty",
+        "path": "/usr"
+      },
+      {
+        "type": "empty",
+        "path": "/etc"
+      },
+      {
+        "type": "empty",
+        "path": "/proc"
+      },
+      {
+        "type": "empty",
+        "path": "/net"
+      },
+      {
+        "type": "empty",
+        "path": "/run"
+      },
+      {
+        "type": "empty",
+        "path": "/tmp"
+      },
+      {
+        "type": "rw",
+        "glob": "/home/bjunglas/workspaces"
+      },
+      {
+        "type": "ro",
+        "glob": "/lib"
+      },
+      {
+        "type": "ro",
+        "glob": "/lib64"
+      },
+      {
+        "type": "ro",
+        "glob": "/bin"
+      },
+      {
+        "type": "hide",
+        "glob": "/home/bjunglas/workspaces/**/target"
+      }
+    ]
   },
   "proc": "/proc",
-  "net": { "isolated": true, "allow": ["google.com:443", "opencode.ai:443"] }
+  "net": {
+    "isolated": true,
+    "allow": [
+      "google.com:443",
+      "opencode.ai:443"
+    ]
+  }
 }

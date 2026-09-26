@@ -23,14 +23,17 @@
 //!     { "type": "symlink", "src": "usr/lib", "dest": "/lib" }
 //!   ],
 //!   "proc": "/proc",
-//!   "net": { "isolated": true, "allow": ["example.com:443"] }
+//!   "net": { "isolated": true, "allow": ["example.com:443"] },
+//!   "hostfs": { "mappings": [ { "type": "ro", "glob": "/etc/*.conf" } ] }
 //! }
 //! ```
 //!
 //! All fields are optional: `proc` defaults to `/proc` (a fresh procfs
 //! instance), and without `net.isolated` the command shares the host
 //! network. `allow` is the proxy allow-list; an empty list (or a missing
-//! `allow`) allows every target.
+//! `allow`) allows every target. The `hostfs` mappings make the FUSE
+//! filesystem the sandbox root; without any mappings the sandbox gets a
+//! plain tmpfs root and no FUSE filesystem is started.
 
 pub mod hostfs;
 pub mod net;
@@ -62,7 +65,8 @@ pub struct Spec {
     pub proc: Option<PathBuf>,
     /// Isolated-network configuration.
     pub net: NetConfig,
-    /// The host filesystem mounted at `/host`.
+    /// The host filesystem: it is always the sandbox root, exposing the
+    /// paths selected by its mappings.
     pub hostfs: HostFsConfig,
     /// Accepted for editor tooling only: it names the JSON schema
     /// (`--print-schema`) so the spec file can get completion and
@@ -295,6 +299,13 @@ pub(crate) mod tests {
             assert!(
                 crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")),
                 "{tag} missing from schema"
+            );
+        }
+        // So are the hostfs mappings.
+        for tag in ["ro", "rw", "hide", "empty"] {
+            assert!(
+                crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")),
+                "{tag} mapping missing from schema"
             );
         }
         // deny_unknown_fields on Spec must surface in the schema.

@@ -13,7 +13,7 @@
       ]
     },
     "hostfs": {
-      "description": "The host filesystem mounted at `/host`.",
+      "description": "The host filesystem: it is always the sandbox root, exposing the paths selected by its mappings.",
       "allOf": [
         {
           "$ref": "#/definitions/HostFsConfig"
@@ -47,23 +47,107 @@
   "additionalProperties": false,
   "definitions": {
     "HostFsConfig": {
-      "description": "The spec file's `hostfs` section: what the FUSE filesystem mounted at `/host` exposes.",
+      "description": "The spec file's `hostfs` section: what the FUSE filesystem — which is always the sandbox root — exposes of the host.",
       "type": "object",
       "properties": {
-        "patterns": {
-          "description": "An ordered mapping from glob patterns (absolute host paths) to permissions: matched paths are mirrored under `/host` — read-only (`\"ro\"`) or read-write (`\"rw\"`, as far as the underlying host permissions allow) —, exposed empty (`\"empty\"` — an empty, unwritable directory, or an empty file when the pattern matches a real file), or hidden (`\"hide\"`). Order matters — when a path matches several patterns, the **last** matching pattern decides. Matched paths appear at the same absolute path below `/host` (`/etc/passwd` → `/host/etc/passwd`); matched directories are mirrored recursively (or, when hidden, disappear with their whole subtree). Nothing below an empty path is visible, and empty paths are shown even when a mirror pattern (or the real host path) covers them. Empty patterns match nothing.",
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/definitions/Permission"
+        "mappings": {
+          "description": "An ordered list of mappings. `ro`, `rw` and `hide` select paths with a glob pattern (`glob`) of absolute host paths: matched paths are mirrored into the sandbox — read-only (`ro`) or read-write (`rw`, as far as the underlying host permissions allow) — or hidden (`hide`). `empty` names a single absolute path (`path`) and exposes it empty: an empty, unwritable directory, or an empty file when the path matches a real file. Order matters — when a path matches several mappings, the **last** matching mapping decides. Matched paths appear at the same absolute path inside the sandbox (`/etc/passwd` → `/etc/passwd`); matched directories are mirrored recursively (or, when hidden, disappear with their whole subtree). Nothing below an empty path is visible, and empty paths are shown even when a mirror mapping (or the real host path) covers them. Missing or empty mappings expose nothing.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Mapping"
           }
-        },
-        "root": {
-          "description": "**Experimental:** use the FUSE filesystem itself as the sandbox root instead of mounting it at `/host`. Everything mirrored appears at its absolute host path; the ops (`dev`, `tmpfs`, `proc`, binds) are mounted on top of it. Because the sandbox never creates mount points on the FUSE filesystem itself, every mount point must be listed as `\"empty\"` in `patterns` (or exist in the mirror).",
-          "default": false,
-          "type": "boolean"
         }
       },
       "additionalProperties": false
+    },
+    "Mapping": {
+      "description": "The spec's `hostfs.mappings` setting: an *ordered* list of mappings, each selecting host paths for one treatment.\n\nA `ro`, `rw` or `hide` mapping selects paths with a **glob** pattern of absolute host paths; an `empty` mapping names a single absolute host **path** exactly (it makes no sense to glob an empty mount point). The list order matters: when a path matches several mappings, the **last** matching mapping decides.",
+      "oneOf": [
+        {
+          "description": "The matched paths are mirrored **read-only**.",
+          "type": "object",
+          "required": [
+            "glob",
+            "type"
+          ],
+          "properties": {
+            "glob": {
+              "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`).",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "ro"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The matched paths are mirrored **read-write** (as far as the real host permissions allow).",
+          "type": "object",
+          "required": [
+            "glob",
+            "type"
+          ],
+          "properties": {
+            "glob": {
+              "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`).",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "rw"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The matched paths are hidden (a hidden directory hides its whole subtree).",
+          "type": "object",
+          "required": [
+            "glob",
+            "type"
+          ],
+          "properties": {
+            "glob": {
+              "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`).",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "hide"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The named path is exposed **empty** — a mount point for the sandbox's ops.",
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "path": {
+              "description": "An absolute host path, named exactly (no wildcards).",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "empty"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "NetConfig": {
       "description": "Network-related configuration for isolated networking.",
@@ -219,39 +303,6 @@
               ]
             }
           }
-        }
-      ]
-    },
-    "Permission": {
-      "description": "What happens to a path matched by a `hostfs.patterns` glob pattern.",
-      "oneOf": [
-        {
-          "description": "The matched paths are mirrored under `/host` **read-only**: they can be read (and executed, when the underlying file or directory has the exec bits), but never modified.",
-          "type": "string",
-          "enum": [
-            "ro"
-          ]
-        },
-        {
-          "description": "The matched paths are mirrored under `/host` **read-write**: they can also be modified, created or deleted — as far as the underlying host file or directory really allows it (the real permissions apply).",
-          "type": "string",
-          "enum": [
-            "rw"
-          ]
-        },
-        {
-          "description": "The matched paths are hidden. A hidden **directory** hides its whole subtree, too.",
-          "type": "string",
-          "enum": [
-            "hide"
-          ]
-        },
-        {
-          "description": "The matched paths are exposed **empty**: as an empty, unwritable directory when the path is (or would be) a directory, or as an empty file when it matches a real file. Nothing below an empty path is visible. Meant as mount points inside the sandbox, e.g. `/dev`, `/tmp`, `/proc`.",
-          "type": "string",
-          "enum": [
-            "empty"
-          ]
         }
       ]
     }

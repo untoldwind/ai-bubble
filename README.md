@@ -23,7 +23,7 @@ root, a fresh procfs at `/proc`, and the host network.
   ],
   "proc": "/proc",
   "net": { "isolated": true, "allow": ["example.com:443"] },
-  "hostfs": { "patterns": { "/etc/*.conf": "ro" } }
+  "hostfs": { "mappings": [ { "type": "ro", "glob": "/etc/*.conf" } ] }
 }
 ```
 
@@ -52,31 +52,32 @@ root, a fresh procfs at `/proc`, and the host network.
   rs-bubble process stays on the host and acts as a **TCP proxy**
 - `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`.
   Empty or missing means every target is allowed
-- `hostfs.patterns` — an **ordered** mapping from **glob patterns** of
-  absolute host paths to permissions (`"ro"`, `"rw"`, `"hide"` or
-  `"empty"`). Mirrored paths are exposed under **`/host`**: matched paths
-  appear at the same absolute path below `/host`
-  (`/etc/passwd` → `/host/etc/passwd`). A pattern that names a directory
+- `hostfs.mappings` — an **ordered** array of mappings, each selecting
+  host paths for one treatment (`type`): `ro`, `rw` or `hide` select
+  paths with a **glob** pattern of absolute host paths (`"glob"`);
+  `empty` names a single absolute path (`"path"`) exactly. Mirrored
+  paths are exposed inside the sandbox at their absolute host paths
+  (`/etc/passwd` → `/etc/passwd`). A mapping that names a directory
   exactly (`/usr/share/doc`) mirrors that directory **recursively**; `**`
   spans directory levels (`/usr/share/**/*.rs`). Ancestor directories are
   shown so the tree is navigable down to the matched leaves.
-  **Order matters**: when a path matches several patterns, the **last**
-  matching pattern decides — e.g. `{"/etc": "ro", "/etc/passwd":
-  "hide"}` hides `/etc/passwd`. A hidden directory hides its whole
-  subtree, too. `"ro"` mirrors the matched paths **read-only** (they can
+  **Order matters**: when a path matches several mappings, the **last**
+  matching mapping decides — e.g. mirror `/etc` and then hide
+  `/etc/passwd`. A hidden directory hides its whole
+  subtree, too. `ro` mirrors the matched paths **read-only** (they can
   be read, and executed when the underlying file has the exec bits);
-  `"rw"` mirrors them **read-write** — content, metadata, creation and
+  `rw` mirrors them **read-write** — content, metadata, creation and
   deletion are passed through as far as the *real* host file or
-  directory permissions allow, and only if the last pattern naming the
-  path (or its nearest mirrored ancestor) says `"rw"`. `"empty"` exposes
-  the matched paths **empty**: as an empty, unwritable directory (mode
+  directory permissions allow, and only if the last mapping naming the
+  path (or its nearest mirrored ancestor) says `rw`. `empty` exposes
+  the named path **empty**: as an empty, unwritable directory (mode
   0555) when the path is (or would be) a directory — or as an **empty
-  file** when the pattern matches a real file. Empty paths take
+  file** when it matches a real file. Empty paths take
   *precedence* over the mirror: nothing below them is visible, and they
-  are shown even when a mirror pattern covers them. Their purpose is to
-  provide mount points for the sandbox's ops (`dev`, `tmpfs`, `proc`,
-  binds) — see the `hostfs.root` mode below. Missing or empty matches
-  nothing.
+  are shown even when a mirror mapping (or the real host path) covers
+  them. Their purpose is to provide mount points for the sandbox's ops
+  (`dev`, `tmpfs`, `proc`, binds) — see the hostfs root below. Missing
+  or empty mappings expose nothing.
 
 Everything on the command line (optionally after a `--` separator) is the
 command to run inside the sandbox:
@@ -102,9 +103,9 @@ Like bwrap, the tool:
    its exit status.
 5. Marks the mount tree as a **slave**, so nothing mounted inside
    propagates back to the host.
-6. Creates a fresh **tmpfs** as the sandbox root. (Experimental
-   alternative: with `hostfs.root = true` the FUSE filesystem
-   itself becomes the root — see below.)
+6. Creates a fresh **tmpfs** as the sandbox root — unless the spec has
+   `hostfs` mappings, in which case the FUSE filesystem itself becomes
+   the root (see below).
 7. Applies the filesystem ops (the spec's `proc` and `ops`) **in the
    order they were given** (order matters, exactly like bwrap). Because
    the PID namespace is created before the mounts (the mounting process
@@ -245,73 +246,27 @@ case a hostile command could kill `P` (cutting its own network access —
 it gains nothing else). Fully separating them would require an additional
 namespace split.
 
-## The host filesystem at /host
+## The host filesystem as the sandbox root
 
-The sandbox always gets a FUSE filesystem mounted at `/host`, served by a
-separate forked rs-bubble process. It mirrors the paths selected by the
-spec's ordered `hostfs.patterns` glob → permission map at their absolute
-host paths:
-
-```json
-{
-  "hostfs": {
-    "patterns": {
-      "/etc/*.conf": "ro",
-      "/usr/share/doc": "ro",
-      "/etc/secret.conf": "hide"
-    }
-  }
-}
-```
-
-```sh
-rs-bubble -- /bin/sh -c 'cat /host/etc/hosts'
-```
-
-- Patterns are standard globs (`*`, `?`, `[...]`, `**`); they must be
-  absolute, and `*` does not cross directory separators (use `**` for
-  that). A pattern that names a directory exactly mirrors it with its
-  whole subtree. Each pattern's value is `"ro"` (the matched paths are
-  mirrored read-only), `"rw"` (they are mirrored read-write — writes,
-  creates and deletes are passed through to the real host file system as
-  far as its permissions allow), `"hide"` (they are hidden; a hidden
-  directory hides its whole subtree) or `"empty"` (they are exposed
-  empty — an empty, unwritable directory, or an empty file when the
-  pattern matches a real file). Since this is a JSON object, the patterns
-  are tried in the order they are written and the **last** match wins —
-  put more specific patterns after broader ones, e.g. mirror `/etc` and
-  then hide `/etc/ssh`.
-- The host tree is **not** crawled at startup: every FUSE operation
-  matches the requested path against the patterns on the fly, so a large
-  host tree costs nothing and only the accessed paths are touched.
-- Writes only go through where a pattern says `"rw"`: the last pattern
-  naming the path (or its nearest mirrored ancestor — an exactly-named or
-  `**`-covered directory is a recursive mirror, so its permission governs
-  everything below it) decides, and the **real** host file or directory
-  permissions still apply on top. The mount itself is read-only unless
-  some pattern says `"rw"`.
-
-### Experimental: the host filesystem as the sandbox root
-
-With `hostfs.root = true` the FUSE filesystem itself becomes the sandbox
-root instead of being mounted at `/host`: everything the mirror exposes
-appears at its absolute host path, and the ops (`dev`, `tmpfs`, proc,
-binds) are mounted **on top of** it:
+With `hostfs` mappings, the FUSE filesystem itself becomes the sandbox
+root instead of a plain tmpfs (and it is not mounted at `/host`): everything
+the mirror exposes appears at its absolute host path, and the ops (`dev`,
+`tmpfs`, proc, binds) are mounted **on top of** it. A sandbox without any
+`hostfs` mappings gets the plain tmpfs root and does not use FUSE at all:
 
 ```json
 {
   "hostfs": {
-    "root": true,
-    "patterns": {
-      "/bin": "ro",
-      "/etc": "ro",
-      "/lib": "ro",
-      "/lib64": "ro",
-      "/usr": "ro",
-      "/dev": "empty",
-      "/tmp": "empty",
-      "/proc": "empty"
-    },
+    "mappings": [
+      { "type": "ro", "glob": "/bin" },
+      { "type": "ro", "glob": "/etc" },
+      { "type": "ro", "glob": "/lib" },
+      { "type": "ro", "glob": "/lib64" },
+      { "type": "ro", "glob": "/usr" },
+      { "type": "empty", "path": "/dev" },
+      { "type": "empty", "path": "/tmp" },
+      { "type": "empty", "path": "/proc" }
+    ]
   },
   "ops": [
     { "type": "dev", "dest": "/dev" },
@@ -321,11 +276,35 @@ binds) are mounted **on top of** it:
 }
 ```
 
+- Mappings are standard globs (`*`, `?`, `[...]`, `**`); they must be
+  absolute, and `*` does not cross directory separators (use `**` for
+  that). A mapping that names a directory exactly mirrors it with its
+  whole subtree. The mapping `type` is `ro` (the matched paths are
+  mirrored read-only), `rw` (they are mirrored read-write — writes,
+  creates and deletes are passed through to the real host file system as
+  far as its permissions allow), `hide` (they are hidden; a hidden
+  directory hides its whole subtree) or `empty` (the named path is
+  exposed empty — an empty, unwritable directory, or an empty file when
+  it matches a real file). The mappings are tried in the order they are
+  written and the **last** match wins — put more specific mappings after
+  broader ones, e.g. mirror `/etc` and then hide `/etc/ssh`.
+- The host tree is **not** crawled at startup: every FUSE operation
+  matches the requested path against the patterns on the fly, so a large
+  host tree costs nothing and only the accessed paths are touched.
+- Writes only go through where a mapping says `rw`: the last mapping
+  naming the path (or its nearest mirrored ancestor — an exactly-named or
+  `**`-covered directory is a recursive mirror, so its permission governs
+  everything below it) decides, and the **real** host file or directory
+  permissions still apply on top. The mount itself is read-only unless
+  some mapping says `rw`.
+
+### The "empty" mappings are the mount points
+
 ```sh
-rs-bubble --spec hostfs-root.json -- /bin/sh
+rs-bubble --spec hostfs.json -- /bin/sh
 ```
 
-The `"empty"` entries are exposed by the FUSE filesystem as empty,
+The `"empty"` mappings are exposed by the FUSE filesystem as empty,
 unwritable (mode 0555) directories — pure mount points, taking *precedence*
 over the mirror (nothing below them is visible, and no mirror pattern can
 bring content back). They must exist for every mount point, because
@@ -344,5 +323,5 @@ the host view.
 ## Status
 
 Starter project — the spec file's `ops` (bind, symlink, dev, tmpfs), `proc`,
-`net.isolated`, `net.allow` and `hostfs.patterns` are implemented. Natural next steps would be
+`net.isolated`, `net.allow` and `hostfs.mappings` are implemented. Natural next steps would be
 read-only binds, `--die-with-parent`, and `--unshare-all`.

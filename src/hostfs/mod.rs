@@ -1,14 +1,13 @@
 //! The host-side FUSE filesystem.
 //!
 //! The *host* process exposes a mirror of parts of the real filesystem via
-//! FUSE. The mirrored paths are selected by the spec file's ordered
-//! `hostfs.patterns` glob → permission map (`"ro"` mirrors a matched path
-//! read-only, `"rw"` mirrors it read-write, `"hide"` hides it, `"empty"`
-//! exposes it empty; when a path matches several patterns, the last match
-//! wins); the sandboxed command gets
-//! the result bind-mounted at `/host`, where the **full host paths** are
-//! reproduced: a pattern `/etc/*.conf` makes `/etc/foo.conf` available as
-//! `/host/etc/foo.conf`. A pattern that matches a directory exactly
+//! FUSE. The mirrored paths are selected by the spec's ordered
+//! `hostfs.mappings` list, each carrying a permission (`"ro"` mirrors a
+//! matched path read-only, `"rw"` mirrors it read-write, `"hide"` hides it,
+//! `"empty"` exposes it empty; when a path matches several mappings, the
+//! last match wins); the result is the sandbox root: the **full host paths**
+//! are reproduced — a mapping `/etc/*.conf` makes `/etc/foo.conf` available
+//! at `/etc/foo.conf`. A pattern that matches a directory exactly
 //! (`/usr/share/doc`) mirrors that directory recursively (or, when hidden,
 //! hides it with its whole subtree); `**` matches across directory
 //! boundaries.
@@ -27,15 +26,15 @@
 //! then proceeds with the namespace setup. When the parent dies, the FUSE
 //! server unmounts and exits.
 //!
-//! `hostfs.patterns` is an ordered glob → permission map: `"ro"`/`"rw"`
+//! `hostfs.mappings` is an ordered pattern → permission list: `"ro"`/`"rw"`
 //! mirror the matched paths (read-only or read-write), `"hide"` hides them
 //! (a hidden directory hides its whole subtree) and `"empty"` exposes them
 //! empty — an empty, unwritable directory when the path is (or would be) a
 //! directory, an empty file when it matches a real file. Empty paths take
 //! precedence over the mirror: nothing below them is visible, which makes
 //! them the mount points for the sandbox to stack `/dev`, `/proc`, tmpfs
-//! (or, with `hostfs.root`, its whole root) on top of. When a path matches
-//! several patterns the last match wins.
+//! (or its whole root) on top of. When a path matches several patterns the
+//! last match wins.
 //!
 //! Writes: a path is writable only when the last pattern naming it (or its
 //! nearest mirrored ancestor — an exactly-named or `**`-covered directory
@@ -121,9 +120,10 @@ impl MirrorPattern {
 }
 
 /// The mirror filesystem: a view of the paths selected by the spec's
-/// ordered `hostfs.patterns` glob → permission map, reproduced at
-/// the same absolute paths below `/host`. Nothing is pre-expanded; every
-/// operation matches against the patterns directly.
+/// ordered `hostfs.mappings` pattern → permission list, reproduced at
+/// the same absolute host paths (the filesystem is the sandbox root).
+/// Nothing is pre-expanded; every operation matches against the patterns
+/// directly.
 ///
 /// Paths matched with the `"empty"` permission are exposed empty: as an
 /// empty, unwritable directory when the path is (or would be) a directory,
@@ -1025,12 +1025,13 @@ fn ts_to_timespec(ts: Option<Timestamp>) -> libc::timespec {
 /// Fork the FUSE server process, wait for it to mount, and record the
 /// mountpoint for the sandbox child. Must run before any namespace setup.
 ///
-/// `config` is the spec's `hostfs` section; the patterns are compiled inside
-/// the server process (after the fork).
+/// `patterns` is the internal pattern → permission list built from the
+/// spec's `hostfs` section; the patterns are compiled inside the server
+/// process (after the fork).
 ///
 /// On success the mountpoint path is stored in `HOST_MOUNT_POINT` (inherited
 /// by every later fork). On any failure the process dies.
-pub fn start_host_fs(config: &crate::spec::HostFsConfig) {
+pub fn start_host_fs(patterns: &crate::spec::hostfs::Patterns) {
     // Create the mountpoint directory in the parent so both the server and the
     // sandbox (and its children) can agree on a stable path.
     let mut tmpl: Vec<u8> = b"/tmp/rs-bubble.host.XXXXXX".to_vec();
@@ -1060,7 +1061,7 @@ pub fn start_host_fs(config: &crate::spec::HostFsConfig) {
     if pid == 0 {
         // Child: serve the FUSE filesystem forever (or until the host dies).
         unsafe { libc::close(read_fd) };
-        serve(config.patterns.clone(), mountpoint, write_fd);
+        serve(patterns.clone(), mountpoint, write_fd);
         // serve never returns
     }
 
