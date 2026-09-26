@@ -10,10 +10,10 @@
 //! editor can find) to get completion and validation for
 //! `.rs-bubble.json`.
 //!
-//! Because the schema is generated from the very same source file that
-//! does the deserialization, it can never drift from what the program
+//! Because the schema is generated from the very same source files that
+//! do the deserialization, it can never drift from what the program
 //! actually accepts (the hand-written `TmpfsPerms` deserializer is
-//! described manually in `spec/mod.rs` and its submodules).
+//! described manually in `spec/tmpfs.rs`).
 
 mod sandbox {
     /// Stand-in for the main crate's `sandbox::die`: the schema generation
@@ -30,7 +30,8 @@ mod spec;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/spec/mod.rs");
-    println!("cargo:rerun-if-changed=src/spec/op.rs");
+    println!("cargo:rerun-if-changed=src/spec/file.rs");
+    println!("cargo:rerun-if-changed=src/spec/internal.rs");
     println!("cargo:rerun-if-changed=src/spec/tmpfs.rs");
     println!("cargo:rerun-if-changed=src/spec/net.rs");
     println!("cargo:rerun-if-changed=src/spec/hostfs.rs");

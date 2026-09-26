@@ -1,82 +1,37 @@
 //! The `hostfs` section of the spec file: what the FUSE filesystem —
 //! which is always the sandbox root — exposes of the host.
 //!
-//! This is only the *spec-file* view: [`HostFsConfig::patterns`] maps it
-//! onto the internal [`Patterns`] representation the FUSE filesystem
-//! itself works with.
+//! This is only the *config-file* view: [`HostFsConfig::patterns`] and
+//! [`HostFsConfig::ops`] compile it down onto the internal [`Patterns`]
+//! and [`Op`] types ([`super::internal`]) that the FUSE filesystem and
+//! the sandbox itself work with.
 
-use std::fmt;
 use std::path::PathBuf;
 
 use serde::Deserialize;
 
 use schemars::JsonSchema;
 
-use super::op::Op;
-use super::TmpfsPerms;
-
-/// What happens to a path matched by one of the mirror patterns
-/// (the internal representation of a mapping's `type`).
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Permission {
-    /// The matched paths are mirrored into the sandbox **read-only**: they can
-    /// be read (and executed, when the underlying file or directory has the
-    /// exec bits), but never modified.
-    Ro,
-    /// The matched paths are mirrored into the sandbox **read-write**: they can
-    /// also be modified, created or deleted — as far as the underlying host
-    /// file or directory really allows it (the real permissions apply).
-    Rw,
-    /// The matched paths are hidden. A hidden **directory** hides its
-    /// whole subtree, too.
-    Hide,
-    /// The matched paths are exposed **empty**: as an empty, unwritable
-    /// directory when the path is (or would be) a directory, or as an
-    /// empty file when it matches a real file. Nothing below an empty
-    /// path is visible. Meant as mount points inside the sandbox, e.g.
-    /// `/dev`, `/tmp`, `/proc`.
-    Empty,
-}
-
-impl Permission {
-    /// Whether the permission mirrors real host content (`ro` or `rw`).
-    pub fn is_mirrored(self) -> bool {
-        matches!(self, Permission::Ro | Permission::Rw)
-    }
-
-    /// Whether the permission additionally allows writing (`rw` only).
-    pub fn is_writable(self) -> bool {
-        self == Permission::Rw
-    }
-}
-
-impl fmt::Display for Permission {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Permission::Ro => "ro",
-            Permission::Rw => "rw",
-            Permission::Hide => "hide",
-            Permission::Empty => "empty",
-        })
-    }
-}
+use super::internal::{Op, Patterns, Permission};
+use super::tmpfs::TmpfsPerms;
 
 /// The spec's `hostfs.mappings` setting: an *ordered* list of mappings,
 /// each selecting host paths for one treatment.
 ///
 /// A `ro`, `rw` or `hide` mapping selects paths with a **glob** pattern of
-/// absolute host paths; every other mapping names a single absolute host
-/// **path** exactly (it makes no sense to glob a mount point). The `dev`
-/// and `proc` mappings default their path to `/dev` and `/proc`.
+/// absolute host paths; every other mapping names absolute **paths**
+/// exactly (it makes no sense to glob a mount point). The `dev` and
+/// `proc` mappings default their path to `/dev` and `/proc`.
 /// The list order matters: when a path matches several mappings, the
-/// **last** matching mapping decides.
+/// **last** matching mapping decides — and the mount ops the mappings
+/// generate are applied in mapping order, too.
 ///
 /// The mount-point mappings (`dev`, `tmpfs`, `proc`, `bind`) are
 /// shorthand for an `empty` mapping *plus* the corresponding mount op
 /// (see [`Mapping::op`]): the FUSE filesystem exposes the path empty so
 /// it can be mounted on, and the sandbox stacks the real mount on top of
-/// it.
+/// it. `symlink` is the odd one out: it only produces a symlink op (see
+/// [`Mapping::op`]) and does not touch the host filesystem at all.
 #[derive(Debug, Clone, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Mapping {
@@ -129,11 +84,32 @@ pub enum Mapping {
         #[serde(default = "default_proc_path")]
         path: String,
     },
-    /// Shorthand for `empty` at `path` **plus** a bind mount of the real
-    /// host path at the same path on top of it.
+    /// Shorthand for `empty` at `dest` **plus** a bind mount of the host
+    /// path `src` on top of it. `dest` defaults to `src` — the plain
+    /// "bind the real host path at the same path" case. The field is
+    /// also accepted under its old name `path` (deprecated alias for
+    /// `src`).
     Bind {
-        /// An absolute host path, named exactly (no wildcards).
-        path: String,
+        /// An absolute host path to bind (named exactly, no wildcards).
+        /// Also accepted under its old name `path` (deprecated alias,
+        /// meaning "bind at the same path").
+        #[serde(alias = "path")]
+        src: String,
+        /// An absolute sandbox path to bind it at. Defaults to `src`.
+        #[serde(default)]
+        dest: Option<String>,
+    },
+    /// Create a symlink at `dest` pointing to `src`, like bwrap's
+    /// `--symlink`. `src` is relative to the sandbox root (`usr/lib`,
+    /// like bwrap's relative symlink targets) or absolute. This mapping
+    /// does not expose anything in the host filesystem — it only
+    /// generates the symlink op (applied in mapping order, together with
+    /// the other mount ops).
+    Symlink {
+        /// The symlink target, relative to the sandbox root (or absolute).
+        src: String,
+        /// An absolute sandbox path for the new symlink.
+        dest: String,
     },
 }
 
@@ -151,10 +127,18 @@ fn default_proc_path() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum UncheckedMapping {
-    Ro { glob: String },
-    Rw { glob: String },
-    Hide { glob: String },
-    Empty { path: String },
+    Ro {
+        glob: String,
+    },
+    Rw {
+        glob: String,
+    },
+    Hide {
+        glob: String,
+    },
+    Empty {
+        path: String,
+    },
     Dev {
         #[serde(default = "default_dev_path")]
         path: String,
@@ -168,7 +152,16 @@ enum UncheckedMapping {
         #[serde(default = "default_proc_path")]
         path: String,
     },
-    Bind { path: String },
+    Bind {
+        #[serde(alias = "path")]
+        src: String,
+        #[serde(default)]
+        dest: Option<String>,
+    },
+    Symlink {
+        src: String,
+        dest: String,
+    },
 }
 
 impl TryFrom<UncheckedMapping> for Mapping {
@@ -182,6 +175,13 @@ impl TryFrom<UncheckedMapping> for Mapping {
                 Err(format!(
                     "hostfs {kind} mapping: {field} {value:?} is not an absolute path"
                 ))
+            }
+        }
+        fn nonempty(kind: &str, field: &str, value: String) -> Result<String, String> {
+            if value.is_empty() {
+                Err(format!("hostfs {kind} mapping: {field} must not be empty"))
+            } else {
+                Ok(value)
             }
         }
         Ok(match raw {
@@ -208,8 +208,16 @@ impl TryFrom<UncheckedMapping> for Mapping {
             UncheckedMapping::Proc { path } => Mapping::Proc {
                 path: absolute("proc", "path", path)?,
             },
-            UncheckedMapping::Bind { path } => Mapping::Bind {
-                path: absolute("bind", "path", path)?,
+            UncheckedMapping::Bind { src, dest } => Mapping::Bind {
+                src: absolute("bind", "src", src)?,
+                dest: match dest {
+                    Some(dest) => Some(absolute("bind", "dest", dest)?),
+                    None => None,
+                },
+            },
+            UncheckedMapping::Symlink { src, dest } => Mapping::Symlink {
+                src: nonempty("symlink", "src", src)?,
+                dest: absolute("symlink", "dest", dest)?,
             },
         })
     }
@@ -224,17 +232,20 @@ impl<'de> Deserialize<'de> for Mapping {
 }
 
 impl Mapping {
-    /// The internal glob pattern the mapping selects paths with. The
-    /// mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`, `bind`)
-    /// name their single path as a wildcard-free "pattern".
-    fn pattern(&self) -> &str {
+    /// The hostfs glob pattern the mapping selects paths with, if it
+    /// touches the host filesystem at all. The mount-point mappings
+    /// (`empty`, `dev`, `tmpfs`, `proc`, `bind`) name their single path
+    /// as a wildcard-free "pattern"; a `symlink` mapping exposes
+    /// nothing.
+    fn pattern(&self) -> Option<&str> {
         match self {
-            Mapping::Ro { glob } | Mapping::Rw { glob } | Mapping::Hide { glob } => glob,
+            Mapping::Ro { glob } | Mapping::Rw { glob } | Mapping::Hide { glob } => Some(glob),
             Mapping::Empty { path }
             | Mapping::Dev { path }
             | Mapping::Tmpfs { path, .. }
-            | Mapping::Proc { path }
-            | Mapping::Bind { path } => path,
+            | Mapping::Proc { path } => Some(path),
+            Mapping::Bind { src, dest } => Some(dest.as_deref().unwrap_or(src)),
+            Mapping::Symlink { .. } => None,
         }
     }
 
@@ -245,18 +256,14 @@ impl Mapping {
             Mapping::Ro { .. } => Permission::Ro,
             Mapping::Rw { .. } => Permission::Rw,
             Mapping::Hide { .. } => Permission::Hide,
-            Mapping::Empty { .. } => Permission::Empty,
-            Mapping::Dev { .. }
-            | Mapping::Tmpfs { .. }
-            | Mapping::Proc { .. }
-            | Mapping::Bind { .. } => Permission::Empty,
+            _ => Permission::Empty,
         }
     }
 
-    /// The mount op the mapping stands for, if any. The mount-point
-    /// mappings (`dev`, `tmpfs`, `proc`, `bind`) produce the op that is
-    /// stacked on top of the empty path they expose; every other mapping
-    /// produces none.
+    /// The op the mapping stands for, if any. The mount-point mappings
+    /// (`dev`, `tmpfs`, `proc`, `bind`) produce the op that is stacked on
+    /// top of the empty path they expose, and `symlink` produces the
+    /// symlink op; every other mapping produces none.
     pub fn op(&self) -> Option<Op> {
         match self {
             Mapping::Dev { path } => Some(Op::Dev {
@@ -270,30 +277,16 @@ impl Mapping {
             Mapping::Proc { path } => Some(Op::Proc {
                 dest: PathBuf::from(path),
             }),
-            Mapping::Bind { path } => Some(Op::Bind {
-                src: path.clone(),
-                dest: PathBuf::from(path),
+            Mapping::Bind { src, dest } => Some(Op::Bind {
+                src: src.clone(),
+                dest: PathBuf::from(dest.as_deref().unwrap_or(src)),
+            }),
+            Mapping::Symlink { src, dest } => Some(Op::Symlink {
+                src: src.clone(),
+                dest: PathBuf::from(dest),
             }),
             _ => None,
         }
-    }
-}
-
-/// The internal `hostfs` representation: an *ordered* list of
-/// (glob pattern, permission) pairs — the compiled-down form of the
-/// spec's [`Mapping`] list. That order matters: when a path matches
-/// several patterns, the **last** matching pattern decides.
-#[derive(Debug, Default, PartialEq, Clone)]
-pub struct Patterns(pub Vec<(String, Permission)>);
-
-impl Patterns {
-    /// The pattern/permission pairs, in spec order.
-    pub fn iter(&self) -> impl Iterator<Item = &(String, Permission)> {
-        self.0.iter()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }
 
@@ -309,31 +302,34 @@ pub struct HostFsConfig {
     /// hidden (`hide`). `empty` names a single absolute path (`path`) and
     /// exposes it empty: an empty, unwritable directory, or an empty file
     /// when the path matches a real file. Order matters — when a path
-    /// matches several mappings, the **last** matching mapping decides.
-    /// Matched paths appear at the same absolute path inside the sandbox
-    /// (`/etc/passwd` → `/etc/passwd`); matched directories are mirrored
-    /// recursively (or, when hidden, disappear with their whole subtree).
-    /// Nothing below an empty path is visible, and empty paths are shown
-    /// even when a mirror mapping (or the real host path) covers them.
-    /// Missing or empty mappings expose nothing.
+    /// matches several mappings, the **last** matching mapping decides,
+    /// and the mount/symlink ops the mappings generate are applied in
+    /// mapping order. Matched paths appear at the same absolute path
+    /// inside the sandbox (`/etc/passwd` → `/etc/passwd`); matched
+    /// directories are mirrored recursively (or, when hidden, disappear
+    /// with their whole subtree). Nothing below an empty path is visible,
+    /// and empty paths are shown even when a mirror mapping (or the real
+    /// host path) covers them. Missing or empty mappings expose nothing.
     pub mappings: Vec<Mapping>,
 }
 
 impl HostFsConfig {
     /// The internal pattern → permission list, in spec order. The
     /// mount-point mappings (`dev`, `tmpfs`, `proc`, `bind`) contribute
-    /// an `empty` pattern for their path, exactly like [`Mapping::Empty`].
+    /// an `empty` pattern for their path, exactly like [`Mapping::Empty`];
+    /// `symlink` mappings contribute nothing (they touch only the sandbox
+    /// root, not the host filesystem).
     pub fn patterns(&self) -> Patterns {
         Patterns(
             self.mappings
                 .iter()
-                .map(|m| (m.pattern().to_string(), m.permission()))
+                .filter_map(|m| m.pattern().map(|p| (p.to_string(), m.permission())))
                 .collect(),
         )
     }
 
-    /// The mount ops the mappings stand for, in mapping order (only the
-    /// mount-point mappings contribute — see [`Mapping::op`]).
+    /// The ops the mappings stand for, in mapping order (only the
+    /// mount-point and symlink mappings contribute — see [`Mapping::op`]).
     pub fn ops(&self) -> Vec<Op> {
         self.mappings.iter().filter_map(Mapping::op).collect()
     }
@@ -341,6 +337,7 @@ impl HostFsConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::super::internal::SandboxConfig;
     use super::super::tests::parse;
     use super::*;
 
@@ -443,12 +440,10 @@ mod tests {
     #[test]
     fn hostfs_rejects_unknown_fields() {
         assert!(
-            serde_json::from_str::<crate::spec::Spec>(r#"{ "hostfs": { "nope": true } }"#)
-                .is_err()
+            serde_json::from_str::<crate::spec::Spec>(r#"{ "hostfs": { "nope": true } }"#).is_err()
         );
         assert!(
-            serde_json::from_str::<crate::spec::Spec>(r#"{ "hostfs": { "root": true } }"#)
-                .is_err()
+            serde_json::from_str::<crate::spec::Spec>(r#"{ "hostfs": { "root": true } }"#).is_err()
         );
     }
 
@@ -460,10 +455,12 @@ mod tests {
                 { "type": "tmpfs", "path": "/tmp", "perms": "1777", "size": 1048576 },
                 { "type": "tmpfs", "path": "/var/tmp" },
                 { "type": "proc", "path": "/proc" },
-                { "type": "bind", "path": "/usr" }
+                { "type": "bind", "src": "/usr" },
+                { "type": "bind", "src": "/opt/extra", "dest": "/extra" }
             ] } }"#,
         );
-        // The FUSE side sees an empty path for every mount-point mapping.
+        // The FUSE side sees an empty path for every mount-point mapping,
+        // at its sandbox destination.
         assert_eq!(
             spec.hostfs.patterns(),
             Patterns(vec![
@@ -472,6 +469,7 @@ mod tests {
                 ("/var/tmp".to_string(), Permission::Empty),
                 ("/proc".to_string(), Permission::Empty),
                 ("/usr".to_string(), Permission::Empty),
+                ("/extra".to_string(), Permission::Empty),
             ])
         );
         // The sandbox side gets the ops, in mapping order.
@@ -498,13 +496,52 @@ mod tests {
                     src: "/usr".to_string(),
                     dest: PathBuf::from("/usr")
                 },
+                Op::Bind {
+                    src: "/opt/extra".to_string(),
+                    dest: PathBuf::from("/extra")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn symlink_mapping_produces_only_an_op() {
+        // A symlink mapping touches only the sandbox root: it must not
+        // contribute anything to the hostfs patterns.
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "bind", "src": "/usr" },
+                { "type": "symlink", "src": "usr/lib", "dest": "/lib" },
+                { "type": "symlink", "src": "/etc/alternative/sh", "dest": "/bin/sh" }
+            ] } }"#,
+        );
+        assert_eq!(
+            spec.hostfs.patterns(),
+            Patterns(vec![("/usr".to_string(), Permission::Empty)])
+        );
+        assert_eq!(
+            spec.hostfs.ops(),
+            vec![
+                Op::Bind {
+                    src: "/usr".to_string(),
+                    dest: PathBuf::from("/usr")
+                },
+                Op::Symlink {
+                    src: "usr/lib".to_string(),
+                    dest: PathBuf::from("/lib")
+                },
+                Op::Symlink {
+                    src: "/etc/alternative/sh".to_string(),
+                    dest: PathBuf::from("/bin/sh")
+                },
             ]
         );
     }
 
     #[test]
     fn dev_and_proc_mappings_default_their_path() {
-        let spec = parse(r#"{ "hostfs": { "mappings": [ { "type": "dev" }, { "type": "proc" } ] } }"#);
+        let spec =
+            parse(r#"{ "hostfs": { "mappings": [ { "type": "dev" }, { "type": "proc" } ] } }"#);
         assert_eq!(
             spec.hostfs.patterns(),
             Patterns(vec![
@@ -526,11 +563,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_tmpfs_and_bind_require_a_path() {
+    fn empty_tmpfs_and_bind_require_a_src() {
         for mapping in [
             r#"{ "type": "empty" }"#,
             r#"{ "type": "tmpfs" }"#,
             r#"{ "type": "bind" }"#,
+            r#"{ "type": "symlink" }"#,
+            r#"{ "type": "symlink", "src": "usr/lib" }"#,
         ] {
             assert!(
                 serde_json::from_str::<crate::spec::Spec>(&format!(
@@ -548,7 +587,9 @@ mod tests {
             r#"{ "type": "dev", "path": "dev" }"#,
             r#"{ "type": "tmpfs", "path": "/tmp", "perms": "abc" }"#,
             r#"{ "type": "proc", "path": "/proc", "glob": "/proc" }"#,
-            r#"{ "type": "bind", "path": "/usr", "src": "/other" }"#,
+            r#"{ "type": "bind", "src": "/usr", "dest": "usr" }"#,
+            r#"{ "type": "bind", "src": "usr" }"#,
+            r#"{ "type": "symlink", "src": "usr/lib", "dest": "lib" }"#,
         ] {
             assert!(
                 serde_json::from_str::<crate::spec::Spec>(&format!(
@@ -561,19 +602,21 @@ mod tests {
     }
 
     #[test]
-    fn mapped_ops_run_before_explicit_ops() {
+    fn mapping_ops_are_applied_in_mapping_order() {
         let spec = parse(
-            r#"{ "ops": [ { "type": "symlink", "src": "usr/bin", "dest": "/bin" } ],
-                 "hostfs": { "mappings": [ { "type": "dev", "path": "/dev" } ] } }"#,
+            r#"{ "hostfs": { "mappings": [
+                 { "type": "dev", "path": "/dev" },
+                 { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
+             ] } }"#,
         );
         assert_eq!(
-            spec.filesystem_ops(),
+            SandboxConfig::compile(&spec).ops,
             vec![
-                // the dev mapping's op
+                // the dev mapping's op, first
                 Op::Dev {
                     dest: PathBuf::from("/dev")
                 },
-                // the explicit op, last
+                // the symlink mapping's op, second
                 Op::Symlink {
                     src: "usr/bin".to_string(),
                     dest: PathBuf::from("/bin")
@@ -583,10 +626,36 @@ mod tests {
     }
 
     #[test]
-    fn proc_mapping_mounts_procfs() {
-        let spec = parse(r#"{ "hostfs": { "mappings": [ { "type": "proc", "path": "/proc" } ] } }"#);
+    fn bind_mapping_accepts_the_deprecated_path_alias() {
+        // Old spec files use `{"type": "bind", "path": "/etc"}`: accepted
+        // as an alias for `src`, binding at the same path.
+        let spec = parse(r#"{ "hostfs": { "mappings": [ { "type": "bind", "path": "/etc" } ] } }"#);
         assert_eq!(
-            spec.filesystem_ops(),
+            spec.hostfs.ops(),
+            vec![Op::Bind {
+                src: "/etc".to_string(),
+                dest: PathBuf::from("/etc")
+            }]
+        );
+        assert_eq!(
+            spec.hostfs.patterns(),
+            Patterns(vec![("/etc".to_string(), Permission::Empty)])
+        );
+        // A relative `path` is rejected just like a relative `src`.
+        assert!(
+            serde_json::from_str::<crate::spec::Spec>(
+                r#"{ "hostfs": { "mappings": [ { "type": "bind", "path": "etc" } ] } }"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn proc_mapping_mounts_procfs() {
+        let spec =
+            parse(r#"{ "hostfs": { "mappings": [ { "type": "proc", "path": "/proc" } ] } }"#);
+        assert_eq!(
+            SandboxConfig::compile(&spec).ops,
             vec![Op::Proc {
                 dest: PathBuf::from("/proc")
             }]
@@ -594,6 +663,6 @@ mod tests {
         // And without any mount-point mapping, no procfs (and nothing
         // else) is mounted.
         let spec = parse(r#"{ "hostfs": { "mappings": [ { "type": "ro", "glob": "/etc" } ] } }"#);
-        assert_eq!(spec.filesystem_ops(), vec![]);
+        assert_eq!(SandboxConfig::compile(&spec).ops, vec![]);
     }
 }

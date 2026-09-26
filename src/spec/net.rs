@@ -33,6 +33,6 @@ mod tests {
         let spec = parse("{}");
         assert_eq!(spec, crate::spec::Spec::default());
         assert!(!spec.net.isolated);
-        assert_eq!(spec.ops, Vec::new());
+        assert_eq!(spec.hostfs.mappings.len(), 0);
     }
 }

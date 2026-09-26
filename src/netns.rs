@@ -34,12 +34,12 @@ use crate::proxy::{PROXY_ADDR, PROXY_URL};
 use crate::sandbox::{
     die, die_with_error, exit_with_status, pidns_and_exec, userns_id, write_id_map,
 };
-use crate::spec::{NetConfig, Op};
+use crate::spec::internal::{Net, Op};
 
 /// Temporary host directory holding the proxy socket. It is bind-mounted
 /// at /net inside the sandbox so that the (network-isolated) child can
 /// reach the connector.
-pub unsafe fn run(ops: &[Op], command: &[String], net: &NetConfig) -> ! {
+pub unsafe fn run(ops: &[Op], command: &[String], net: &Net) -> ! {
     unsafe {
         let netdir = create_socket_dir();
         let listener = match StdUnixListener::bind(netdir.join("sock")) {
@@ -82,7 +82,7 @@ pub unsafe fn run(ops: &[Op], command: &[String], net: &NetConfig) -> ! {
 /// P: owns the sandbox network namespace and runs the HTTP CONNECT proxy on
 /// 127.0.0.2. Forks C for the filesystem sandbox and exec, then reports C's
 /// exit status.
-unsafe fn isolated_parent(netdir: &Path, net: &NetConfig, ops: &[Op], command: &[String]) -> ! {
+unsafe fn isolated_parent(netdir: &Path, net: &Net, ops: &[Op], command: &[String]) -> ! {
     unsafe {
         // Prevent gaining privileges via execve of setuid binaries. C inherits
         // this, which is what matters (C is the process that execs).

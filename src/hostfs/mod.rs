@@ -68,7 +68,7 @@ use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::sandbox::die_with_error;
-use crate::spec::hostfs::{Patterns, Permission};
+use crate::spec::internal::{Patterns, Permission};
 
 mod pattern;
 use pattern::{Pattern, Walk};
@@ -392,7 +392,10 @@ impl HostFs {
     /// its precedence; empty paths that live directly under the directory
     /// are always shown. Async: it reads and stats the real host
     /// directory (`tokio::fs`).
-    async fn dir_entries(&self, host: &Path) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
+    async fn dir_entries(
+        &self,
+        host: &Path,
+    ) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
         // A directory named by a mirrored pattern itself is a recursive
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
@@ -715,7 +718,10 @@ impl PathFilesystem for HostFs {
         if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host).await {
             return Err(libc::ENOENT.into());
         }
-        let entries: Vec<_> = self.dir_entries(&host).await.into_iter()
+        let entries: Vec<_> = self
+            .dir_entries(&host)
+            .await
+            .into_iter()
             .skip(offset.max(0) as usize)
             .enumerate()
             .map(|(i, (name, attr))| {
@@ -747,7 +753,10 @@ impl PathFilesystem for HostFs {
         if !self.exists(&host) || !is_root(path) && !self.is_listable_dir(&host).await {
             return Err(libc::ENOENT.into());
         }
-        let entries: Vec<_> = self.dir_entries(&host).await.into_iter()
+        let entries: Vec<_> = self
+            .dir_entries(&host)
+            .await
+            .into_iter()
             .skip(offset as usize)
             .enumerate()
             .map(|(i, (name, attr))| {
@@ -777,8 +786,7 @@ impl PathFilesystem for HostFs {
         // Empty paths (and purely virtual ancestors) are unwritable by
         // definition; answer directly instead of asking the real filesystem.
         if self.is_empty(&host)
-            || self.is_empty_prefix(&host)
-                && tokio_fs::symlink_metadata(&host).await.is_err()
+            || self.is_empty_prefix(&host) && tokio_fs::symlink_metadata(&host).await.is_err()
         {
             if mask & libc::W_OK as u32 != 0 {
                 return Err(libc::EACCES.into());
@@ -862,7 +870,12 @@ impl PathFilesystem for HostFs {
             // errno is per-thread: capture the error on the blocking thread.
             blocking(move || {
                 if unsafe {
-                    libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+                    libc::utimensat(
+                        libc::AT_FDCWD,
+                        cpath.as_ptr(),
+                        times.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
                 } != 0
                 {
                     Err(std::io::Error::last_os_error())
@@ -905,10 +918,7 @@ impl PathFilesystem for HostFs {
         .await
         .map_err(fuse3::Errno::from)?;
         let attr = self.attr(&host).await?;
-        Ok(ReplyEntry {
-            ttl: TTL,
-            attr,
-        })
+        Ok(ReplyEntry { ttl: TTL, attr })
     }
 
     async fn unlink(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
@@ -925,7 +935,8 @@ impl PathFilesystem for HostFs {
         }
         tokio_fs::remove_file(&host).await?;
         Ok(())
-    }    async fn rmdir(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
+    }
+    async fn rmdir(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
         let host = self.host_path(parent).join(name);
         if self.is_empty(&host) {
             return Err(libc::EACCES.into());
@@ -1031,7 +1042,7 @@ fn ts_to_timespec(ts: Option<Timestamp>) -> libc::timespec {
 ///
 /// On success the mountpoint path is stored in `HOST_MOUNT_POINT` (inherited
 /// by every later fork). On any failure the process dies.
-pub fn start_host_fs(patterns: &crate::spec::hostfs::Patterns) {
+pub fn start_host_fs(patterns: &crate::spec::internal::Patterns) {
     // Create the mountpoint directory in the parent so both the server and the
     // sandbox (and its children) can agree on a stable path.
     let mut tmpl: Vec<u8> = b"/tmp/rs-bubble.host.XXXXXX".to_vec();
@@ -1096,12 +1107,11 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let outcome = {
         let mp = mountpoint.clone();
         runtime.block_on(async move {
-            let handle = match mount_with_fallback(&mp, uid, gid, &fs, !fs.has_writable_patterns())
-                .await
-            {
-                Ok(handle) => handle,
-                Err(e) => return Err(e),
-            };
+            let handle =
+                match mount_with_fallback(&mp, uid, gid, &fs, !fs.has_writable_patterns()).await {
+                    Ok(handle) => handle,
+                    Err(e) => return Err(e),
+                };
 
             // Signal readiness to the parent.
             let byte: u8 = 1;
@@ -1224,7 +1234,10 @@ mod tests {
         assert!(f.exists(Path::new("/dev")));
         assert!(f.is_empty(Path::new("/dev")));
         assert_eq!(block(f.attr(Path::new("/dev"))).unwrap().perm, 0o555);
-        assert_eq!(block(f.attr(Path::new("/dev"))).unwrap().kind, FileType::Directory);
+        assert_eq!(
+            block(f.attr(Path::new("/dev"))).unwrap().kind,
+            FileType::Directory
+        );
         // ...and it is empty even though the real host /dev has entries.
         assert!(block(f.dir_entries(Path::new("/dev"))).is_empty());
         // Deeper paths are shadowed by the precedence.
@@ -1306,10 +1319,7 @@ mod tests {
     fn empty_paths_coexist_with_mirror() {
         // /dev is empty, /etc/passwd is mirrored normally; siblings of the
         // empty path are listed together with it.
-        let f = fs(&[
-            ("/etc/passwd", Permission::Ro),
-            ("/dev", Permission::Empty),
-        ]);
+        let f = fs(&[("/etc/passwd", Permission::Ro), ("/dev", Permission::Empty)]);
         let names: Vec<_> = block(f.dir_entries(Path::new("/")))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
@@ -1400,10 +1410,7 @@ mod tests {
         assert!(!names.contains(&"c.conf.dir".to_string()));
 
         // An entry that only leads to a match (virtual ancestor) is shown.
-        let f = fs(&[(
-            &format!("{}/c.conf.dir/x", base.display()),
-            Permission::Ro,
-        )]);
+        let f = fs(&[(&format!("{}/c.conf.dir/x", base.display()), Permission::Ro)]);
         let names: Vec<_> = block(f.dir_entries(&base))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
@@ -1450,10 +1457,7 @@ mod tests {
     #[test]
     fn last_matching_pattern_wins() {
         // The later hide hides the file inside the mirrored tree...
-        let f = fs(&[
-            ("/etc", Permission::Ro),
-            ("/etc/passwd", Permission::Hide),
-        ]);
+        let f = fs(&[("/etc", Permission::Ro), ("/etc/passwd", Permission::Hide)]);
         assert!(f.exists(Path::new("/etc")));
         assert!(!f.exists(Path::new("/etc/passwd")));
         assert!(!f.matches(Path::new("/etc/passwd")));
@@ -1461,10 +1465,7 @@ mod tests {
         // the last pattern that names a path decides. "/etc/passwd" is
         // still hidden (its own hide pattern is the only one naming it),
         // but a sibling is visible via the later recursive mirror.
-        let f = fs(&[
-            ("/etc/passwd", Permission::Hide),
-            ("/etc", Permission::Ro),
-        ]);
+        let f = fs(&[("/etc/passwd", Permission::Hide), ("/etc", Permission::Ro)]);
         assert!(!f.exists(Path::new("/etc/passwd")));
         assert!(f.exists(Path::new("/etc/hosts")));
     }
@@ -1527,10 +1528,7 @@ mod tests {
 
     #[test]
     fn rw_directories_are_recursively_writable() {
-        let f = fs(&[
-            ("/proj", Permission::Rw),
-            ("/proj/secret", Permission::Ro),
-        ]);
+        let f = fs(&[("/proj", Permission::Rw), ("/proj/secret", Permission::Ro)]);
         // Children of an exactly-named rw dir inherit its permission.
         assert!(f.writable(Path::new("/proj/newfile")));
         assert!(f.writable(Path::new("/proj/sub/x")));
@@ -1570,8 +1568,9 @@ mod tests {
     #[test]
     fn writable_patterns_are_detected_for_the_mount_options() {
         assert!(!fs(&[("/etc", Permission::Ro)]).has_writable_patterns());
-        assert!(fs(&[("/etc", Permission::Ro), ("/tmp/x", Permission::Rw)])
-            .has_writable_patterns());
+        assert!(
+            fs(&[("/etc", Permission::Ro), ("/tmp/x", Permission::Rw)]).has_writable_patterns()
+        );
         assert!(!fs(&[]).has_writable_patterns());
     }
 }

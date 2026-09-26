@@ -3,9 +3,11 @@
 //! Module layout (who is allowed to do what):
 //!
 //! * `cli`     — argument parsing only (clap derive); no side effects.
-//! * `spec`    — the sandbox spec file (JSON): mount operations and
-//!   network configuration. Parsing only; no side effects beyond reading
-//!   the file.
+//! * `spec`    — the sandbox spec file (JSON), in two layers: the
+//!   config-file view (`spec`, `hostfs`, `net`, `tmpfs`) and the internal
+//!   configuration (`spec::internal`) the sandbox machinery runs with,
+//!   compiled down from the parsed file. Parsing only; no side effects
+//!   beyond reading the file.
 //! * `sandbox` — the privileged filesystem part: user/mount namespaces,
 //!   tmpfs root, bind mounts, symlinks, proc, exec. Never touches the
 //!   network.
@@ -46,25 +48,25 @@ fn main() {
         sandbox::die("No command given; usage: rs-bubble [--spec FILE] -- COMMAND [args...]");
     }
 
+    // Compile the config-file spec down into the internal configuration
+    // (ops, hostfs patterns, net settings) the sandbox machinery runs with.
+    let sandbox = spec::internal::SandboxConfig::compile(&spec);
+
     // Start the host FUSE filesystem server (in its own child process) before
     // any namespace setup: its filesystem becomes the sandbox root, with the
     // ops (dev, tmpfs, proc, binds) mounted on top of it. Only when the spec
     // actually exposes something: a sandbox without any hostfs mappings must
     // not depend on (or fail for the lack of) FUSE.
-    let patterns = spec.hostfs.patterns();
-    if !patterns.is_empty() {
+    if !sandbox.patterns.is_empty() {
         hostfs::set_root_mode(true);
-        hostfs::start_host_fs(&patterns);
+        hostfs::start_host_fs(&sandbox.patterns);
     }
 
-    let net = &spec.net;
-    let ops = spec.filesystem_ops();
-
     unsafe {
-        if net.isolated {
-            netns::run(&ops, &command, net);
+        if sandbox.net.isolated {
+            netns::run(&sandbox.ops, &command, &sandbox.net);
         } else {
-            sandbox::setup_and_exec(&ops, &command);
+            sandbox::setup_and_exec(&sandbox.ops, &command);
         }
     }
 }

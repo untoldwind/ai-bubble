@@ -1,138 +1,39 @@
-//! The sandbox specification file (JSON).
+//! The sandbox specification: its **config-file** view and its
+//! **internal** representation.
 //!
-//! Everything that used to be configured on the command line — the mount
-//! operations and the isolated-network settings — now lives in a single
-//! spec file. The default location is `.rs-bubble.json` in the current
-//! directory; `--spec FILE` on the command line overrides it.
+//! The module is split into two deliberately separate layers:
 //!
-//! A JSON Schema for this format is generated from this very file at
-//! build time (see `build.rs`): all the serde attributes are honored,
+//! * The config file — [`file::Spec`] and its sections ([`hostfs`],
+//!   [`net`], [`tmpfs`]): everything that maps 1:1 onto what the user
+//!   writes in the JSON spec file (`.rs-bubble.json`, or `--spec FILE`).
+//!   These types carry the serde and JSON-schema attributes and are
+//!   documented for the file format.
+//! * The internal configuration — [`internal`]: what the sandbox
+//!   machinery (`crate::sandbox`, `crate::hostfs`, `crate::netns`)
+//!   actually runs with, compiled down from the parsed file by
+//!   [`internal::SandboxConfig::compile`]. Internal code never touches
+//!   the config-file types.
+//!
+//! A JSON Schema for the config file is generated from these very files
+//! at build time (see `build.rs`): all the serde attributes are honored,
 //! and `TmpfsPerms`' hand-written deserializer is described manually in
 //! its `JsonSchema` impl. The main crate embeds the generated schema as
 //! `crate::SPEC_SCHEMA` and prints it via `--print-schema`, so editors
 //! can validate and auto-complete spec files against it.
-//!
-//! Format:
-//!
-//! ```json
-//! {
-//!   "hostfs": { "mappings": [
-//!     { "type": "ro",    "glob": "/usr" },
-//!     { "type": "bind",  "path": "/etc" },
-//!     { "type": "dev" },
-//!     { "type": "tmpfs", "path": "/tmp", "perms": "1777", "size": 1048576 }
-//!   ] },
-//!   "net": { "isolated": true, "allow": ["example.com:443"] }
-//! }
-//! ```
-//!
-//! All fields are optional: without `net.isolated` the command shares the
-//! host network. `allow` is the proxy allow-list; an empty list (or a
-//! missing `allow`) allows every target. Nothing is mounted
-//! automatically: procfs only appears where the spec asks for it (a
-//! `proc` mapping or `proc` op). The `hostfs` mappings make the FUSE
-//! filesystem the sandbox root — `ro`/`rw`/`hide` mirror or hide host
-//! paths, while the mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`,
-//! `bind`) expose a path empty *and* stack the corresponding mount op on
-//! top of it. Without any mappings the sandbox gets a plain tmpfs root and
-//! no FUSE filesystem is started.
 
+pub mod file;
 pub mod hostfs;
+pub mod internal;
 pub mod net;
-pub mod op;
 pub mod tmpfs;
 
-use std::path::Path;
-
-use serde::Deserialize;
-
-use schemars::JsonSchema;
-
-pub use self::hostfs::HostFsConfig;
-pub use self::net::NetConfig;
-pub use self::op::Op;
-pub use self::tmpfs::TmpfsPerms;
-
-/// The default spec file, looked up relative to the current directory.
-pub const DEFAULT_SPEC: &str = ".rs-bubble.json";
-
-/// The whole sandbox specification.
-#[derive(Debug, Default, PartialEq, Deserialize, JsonSchema)]
-#[serde(default, deny_unknown_fields)]
-pub struct Spec {
-    /// The explicit mount operations, applied **after** the ops generated
-    /// by the `hostfs` mappings (see [`Spec::filesystem_ops`]). Kept for
-    /// everything that cannot be expressed as a mapping — symlinks, or a
-    /// bind from a *different* source path.
-    pub ops: Vec<Op>,
-    /// Isolated-network configuration.
-    pub net: NetConfig,
-    /// The host filesystem: it is always the sandbox root, exposing the
-    /// paths selected by its mappings.
-    pub hostfs: HostFsConfig,
-    /// Accepted for editor tooling only: it names the JSON schema
-    /// (`--print-schema`) so the spec file can get completion and
-    /// validation. Never serialized back out.
-    #[serde(rename = "$schema", default, skip_serializing)]
-    pub schema: Option<String>,
-}
-
-impl Spec {
-    /// Load the spec from `path` (typically `--spec FILE` or the default
-    /// `.rs-bubble.json`). A missing default file is fine: an empty spec
-    /// (empty root, no mounts, host network) is used in that case,
-    /// while an explicit `--spec` file that cannot be read is a hard error.
-    pub fn load(explicit: Option<&Path>) -> Spec {
-        match explicit {
-            Some(path) => Self::read(path),
-            None => {
-                let path = Path::new(DEFAULT_SPEC);
-                if path.exists() {
-                    Self::read(path)
-                } else {
-                    Spec::default()
-                }
-            }
-        }
-    }
-
-    fn read(path: &Path) -> Spec {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) => crate::sandbox::die(&format!("Can't read spec file {}: {e}", path.display())),
-        };
-        match serde_json::from_str(&text) {
-            Ok(spec) => spec,
-            Err(e) => crate::sandbox::die(&format!("Invalid spec file {}: {e}", path.display())),
-        }
-    }
-
-    /// The filesystem setup operations.
-    ///
-    /// The ops come from two places, applied in this order:
-    ///
-    /// 1. the ops generated by the `hostfs.mappings` (the mount-point
-    ///    mappings `dev`, `tmpfs`, `proc` and `bind` — see
-    ///    [`HostFsConfig::ops`]), in mapping order,
-    /// 2. the explicit `ops` list (kept for everything that cannot be
-    ///    expressed as a mapping, e.g. symlinks or a bind from a
-    ///    *different* source path).
-    ///
-    /// Nothing is mounted automatically — in particular, procfs is only
-    /// mounted when the spec says so: a `proc` mapping (or a `proc` op)
-    /// chooses where (and whether at all) a fresh procfs instance appears.
-    pub fn filesystem_ops(&self) -> Vec<Op> {
-        self.hostfs
-            .ops()
-            .into_iter()
-            .chain(self.ops.iter().cloned())
-            .collect()
-    }
-}
+pub use self::file::Spec;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
+    use super::file::Spec;
+    use super::internal::{Op, SandboxConfig};
+    use super::tmpfs::TmpfsPerms;
     use std::path::PathBuf;
 
     /// Parse a spec file from a JSON snippet, like `serde_json::from_str`.
@@ -140,49 +41,49 @@ pub(crate) mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    /// The compiled-down ops of a spec file snippet.
+    pub(crate) fn compile_ops(json: &str) -> Vec<Op> {
+        SandboxConfig::compile(&parse(json)).ops
+    }
+
     #[test]
-    fn ops_preserve_spec_order() {
-        let spec = parse(
-            r#"{
-                "ops": [
-                    { "type": "symlink", "src": "x", "dest": "/a" },
-                    { "type": "bind", "src": "/usr", "dest": "/usr" },
-                    { "type": "symlink", "src": "y", "dest": "/b" }
-                ]
-            }"#,
-        );
-        assert_eq!(spec.net, NetConfig::default());
-        assert_eq!(spec.ops.len(), 3);
+    fn mapping_ops_preserve_spec_order() {
+        // Every op comes from the mappings, applied in mapping order.
         assert_eq!(
-            spec.ops[0],
-            Op::Symlink {
-                src: "x".into(),
-                dest: PathBuf::from("/a")
-            }
-        );
-        assert_eq!(
-            spec.ops[1],
-            Op::Bind {
-                src: "/usr".into(),
-                dest: PathBuf::from("/usr")
-            }
-        );
-        assert_eq!(
-            spec.ops[2],
-            Op::Symlink {
-                src: "y".into(),
-                dest: PathBuf::from("/b")
-            }
+            compile_ops(
+                r#"{
+                    "hostfs": { "mappings": [
+                        { "type": "symlink", "src": "x", "dest": "/a" },
+                        { "type": "bind", "src": "/usr" },
+                        { "type": "symlink", "src": "y", "dest": "/b" }
+                    ] }
+                }"#
+            ),
+            vec![
+                Op::Symlink {
+                    src: "x".into(),
+                    dest: PathBuf::from("/a")
+                },
+                Op::Bind {
+                    src: "/usr".into(),
+                    dest: PathBuf::from("/usr")
+                },
+                Op::Symlink {
+                    src: "y".into(),
+                    dest: PathBuf::from("/b")
+                },
+            ]
         );
     }
 
     #[test]
-    fn explicit_proc_op_relocates_procfs() {
-        // Procfs only appears where the spec asks for it: a proc op (or a
-        // proc mapping) chooses where — and whether at all.
-        let spec = parse(r#"{ "ops": [ { "type": "proc", "dest": "/sys/proc" } ] }"#);
+    fn proc_mapping_relocates_procfs() {
+        // Procfs only appears where the spec asks for it: a proc mapping
+        // chooses where — and whether at all.
         assert_eq!(
-            spec.filesystem_ops(),
+            compile_ops(
+                r#"{ "hostfs": { "mappings": [ { "type": "proc", "path": "/sys/proc" } ] } }"#
+            ),
             vec![Op::Proc {
                 dest: PathBuf::from("/sys/proc")
             }]
@@ -190,23 +91,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn no_proc_mount_without_a_proc_mapping_or_op() {
-        // Neither an explicit ops list nor mappings mount procfs on their
-        // own: no default /proc mount happens.
-        let spec = parse(r#"{ "ops": [ { "type": "bind", "src": "/usr", "dest": "/usr" } ] }"#);
-        assert_eq!(spec.filesystem_ops().len(), 1);
-        let spec = parse(
-            r#"{ "hostfs": { "mappings": [ { "type": "dev", "path": "/dev" } ] } }"#,
+    fn no_proc_mount_without_a_proc_mapping() {
+        // Mappings mount procfs only when asked: no default /proc mount
+        // happens.
+        assert_eq!(
+            compile_ops(r#"{ "hostfs": { "mappings": [ { "type": "bind", "src": "/usr" } ] } }"#)
+                .len(),
+            1
         );
-        assert_eq!(spec.filesystem_ops().len(), 1);
+        assert_eq!(
+            compile_ops(r#"{ "hostfs": { "mappings": [ { "type": "dev", "path": "/dev" } ] } }"#)
+                .len(),
+            1
+        );
     }
 
     #[test]
-    fn tmpfs_options() {
+    fn tmpfs_mapping_options() {
         // Default mode is 0755, like bwrap's --tmpfs.
-        let spec = parse(r#"{ "ops": [ { "type": "tmpfs", "dest": "/tmp" } ] }"#);
         assert_eq!(
-            spec.ops,
+            compile_ops(r#"{ "hostfs": { "mappings": [ { "type": "tmpfs", "path": "/tmp" } ] } }"#),
             vec![Op::Tmpfs {
                 dest: PathBuf::from("/tmp"),
                 perms: None,
@@ -215,55 +119,45 @@ pub(crate) mod tests {
         );
 
         // perms and size are accepted as octal number or string.
-        let spec = parse(
-            r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "0700", "size": 1048576 } ] }"#,
-        );
         assert_eq!(
-            spec.ops[0],
-            Op::Tmpfs {
+            compile_ops(
+                r#"{ "hostfs": { "mappings": [ { "type": "tmpfs", "path": "/x", "perms": "0700", "size": 1048576 } ] } }"#
+            ),
+            vec![Op::Tmpfs {
                 dest: PathBuf::from("/x"),
                 perms: Some(TmpfsPerms(0o700)),
                 size: Some(1048576)
-            }
+            }]
         );
-        let spec = parse(r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": 700 } ] }"#);
         assert_eq!(
-            spec.ops[0],
-            Op::Tmpfs {
+            compile_ops(
+                r#"{ "hostfs": { "mappings": [ { "type": "tmpfs", "path": "/x", "perms": 700 } ] } }"#
+            ),
+            vec![Op::Tmpfs {
                 dest: PathBuf::from("/x"),
                 perms: Some(TmpfsPerms(0o700)),
                 size: None
-            }
+            }]
         );
     }
 
     #[test]
-    fn tmpfs_rejects_bad_perms() {
-        assert!(
-            serde_json::from_str::<Spec>(
-                r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "abc" } ] }"#
-            )
-            .is_err()
-        );
-        assert!(
-            serde_json::from_str::<Spec>(
-                r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "999" } ] }"#
-            )
-            .is_err()
-        );
-        assert!(
-            serde_json::from_str::<Spec>(
-                r#"{ "ops": [ { "type": "tmpfs", "dest": "/x", "perms": "777777777777" } ] }"#
-            )
-            .is_err()
-        );
+    fn tmpfs_mapping_rejects_bad_perms() {
+        for perms in ["\"abc\"", "\"999\"", "\"777777777777\""] {
+            assert!(
+                serde_json::from_str::<Spec>(&format!(
+                    r#"{{ "hostfs": {{ "mappings": [ {{ "type": "tmpfs", "path": "/x", "perms": {perms} }} ] }} }}"#
+                ))
+                .is_err(),
+                "should reject perms {perms}"
+            );
+        }
     }
 
     #[test]
-    fn dev_op_parses() {
-        let spec = parse(r#"{ "ops": [ { "type": "dev", "dest": "/dev" } ] }"#);
+    fn dev_mapping_parses() {
         assert_eq!(
-            spec.ops,
+            compile_ops(r#"{ "hostfs": { "mappings": [ { "type": "dev", "path": "/dev" } ] } }"#),
             vec![Op::Dev {
                 dest: PathBuf::from("/dev")
             }]
@@ -274,14 +168,15 @@ pub(crate) mod tests {
     fn unknown_fields_are_rejected() {
         assert!(serde_json::from_str::<Spec>(r#"{ "nope": true }"#).is_err());
         // The top-level "proc" field is gone: procfs is configured with a
-        // `proc` mapping (or op) instead.
+        // `proc` mapping instead.
         assert!(serde_json::from_str::<Spec>(r#"{ "proc": "/proc" }"#).is_err());
+        // So is the top-level "ops" array: everything is a mapping now.
+        assert!(serde_json::from_str::<Spec>(r#"{ "ops": [] }"#).is_err());
     }
 
     #[test]
     fn schema_key_is_accepted_but_ignored() {
-        let spec = parse(r#"{ "$schema": "./rs-bubble.spec.schema.json", "ops": [] }"#);
-        assert!(spec.ops.is_empty());
+        let spec = parse(r#"{ "$schema": "./rs-bubble.spec.schema.json" }"#);
         assert_eq!(spec.schema.as_deref(), Some("./rs-bubble.spec.schema.json"));
         // It must be advertised in the generated schema (it's a real
         // field with skip_serializing), so editors accept it.
@@ -290,20 +185,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn embedded_schema_is_valid_json_and_covers_all_op_types() {
+    fn embedded_schema_is_valid_json_and_covers_all_mapping_types() {
         let schema: serde_json::Value = serde_json::from_str(crate::SPEC_SCHEMA).unwrap();
         assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
         assert_eq!(schema["title"], "rs-bubble sandbox spec");
-        // The ops are a "type"-tagged enum: every variant's tag must show
-        // up in the generated schema.
-        for tag in ["bind", "symlink", "proc", "dev", "tmpfs"] {
-            assert!(
-                crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")),
-                "{tag} missing from schema"
-            );
-        }
-        // So are the hostfs mappings.
-        for tag in ["ro", "rw", "hide", "empty", "bind"] {
+        // The mappings are a "type"-tagged enum: every variant's tag must
+        // show up in the generated schema.
+        for tag in [
+            "ro", "rw", "hide", "empty", "dev", "tmpfs", "proc", "bind", "symlink",
+        ] {
             assert!(
                 crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")),
                 "{tag} mapping missing from schema"
@@ -315,8 +205,6 @@ pub(crate) mod tests {
         // The hand-written TmpfsPerms schema is inlined, not a $ref.
         assert!(crate::SPEC_SCHEMA.contains(r#""pattern": "^[0-7]{1,4}$""#));
         assert_eq!(schema["$defs"], serde_json::Value::Null);
-        // The op variants are described in a referenced definition.
-        assert!(schema["definitions"]["Op"]["oneOf"].is_array());
     }
 
     #[test]

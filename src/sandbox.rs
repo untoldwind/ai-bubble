@@ -13,7 +13,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use crate::spec::{Op, TmpfsPerms};
+use crate::spec::internal::Op;
+use crate::spec::tmpfs::TmpfsPerms;
 
 pub(crate) fn die(msg: &str) -> ! {
     eprintln!("rs-bubble: {msg}");
