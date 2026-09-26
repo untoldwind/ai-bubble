@@ -53,7 +53,7 @@
       "additionalProperties": false
     },
     "Mapping": {
-      "description": "The spec's `hostfs.mappings` setting: an *ordered* list of mappings, each selecting host paths for one treatment.\n\nA `ro`, `rw` or `hide` mapping selects paths with a **glob** pattern of absolute host paths; every other mapping names a single absolute host **path** exactly (it makes no sense to glob a mount point). The list order matters: when a path matches several mappings, the **last** matching mapping decides.\n\nThe mount-point mappings (`dev`, `tmpfs`, `proc`, `bind`) are shorthand for an `empty` mapping *plus* the corresponding mount op (see [`Mapping::op`]): the FUSE filesystem exposes the path empty so it can be mounted on, and the sandbox stacks the real mount on top of it.",
+      "description": "The spec's `hostfs.mappings` setting: an *ordered* list of mappings, each selecting host paths for one treatment.\n\nA `ro`, `rw` or `hide` mapping selects paths with a **glob** pattern of absolute host paths; every other mapping names a single absolute host **path** exactly (it makes no sense to glob a mount point). The `dev` and `proc` mappings default their path to `/dev` and `/proc`. The list order matters: when a path matches several mappings, the **last** matching mapping decides.\n\nThe mount-point mappings (`dev`, `tmpfs`, `proc`, `bind`) are shorthand for an `empty` mapping *plus* the corresponding mount op (see [`Mapping::op`]): the FUSE filesystem exposes the path empty so it can be mounted on, and the sandbox stacks the real mount on top of it.",
       "oneOf": [
         {
           "description": "The matched paths are mirrored **read-only**.",
@@ -140,15 +140,15 @@
           "additionalProperties": false
         },
         {
-          "description": "Shorthand for `empty` at `path` **plus** a minimal `/dev` mount (like bwrap's `--dev`) on top of it.",
+          "description": "Shorthand for `empty` at `path` **plus** a minimal `/dev` mount (like bwrap's `--dev`) on top of it. `path` defaults to `/dev`.",
           "type": "object",
           "required": [
-            "path",
             "type"
           ],
           "properties": {
             "path": {
               "description": "An absolute host path, named exactly (no wildcards).",
+              "default": "/dev",
               "type": "string"
             },
             "type": {
@@ -213,15 +213,15 @@
           "additionalProperties": false
         },
         {
-          "description": "Shorthand for `empty` at `path` **plus** a fresh procfs instance (showing only the sandbox's own processes) on top of it.",
+          "description": "Shorthand for `empty` at `path` **plus** a fresh procfs instance (showing only the sandbox's own processes) on top of it. `path` defaults to `/proc`.",
           "type": "object",
           "required": [
-            "path",
             "type"
           ],
           "properties": {
             "path": {
               "description": "An absolute host path, named exactly (no wildcards).",
+              "default": "/proc",
               "type": "string"
             },
             "type": {

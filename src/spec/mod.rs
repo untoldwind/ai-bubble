@@ -19,7 +19,7 @@
 //!   "hostfs": { "mappings": [
 //!     { "type": "ro",    "glob": "/usr" },
 //!     { "type": "bind",  "path": "/etc" },
-//!     { "type": "dev",   "path": "/dev" },
+//!     { "type": "dev" },
 //!     { "type": "tmpfs", "path": "/tmp", "perms": "1777", "size": 1048576 }
 //!   ] },
 //!   "net": { "isolated": true, "allow": ["example.com:443"] }

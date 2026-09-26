@@ -18,7 +18,7 @@ root, no mounts at all (not even procfs), and the host network.
   "hostfs": { "mappings": [
     { "type": "ro",    "glob": "/usr" },
     { "type": "bind",  "path": "/etc" },
-    { "type": "dev",   "path": "/dev" },
+    { "type": "dev" },
     { "type": "tmpfs", "path": "/tmp", "perms": "1777" }
   ] },
   "net": { "isolated": true, "allow": ["example.com:443"] }
@@ -31,8 +31,9 @@ root, no mounts at all (not even procfs), and the host network.
   name a single absolute path (`"path"`) exactly and do two things at
   once: expose the path empty in the host filesystem (a mount point) and
   stack the corresponding mount op on top of it inside the sandbox —
-  `dev` a minimal `/dev`, `tmpfs` a fresh tmpfs (with optional `perms`
-  and `size`, like the tmpfs op), `proc` a fresh procfs instance, and
+  `dev` a minimal `/dev` (defaulting to `path: "/dev"`), `tmpfs` a fresh
+  tmpfs (with optional `perms` and `size`, like the tmpfs op), `proc` a
+  fresh procfs instance (defaulting to `path: "/proc"`), and
   `bind` the real host directory. The generated ops are applied in
   mapping order, **before** the explicit `ops` (which stay available for
   what a mapping cannot express: symlinks, or a bind from a different
@@ -275,9 +276,9 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
       { "type": "ro", "glob": "/lib" },
       { "type": "ro", "glob": "/lib64" },
       { "type": "ro", "glob": "/usr" },
-      { "type": "dev", "path": "/dev" },
+      { "type": "dev" },
       { "type": "tmpfs", "path": "/tmp", "perms": "1777" },
-      { "type": "proc", "path": "/proc" }
+      { "type": "proc" }
     ]
   }
 }

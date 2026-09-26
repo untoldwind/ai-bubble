@@ -67,7 +67,8 @@ impl fmt::Display for Permission {
 ///
 /// A `ro`, `rw` or `hide` mapping selects paths with a **glob** pattern of
 /// absolute host paths; every other mapping names a single absolute host
-/// **path** exactly (it makes no sense to glob a mount point).
+/// **path** exactly (it makes no sense to glob a mount point). The `dev`
+/// and `proc` mappings default their path to `/dev` and `/proc`.
 /// The list order matters: when a path matches several mappings, the
 /// **last** matching mapping decides.
 ///
@@ -103,9 +104,10 @@ pub enum Mapping {
         path: String,
     },
     /// Shorthand for `empty` at `path` **plus** a minimal `/dev` mount
-    /// (like bwrap's `--dev`) on top of it.
+    /// (like bwrap's `--dev`) on top of it. `path` defaults to `/dev`.
     Dev {
         /// An absolute host path, named exactly (no wildcards).
+        #[serde(default = "default_dev_path")]
         path: String,
     },
     /// Shorthand for `empty` at `path` **plus** a fresh tmpfs (like
@@ -120,9 +122,11 @@ pub enum Mapping {
         size: Option<u64>,
     },
     /// Shorthand for `empty` at `path` **plus** a fresh procfs instance
-    /// (showing only the sandbox's own processes) on top of it.
+    /// (showing only the sandbox's own processes) on top of it. `path`
+    /// defaults to `/proc`.
     Proc {
         /// An absolute host path, named exactly (no wildcards).
+        #[serde(default = "default_proc_path")]
         path: String,
     },
     /// Shorthand for `empty` at `path` **plus** a bind mount of the real
@@ -133,6 +137,16 @@ pub enum Mapping {
     },
 }
 
+/// The default path of the `dev` mapping's mount point.
+fn default_dev_path() -> String {
+    "/dev".to_string()
+}
+
+/// The default path of the `proc` mapping's mount point.
+fn default_proc_path() -> String {
+    "/proc".to_string()
+}
+
 /// The mapping as it is written in the spec file, before validation.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
@@ -141,13 +155,19 @@ enum UncheckedMapping {
     Rw { glob: String },
     Hide { glob: String },
     Empty { path: String },
-    Dev { path: String },
+    Dev {
+        #[serde(default = "default_dev_path")]
+        path: String,
+    },
     Tmpfs {
         path: String,
         perms: Option<TmpfsPerms>,
         size: Option<u64>,
     },
-    Proc { path: String },
+    Proc {
+        #[serde(default = "default_proc_path")]
+        path: String,
+    },
     Bind { path: String },
 }
 
@@ -480,6 +500,46 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn dev_and_proc_mappings_default_their_path() {
+        let spec = parse(r#"{ "hostfs": { "mappings": [ { "type": "dev" }, { "type": "proc" } ] } }"#);
+        assert_eq!(
+            spec.hostfs.patterns(),
+            Patterns(vec![
+                ("/dev".to_string(), Permission::Empty),
+                ("/proc".to_string(), Permission::Empty)
+            ])
+        );
+        assert_eq!(
+            spec.hostfs.ops(),
+            vec![
+                Op::Dev {
+                    dest: PathBuf::from("/dev")
+                },
+                Op::Proc {
+                    dest: PathBuf::from("/proc")
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_tmpfs_and_bind_require_a_path() {
+        for mapping in [
+            r#"{ "type": "empty" }"#,
+            r#"{ "type": "tmpfs" }"#,
+            r#"{ "type": "bind" }"#,
+        ] {
+            assert!(
+                serde_json::from_str::<crate::spec::Spec>(&format!(
+                    r#"{{ "hostfs": {{ "mappings": [ {mapping} ] }} }}"#
+                ))
+                .is_err(),
+                "should reject {mapping}"
+            );
+        }
     }
 
     #[test]

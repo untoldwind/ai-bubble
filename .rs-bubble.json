@@ -27,16 +27,14 @@
         "glob": "/home/bjunglas/workspaces/**/target"
       },
       {
-        "type": "dev",
-        "path": "/dev"
+        "type": "dev"
       },
       {
         "type": "bind",
         "path": "/etc"
       },
       {
-        "type": "proc",
-        "path": "/proc"
+        "type": "proc"
       },
       {
         "type": "empty",
