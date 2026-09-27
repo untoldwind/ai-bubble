@@ -40,25 +40,37 @@ use super::fuselog;
 /// The nodeid of the filesystem root; its parent is itself.
 pub(crate) const ROOT_INODE: Inode = 1;
 
+/// The state of one known nodeid: where it lives, who its parent is, how
+/// many open handles it carries, and whether its lookup references are
+/// already gone (a zombie — see the module docs).
+#[derive(Debug)]
+struct InodeEntry {
+    /// The mirrored path the nodeid stands for. Kept on zombies too (the
+    /// last known path), so stateless (`fh = 0`) IO on their handles still
+    /// resolves.
+    path: PathBuf,
+    /// The nodeid of the path's parent directory (for `..` in `readdir`).
+    /// Meaningless on zombies (`parent_of` reports `None` for them, matching
+    /// the released mapping).
+    parent: Inode,
+    /// Open handles (`open`/`create`/`opendir` minus `release`/`releasedir`).
+    /// The kernel keeps sending operations for a nodeid with open handles —
+    /// including after its dentry is evicted (forget) or the file is
+    /// unlinked — so the entry must not be dropped (nor the nodeid reused)
+    /// until the last handle is closed.
+    open_handles: u64,
+    /// Lookup references are gone (the kernel forgot the dentry, or the name
+    /// was unlinked) but open handles remain: the last known path is kept
+    /// for those handles. Freed with the last release.
+    zombie: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct InodeMap {
-    /// The path each live nodeid stands for.
-    inode_to_path: HashMap<Inode, PathBuf>,
-    /// The nodeid of each path's parent directory (for `..` in `readdir`).
-    inode_to_parent: HashMap<Inode, Inode>,
-    /// The live nodeid of each mapped path.
+    /// The state of each known nodeid — live or zombie (see [`InodeEntry`]).
+    inodes: HashMap<Inode, InodeEntry>,
+    /// The live nodeid of each mapped path (never zombie entries).
     path_to_inode: HashMap<PathBuf, Inode>,
-    /// Open handles per nodeid (`open`/`create`/`opendir` minus
-    /// `release`/`releasedir`). The kernel keeps sending operations for a
-    /// nodeid with open handles — including after its dentry is evicted
-    /// (forget) or the file is unlinked — so the mapping must not be dropped
-    /// (nor the nodeid reused) until the last handle is closed.
-    open_counts: HashMap<Inode, u64>,
-    /// Lookup references are gone (the kernel forgot the dentry, or the name
-    /// was unlinked) but open handles remain: the last known path is kept so
-    /// stateless (`fh = 0`) IO on those handles still resolves. Freed with
-    /// the last release.
-    zombies: HashMap<Inode, PathBuf>,
     /// The next nodeid to allocate; never reused (see the module docs).
     next_inode: Inode,
 }
@@ -70,9 +82,16 @@ impl InodeMap {
             next_inode: ROOT_INODE + 1,
             ..Default::default()
         };
-        map.inode_to_path.insert(ROOT_INODE, PathBuf::from("/"));
+        map.inodes.insert(
+            ROOT_INODE,
+            InodeEntry {
+                path: PathBuf::from("/"),
+                parent: ROOT_INODE,
+                open_handles: 0,
+                zombie: false,
+            },
+        );
         map.path_to_inode.insert(PathBuf::from("/"), ROOT_INODE);
-        map.inode_to_parent.insert(ROOT_INODE, ROOT_INODE);
         map
     }
 
@@ -80,11 +99,7 @@ impl InodeMap {
     /// handles remain on a node that lost its lookup references. `None` means
     /// the kernel dentry is unknown to the map — ENOENT for the caller.
     pub(crate) fn path_of(&self, inode: Inode) -> Option<PathBuf> {
-        let path = self
-            .inode_to_path
-            .get(&inode)
-            .or_else(|| self.zombies.get(&inode))
-            .cloned();
+        let path = self.inodes.get(&inode).map(|entry| entry.path.clone());
         if path.is_none() {
             fuselog::event(&format!("INODE no-path inode={inode}"));
         }
@@ -93,7 +108,10 @@ impl InodeMap {
 
     /// The nodeid of a path's parent directory (for `..` in `readdir`).
     pub(crate) fn parent_of(&self, inode: Inode) -> Option<Inode> {
-        self.inode_to_parent.get(&inode).copied()
+        self.inodes
+            .get(&inode)
+            .filter(|entry| !entry.zombie)
+            .map(|entry| entry.parent)
     }
 
     /// The live nodeid mapped to a path, if any.
@@ -113,9 +131,16 @@ impl InodeMap {
         }
         let inode = self.next_inode;
         self.next_inode += 1;
-        self.inode_to_path.insert(inode, path.to_path_buf());
-        self.inode_to_parent.insert(inode, parent);
         self.path_to_inode.insert(path.to_path_buf(), inode);
+        self.inodes.insert(
+            inode,
+            InodeEntry {
+                path: path.to_path_buf(),
+                parent,
+                open_handles: 0,
+                zombie: false,
+            },
+        );
         inode
     }
 
@@ -138,8 +163,10 @@ impl InodeMap {
                 }
 
                 if old != new {
-                    self.inode_to_path.insert(source, new.to_path_buf());
-                    self.inode_to_parent.insert(source, new_parent);
+                    if let Some(entry) = self.inodes.get_mut(&source) {
+                        entry.path = new.to_path_buf();
+                        entry.parent = new_parent;
+                    }
                     self.path_to_inode.remove(old);
                     self.path_to_inode.insert(new.to_path_buf(), source);
                     self.repoint_descendants(old, new);
@@ -163,62 +190,61 @@ impl InodeMap {
     /// dentries (e.g. `cat new_dir/file` right after `mv old_dir new_dir`)
     /// resolve the child nodeid to a path that must already be the new one.
     fn repoint_descendants(&mut self, old: &Path, new: &Path) {
-        // Collect first: the keys borrow the maps being mutated.
-        let moved: Vec<(Inode, PathBuf)> = self
-            .inode_to_path
+        // Collect first: the paths borrow the map being mutated. The zombie
+        // flag travels along: zombie entries keep their remembered path but
+        // must not touch `path_to_inode` (it may already point at another
+        // nodeid).
+        let moved: Vec<(Inode, PathBuf, bool)> = self
+            .inodes
             .iter()
-            .filter(|(_, path)| **path != *old && path.starts_with(old))
-            .map(|(inode, path)| (*inode, path.clone()))
+            .filter(|(_, entry)| entry.path != *old && entry.path.starts_with(old))
+            .map(|(&inode, entry)| (inode, entry.path.clone(), entry.zombie))
             .collect();
-        for (inode, path) in moved {
+        for (inode, path, zombie) in moved {
             let moved_path = new.join(path.strip_prefix(old).expect("prefix checked"));
-            self.path_to_inode.remove(&path);
 
-            // A stale mapping at the child's new name (the rename target
-            // already had content) belongs to a dentry the kernel is
-            // dropping; releasing it keeps a zombie while handles remain.
-            if let Some(&prev) = self.path_to_inode.get(&moved_path) {
-                if prev != inode {
+            if !zombie {
+                self.path_to_inode.remove(&path);
+
+                // A stale mapping at the child's new name (the rename target
+                // already had content) belongs to a dentry the kernel is
+                // dropping; releasing it keeps a zombie while handles remain.
+                if let Some(&prev) = self.path_to_inode.get(&moved_path)
+                    && prev != inode
+                {
                     self.release(prev);
                 }
+                self.path_to_inode.insert(moved_path.clone(), inode);
             }
-            self.inode_to_path.insert(inode, moved_path.clone());
-            self.path_to_inode.insert(moved_path, inode);
-        }
-
-        // Zombies under the renamed directory keep their handles open; their
-        // remembered paths move with the directory too, so stateless (`fh =
-        // 0`) IO still resolves after the rename.
-        let zombies: Vec<(Inode, PathBuf)> = self
-            .zombies
-            .iter()
-            .filter(|(_, path)| **path != *old && path.starts_with(old))
-            .map(|(inode, path)| (*inode, path.clone()))
-            .collect();
-        for (inode, path) in zombies {
-            let moved_path = new.join(path.strip_prefix(old).expect("prefix checked"));
-            self.zombies.insert(inode, moved_path);
+            self.inodes
+                .get_mut(&inode)
+                .expect("collected from the live map")
+                .path = moved_path;
         }
     }
 
     /// Record an open handle on a nodeid (from `open`/`create`/`opendir`).
     pub(crate) fn open_handle(&mut self, inode: Inode) {
-        *self.open_counts.entry(inode).or_insert(0) += 1;
+        // Known nodeids always have an entry (`open` follows a lookup); an
+        // unknown nodeid has no mapping to keep alive anyway.
+        if let Some(entry) = self.inodes.get_mut(&inode) {
+            entry.open_handles += 1;
+        }
     }
 
     /// A handle was released: when it was the last one and no lookup
     /// references remain, the nodeid's zombie record is freed (the nodeid
     /// itself is never reused).
     pub(crate) fn close_handle(&mut self, inode: Inode) {
-        if let Some(count) = self.open_counts.get_mut(&inode) {
-            *count -= 1;
-            if *count == 0 {
-                self.open_counts.remove(&inode);
-
-                if !self.inode_to_path.contains_key(&inode) {
-                    self.zombies.remove(&inode);
-                }
-            }
+        let Some(entry) = self.inodes.get_mut(&inode) else {
+            return;
+        };
+        if entry.open_handles == 0 {
+            return;
+        }
+        entry.open_handles -= 1;
+        if entry.open_handles == 0 && entry.zombie {
+            self.inodes.remove(&inode);
         }
     }
 
@@ -232,7 +258,11 @@ impl InodeMap {
         if inode == ROOT_INODE {
             return None;
         }
-        let path = self.inode_to_path.get(&inode).cloned();
+        let path = self
+            .inodes
+            .get(&inode)
+            .filter(|entry| !entry.zombie)
+            .map(|entry| entry.path.clone());
         if path.is_some() {
             self.release(inode);
         }
@@ -243,7 +273,10 @@ impl InodeMap {
     /// lookup), keeping a zombie when open handles remain.
     pub(crate) fn release_path(&mut self, path: &Path) {
         if let Some(inode) = self.path_to_inode.remove(path)
-            && self.inode_to_path.get(&inode) == Some(&path.to_path_buf())
+            && self
+                .inodes
+                .get(&inode)
+                .is_some_and(|entry| !entry.zombie && entry.path == path)
         {
             self.release(inode);
         }
@@ -254,15 +287,22 @@ impl InodeMap {
     /// still points at this nodeid — a rename may have re-pointed the path at
     /// another nodeid already.
     fn release(&mut self, inode: Inode) {
-        if let Some(path) = self.inode_to_path.remove(&inode) {
-            if self.path_to_inode.get(&path) == Some(&inode) {
-                self.path_to_inode.remove(&path);
-            }
-            self.inode_to_parent.remove(&inode);
+        let Some(entry) = self.inodes.get(&inode) else {
+            return;
+        };
+        if entry.zombie {
+            return;
+        }
+        let path = entry.path.clone();
+        let keep_zombie = entry.open_handles > 0;
 
-            if self.open_counts.contains_key(&inode) {
-                self.zombies.insert(inode, path);
-            }
+        if self.path_to_inode.get(&path) == Some(&inode) {
+            self.path_to_inode.remove(&path);
+        }
+        if keep_zombie {
+            self.inodes.get_mut(&inode).unwrap().zombie = true;
+        } else {
+            self.inodes.remove(&inode);
         }
     }
 }

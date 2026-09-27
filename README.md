@@ -1,16 +1,15 @@
 # ai-bubble
 
-A minimal Rust reimplementation of the basic functionality of
-[bubblewrap](https://github.com/flatpak/bubblewrap) (`bwrap`), built as a
-simple CLI on top of [clap](https://docs.rs/clap).
+The AI bubble that shall not burst.
 
-The sandbox is configured through a **spec file** (JSON), not through
-command-line options. By default ai-bubble looks for `.ai-bubble/spec.json`
-in the current directory; `--spec-dir DIR` points it at a different spec
-directory. The spec directory itself (and everything in it — `spec.json`,
-the env file, the project cache) is **always hidden** from the sandboxed
-command: ai-bubble appends an internal `hide` mapping for it, so even a
-mapping that mirrors the directory containing it cannot expose it.
+Run agents in a sandbox similar to a [bubblewrap](https://github.com/flatpak/bubblewrap) (`bwrap`), but with a more focued setup.
+
+Key differences:
+
+* The sandbox is configured through a **spec file** (JSON), not through command-line options. By default ai-bubble looks for `.ai-bubble/spec.json` in the current directory; `--spec-dir DIR` points it at a different spec directory. The spec directory itself (and everything in it — `spec.json`, the env file, the project cache) is **always hidden** from the sandboxed command: ai-bubble appends an internal `hide` mapping for it, so even a mapping that mirrors the directory containing it cannot expose it.
+* Network access can be restricted through an embedded http-proxy (not exposing the host network)
+* Filesystem access can be routed through a FUSE filesystem that can be configured via glob patterns. This also acts as a uid/gid translation layer so that the agent can run with its own uid (within its own user-namesoace)
+* `--unshare-all`, `--drop-cap ALL` is pretty much the default (only exception if you actually want to give the agent direct access to the host network)
 
 ## Spec file format
 
