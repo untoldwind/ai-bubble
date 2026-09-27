@@ -315,14 +315,23 @@ impl TryFrom<UncheckedMapping> for Mapping {
                 Ok(value)
             }
         }
-        /// A redirect destination: absolute, and wildcard-free (a redirect
-        /// maps one specific path; wildcards could not be resolved onto a
-        /// single source anyway).
+        /// A redirect destination: absolute, wildcard-free (a redirect maps
+        /// one specific path; wildcards could not be resolved onto a
+        /// single source anyway), and free of `..` components (a `..`
+        /// would let a cache mapping's relative sub-path escape the cache
+        /// root onto an arbitrary host directory — see `sub_path`).
         fn redirect_dest(kind: &str, value: String) -> Result<String, String> {
             let dest = absolute(kind, "dest", value)?;
             if dest.contains(['*', '?', '[']) {
                 Err(format!(
                     "hostfs {kind} mapping: dest {dest:?} must not contain wildcards"
+                ))
+            } else if Path::new(&dest)
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
+                Err(format!(
+                    "hostfs {kind} mapping: dest {dest:?} must not contain '..'"
                 ))
             } else {
                 Ok(dest)
@@ -636,7 +645,9 @@ impl HostFsConfig {
 }
 
 /// The cache mapping's path (an absolute sandbox path) as the relative
-/// sub-path it maps onto inside the shared cache root.
+/// sub-path it maps onto inside the shared cache root. Validation
+/// ([`Mapping`]'s deserializer) guarantees the path is absolute and free
+/// of `..` components, so the result always stays inside the cache root.
 fn sub_path(path: &str) -> PathBuf {
     Path::new(path)
         .strip_prefix("/")
@@ -956,7 +967,10 @@ mod tests {
             r#"{ "type": "session-cache", "path": "home/.cache" }"#,
             r#"{ "type": "session-cache", "path": "/hom*" }"#,
             r#"{ "type": "session-cache" }"#,
-            r#"{ "type": "project-cache", "path": "/x?[y]" }"#,
+            r#"{ "type": "session-cache", "path": "/../etc" }"#,
+            r#"{ "type": "session-cache", "path": "/home/../etc" }"#,
+            r#"{ "type": "project-cache", "path": "/../etc" }"#,
+            r#"{ "type": "session-cache", "path": "/x?[y]" }"#,
             r#"{ "type": "project-cache", "path": "/x", "glob": "/x" }"#,
         ] {
             assert!(
@@ -1016,6 +1030,7 @@ mod tests {
             r#"{ "type": "redirect-ro", "dest": "/bl*", "source": "/otherdir" }"#,
             r#"{ "type": "redirect-ro", "dest": "/bl?", "source": "/otherdir" }"#,
             r#"{ "type": "redirect-ro", "dest": "/bl[a]", "source": "/otherdir" }"#,
+            r#"{ "type": "redirect-ro", "dest": "/../etc", "source": "/otherdir" }"#,
             // ...and both fields must be present and non-empty.
             r#"{ "type": "redirect-ro", "dest": "/bla" }"#,
             r#"{ "type": "redirect-ro", "source": "/otherdir" }"#,
