@@ -1600,6 +1600,60 @@ impl Filesystem for HostFs {
         Ok(())
     }
 
+    /// Create a hard link: the new name points at the *same real host file*
+    /// as the source (`link` on the host filesystem), so writes through
+    /// either name are visible through both. The new name gets a **fresh
+    /// nodeid** mapping to the new path: the mirror's pattern permissions
+    /// are decided per path, and a hard-linked name is an independent path
+    /// (the source nodeid keeps its mapping; renaming one name must not
+    /// affect the other's).
+    async fn link(
+        &self,
+        _req: Request,
+        inode: Inode,
+        new_parent: Inode,
+        new_name: &OsStr,
+    ) -> Result<ReplyEntry> {
+        let source_path = self.resolve(inode).await?;
+        let new_parent_path = self.resolve(new_parent).await?;
+        let old = self.mirror_path(source_path.as_os_str());
+        let new = self.mirror_path(new_parent_path.as_os_str()).join(new_name);
+        if self.is_empty(&old) || self.is_empty(&new) {
+            return Err(libc::EACCES.into());
+        }
+        if !self.exists(&old) {
+            log_op_err(
+                "link",
+                &old,
+                None,
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+            );
+            return Err(libc::ENOENT.into());
+        }
+        if !self.writable(&new) {
+            log_op_err(
+                "link",
+                &new,
+                Some(&self.redirect(&new)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
+            return Err(libc::EACCES.into());
+        }
+        if let Err(e) = tokio_fs::hard_link(self.redirect(&old), self.redirect(&new)).await {
+            log_op_err("link", &new, Some(&self.redirect(&new)), &e);
+            return Err(e.into());
+        }
+        log_op_ok("link", &new, &self.redirect(&new));
+        let inode = self.inodes.write().await.get_or_insert(&new, new_parent);
+        let mut attr = self.attr(&new).await?;
+        attr.ino = inode;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr,
+            generation: 0,
+        })
+    }
+
     async fn create(
         &self,
         _req: Request,

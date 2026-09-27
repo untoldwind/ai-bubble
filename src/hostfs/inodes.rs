@@ -7,8 +7,13 @@
 //! filesystem:
 //!
 //! * **One path per nodeid.** The bridge supported one inode under several
-//!   names (hard links); this filesystem does not implement `link`, so a
-//!   plain `path → inode` map suffices.
+//!   names (hard links); `link` here gives each *new name* its own fresh
+//!   nodeid pointing at the new path — the two names alias the same real
+//!   host file (writes through either are visible through both, and
+//!   `st_nlink` comes from the real metadata), but they are independent
+//!   paths: the mirror's pattern permissions are decided per path, and
+//!   renaming one name must not affect the other's mapping. A plain
+//!   `path → inode` map therefore still suffices.
 //! * **Nodeids are never reused.** The kernel may still hold cached dentries
 //!   (or open handles) for a nodeid the server considers dead; handing its
 //!   number out again would alias two different files. Allocation is a
