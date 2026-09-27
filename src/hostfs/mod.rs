@@ -82,6 +82,27 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::sandbox::die_with_error;
 use crate::spec::internal::{Patterns, Permission};
 
+use fuse3::fuselog;
+
+/// Log a failed FUSE op with the mirrored and the real host path (debug
+/// helper, only active with `RS_BUBBLE_FUSE_LOG` set).
+fn log_op_err(op: &str, mirrored: &Path, real: Option<&Path>, err: &std::io::Error) {
+    fuselog::event(&format!(
+        "FS {op} err={err} mirrored={} real={}",
+        mirrored.display(),
+        real.map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
+    ));
+}
+
+/// Log a successful structural op (create/mkdir/…) with its paths.
+fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
+    fuselog::event(&format!(
+        "FS {op} ok mirrored={} real={}",
+        mirrored.display(),
+        real.display()
+    ));
+}
+
 pub(crate) mod pattern;
 use pattern::{Pattern, Walk};
 
@@ -715,9 +736,15 @@ impl PathFilesystem for HostFs {
         // root directory itself.
         let mirrored = self.mirror_path(parent).join(name);
         if self.exists(&mirrored) {
-            let attr = self.attr(&mirrored).await?;
-            return Ok(ReplyEntry { ttl: TTL, attr });
+            match self.attr(&mirrored).await {
+                Ok(attr) => return Ok(ReplyEntry { ttl: TTL, attr }),
+                Err(e) => {
+                    log_op_err("lookup", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                    return Err(e.into());
+                }
+            }
         }
+        log_op_err("lookup", &mirrored, None, &std::io::Error::from_raw_os_error(libc::ENOENT));
         Err(libc::ENOENT.into())
     }
 
@@ -736,9 +763,20 @@ impl PathFilesystem for HostFs {
             Some(p) => {
                 let mirrored = self.mirror_path(p);
                 if self.exists(&mirrored) {
-                    let attr = self.attr(&mirrored).await?;
-                    return Ok(ReplyAttr { ttl: TTL, attr });
+                    match self.attr(&mirrored).await {
+                        Ok(attr) => return Ok(ReplyAttr { ttl: TTL, attr }),
+                        Err(e) => {
+                            log_op_err("getattr", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                            return Err(e.into());
+                        }
+                    }
                 }
+                log_op_err(
+                    "getattr",
+                    &mirrored,
+                    None,
+                    &std::io::Error::from_raw_os_error(libc::ENOENT),
+                );
                 Err(libc::ENOENT.into())
             }
             None => Err(libc::ENOENT.into()),
@@ -761,6 +799,12 @@ impl PathFilesystem for HostFs {
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
         if !self.exists(&mirrored) {
+            log_op_err(
+                "open",
+                &mirrored,
+                None,
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+            );
             return Err(libc::ENOENT.into());
         }
         // The path is visible through the mirror; only real files are
@@ -769,12 +813,27 @@ impl PathFilesystem for HostFs {
         // through the mirror (its target may not be mirrored at all).
         let md = match tokio_fs::symlink_metadata(self.redirect(&mirrored)).await {
             Ok(md) => md,
-            Err(_) => return Err(libc::ENOENT.into()),
+            Err(e) => {
+                log_op_err("open", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                return Err(libc::ENOENT.into());
+            }
         };
         if md.file_type().is_symlink() {
+            log_op_err(
+                "open",
+                &mirrored,
+                Some(&self.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::ELOOP),
+            );
             return Err(libc::ELOOP.into());
         }
         if md.is_dir() {
+            log_op_err(
+                "open",
+                &mirrored,
+                Some(&self.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::EISDIR),
+            );
             return Err(libc::EISDIR.into());
         }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
@@ -782,6 +841,12 @@ impl PathFilesystem for HostFs {
             // `ro` paths (and anything below an empty or hidden pattern) are
             // never writable; the real file permissions are checked by the
             // host filesystem on the actual write.
+            log_op_err(
+                "open",
+                &mirrored,
+                Some(&self.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
             return Err(libc::EACCES.into());
         }
         // The kernel passes O_TRUNC through to the server: the server must
@@ -789,12 +854,16 @@ impl PathFilesystem for HostFs {
         // open their outputs with O_TRUNC, so ignoring it would leave the
         // tail of the old content in place behind the newly written data.
         if write_flags && flags & libc::O_TRUNC as u32 != 0 {
-            tokio_fs::OpenOptions::new()
+            if let Err(e) = tokio_fs::OpenOptions::new()
                 .write(true)
                 .truncate(true)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(self.redirect(&mirrored))
-                .await?;
+                .await
+            {
+                log_op_err("open-trunc", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                return Err(e.into());
+            }
         }
         // fh 0 = stateless IO; every read re-opens the host file.
         Ok(ReplyOpen { fh: 0, flags: 0 })
@@ -809,10 +878,22 @@ impl PathFilesystem for HostFs {
         size: u32,
     ) -> Result<ReplyData> {
         let Some(p) = path else {
+            log_op_err(
+                "read",
+                Path::new("<none>"),
+                None,
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+            );
             return Err(libc::ENOENT.into());
         };
         let mirrored = self.mirror_path(p);
         if !self.exists(&mirrored) {
+            log_op_err(
+                "read",
+                &mirrored,
+                None,
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+            );
             return Err(libc::ENOENT.into());
         }
         // An empty path has no content: an empty file reads as empty (the
@@ -823,14 +904,27 @@ impl PathFilesystem for HostFs {
         // Stateless IO: reopen the host file for every read — never
         // following symlinks (a host symlink is visible only as a link,
         // and its target may not be mirrored at all).
-        let mut file = tokio_fs::OpenOptions::new()
+        let mut file = match tokio_fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.redirect(&mirrored))
-            .await?;
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log_op_err("read", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                return Err(e.into());
+            }
+        };
         file.seek(SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; size as usize];
-        let n = file.read(&mut buf).await?;
+        let n = match file.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                log_op_err("read-io", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                return Err(e.into());
+            }
+        };
         buf.truncate(n);
         Ok(ReplyData::from(Bytes::from(buf)))
     }
@@ -846,31 +940,62 @@ impl PathFilesystem for HostFs {
         flags: u32,
     ) -> Result<ReplyWrite> {
         let Some(p) = path else {
+            log_op_err(
+                "write",
+                Path::new("<none>"),
+                None,
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+            );
             return Err(libc::ENOENT.into());
         };
         let mirrored = self.mirror_path(p);
         if !self.exists(&mirrored) {
+            log_op_err(
+                "write",
+                &mirrored,
+                None,
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+            );
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&mirrored) {
             // The spec must say `rw`; the real file permissions are
             // enforced by the host filesystem on the open below.
+            log_op_err(
+                "write",
+                &mirrored,
+                Some(&self.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
             return Err(libc::EACCES.into());
         }
         // Stateless IO: reopen the host file for every write — never
         // following symlinks (a host symlink is never written through;
         // its target may not be mirrored at all).
         let append = flags & libc::O_APPEND as u32 != 0;
-        let mut file = tokio_fs::OpenOptions::new()
+        let mut file = match tokio_fs::OpenOptions::new()
             .write(true)
             .append(append)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.redirect(&mirrored))
-            .await?;
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log_op_err("write", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                return Err(e.into());
+            }
+        };
         if !append {
             file.seek(SeekFrom::Start(offset)).await?;
         }
-        let n = file.write(data).await?;
+        let n = match file.write(data).await {
+            Ok(n) => n,
+            Err(e) => {
+                log_op_err("write-io", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                return Err(e.into());
+            }
+        };
         Ok(ReplyWrite { written: n as u32 })
     }
     async fn statfs(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyStatFs> {
@@ -1145,6 +1270,12 @@ impl PathFilesystem for HostFs {
     ) -> Result<ReplyEntry> {
         let mirrored = self.mirror_path(parent).join(name);
         if !self.writable(&mirrored) {
+            log_op_err(
+                "mkdir",
+                &mirrored,
+                Some(&self.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
             return Err(libc::EACCES.into());
         }
         // Only a *real* entry at the target means EEXIST; a path merely
@@ -1153,6 +1284,12 @@ impl PathFilesystem for HostFs {
             .await
             .is_ok()
         {
+            log_op_err(
+                "mkdir",
+                &mirrored,
+                Some(&self.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::EEXIST),
+            );
             return Err(libc::EEXIST.into());
         }
         // errno is per-thread: capture the error on the blocking thread.
@@ -1165,7 +1302,11 @@ impl PathFilesystem for HostFs {
             }
         })
         .await
-        .map_err(fuse3::Errno::from)?;
+        .map_err(|e| {
+            log_op_err("mkdir", &mirrored, Some(&self.redirect(&mirrored)), &e);
+            fuse3::Errno::from(e)
+        })?;
+        log_op_ok("mkdir", &mirrored, &self.redirect(&mirrored));
         let attr = self.attr(&mirrored).await?;
         Ok(ReplyEntry { ttl: TTL, attr })
     }
@@ -1177,12 +1318,28 @@ impl PathFilesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         if !self.exists(&mirrored) {
+            log_op_err(
+                "unlink",
+                &mirrored,
+                None,
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+            );
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&mirrored) {
+            log_op_err(
+                "unlink",
+                &mirrored,
+                Some(&self.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
             return Err(libc::EACCES.into());
         }
-        tokio_fs::remove_file(self.redirect(&mirrored)).await?;
+        if let Err(e) = tokio_fs::remove_file(self.redirect(&mirrored)).await {
+            log_op_err("unlink", &mirrored, Some(&self.redirect(&mirrored)), &e);
+            return Err(e.into());
+        }
+        log_op_ok("unlink", &mirrored, &self.redirect(&mirrored));
         Ok(())
     }
     async fn rmdir(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
@@ -1191,12 +1348,28 @@ impl PathFilesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         if !self.exists(&mirrored) {
+            log_op_err(
+                "rmdir",
+                &mirrored,
+                None,
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+            );
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&mirrored) {
+            log_op_err(
+                "rmdir",
+                &mirrored,
+                Some(&self.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
             return Err(libc::EACCES.into());
         }
-        tokio_fs::remove_dir(self.redirect(&mirrored)).await?;
+        if let Err(e) = tokio_fs::remove_dir(self.redirect(&mirrored)).await {
+            log_op_err("rmdir", &mirrored, Some(&self.redirect(&mirrored)), &e);
+            return Err(e.into());
+        }
+        log_op_ok("rmdir", &mirrored, &self.redirect(&mirrored));
         Ok(())
     }
 
@@ -1214,12 +1387,33 @@ impl PathFilesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         if !self.exists(&old) {
+            log_op_err(
+                "rename",
+                &old,
+                None,
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+            );
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&old) || !self.writable(&new) {
+            log_op_err(
+                "rename",
+                &old,
+                Some(&self.redirect(&new)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
             return Err(libc::EACCES.into());
         }
-        tokio_fs::rename(self.redirect(&old), self.redirect(&new)).await?;
+        if let Err(e) = tokio_fs::rename(self.redirect(&old), self.redirect(&new)).await {
+            log_op_err(
+                "rename",
+                &old,
+                Some(&self.redirect(&new)),
+                &e,
+            );
+            return Err(e.into());
+        }
+        log_op_ok("rename", &old, &self.redirect(&new));
         Ok(())
     }
 
@@ -1233,6 +1427,12 @@ impl PathFilesystem for HostFs {
     ) -> Result<ReplyCreated> {
         let mirrored = self.mirror_path(parent).join(name);
         if !self.writable(&mirrored) {
+            log_op_err(
+                "create",
+                &mirrored,
+                Some(&self.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
             return Err(libc::EACCES.into());
         }
         // Only with O_EXCL does a *real* entry at the target mean EEXIST;
@@ -1247,12 +1447,30 @@ impl PathFilesystem for HostFs {
         let truncate = flags & libc::O_TRUNC as u32 != 0;
         if let Some(md) = existing {
             if md.file_type().is_symlink() {
+                log_op_err(
+                    "create",
+                    &mirrored,
+                    Some(&self.redirect(&mirrored)),
+                    &std::io::Error::from_raw_os_error(libc::ELOOP),
+                );
                 return Err(libc::ELOOP.into());
             }
             if excl {
+                log_op_err(
+                    "create",
+                    &mirrored,
+                    Some(&self.redirect(&mirrored)),
+                    &std::io::Error::from_raw_os_error(libc::EEXIST),
+                );
                 return Err(libc::EEXIST.into());
             }
             if md.is_dir() {
+                log_op_err(
+                    "create",
+                    &mirrored,
+                    Some(&self.redirect(&mirrored)),
+                    &std::io::Error::from_raw_os_error(libc::EISDIR),
+                );
                 return Err(libc::EISDIR.into());
             }
             let mut opts = tokio_fs::OpenOptions::new();
@@ -1260,8 +1478,15 @@ impl PathFilesystem for HostFs {
             if truncate {
                 opts.truncate(true);
             }
-            let file = opts.open(self.redirect(&mirrored)).await?;
+            let file = match opts.open(self.redirect(&mirrored)).await {
+                Ok(f) => f,
+                Err(e) => {
+                    log_op_err("create", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                    return Err(e.into());
+                }
+            };
             let md = file.metadata().await?;
+            log_op_ok("create", &mirrored, &self.redirect(&mirrored));
             return Ok(ReplyCreated {
                 ttl: TTL,
                 attr: attr_from_metadata(&md),
@@ -1278,12 +1503,20 @@ impl PathFilesystem for HostFs {
         if flags & libc::O_APPEND as u32 != 0 {
             opts.append(true);
         }
-        let file = opts
+        let file = match opts
             .mode(mode & 0o7777)
             .open(self.redirect(&mirrored))
-            .await?;
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log_op_err("create-new", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                return Err(e.into());
+            }
+        };
         let md = file.metadata().await?;
         let attr = attr_from_metadata(&md);
+        log_op_ok("create-new", &mirrored, &self.redirect(&mirrored));
         Ok(ReplyCreated {
             ttl: TTL,
             attr,
@@ -1388,12 +1621,18 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
 
     let outcome = {
         let mp = mountpoint.clone();
+        fuselog::event(&format!(
+            "SERVER start mountpoint={}",
+            mountpoint.display()
+        ));
         runtime.block_on(async move {
             let handle =
                 match mount_with_fallback(&mp, uid, gid, &fs, !fs.has_writable_patterns()).await {
                     Ok(handle) => handle,
                     Err(e) => return Err(e),
                 };
+
+            fuselog::event("SERVER mounted");
 
             // Signal readiness to the parent.
             let byte: u8 = 1;
@@ -1403,14 +1642,22 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
 
             // Serve until the sandbox process dies, then unmount cleanly. The
             // session task runs concurrently on this runtime.
+            let mut heartbeat = 0u64;
             loop {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 if unsafe { libc::getppid() } != HOST_PID.load(Ordering::SeqCst) {
                     break;
                 }
+                heartbeat += 1;
+                if heartbeat % 10 == 0 {
+                    fuselog::event("SERVER alive");
+                }
             }
 
-            handle.unmount().await
+            fuselog::event("SERVER parent-gone, unmounting");
+            let outcome = handle.unmount().await;
+            fuselog::event(&format!("SERVER unmount outcome={outcome:?}"));
+            outcome
         })
     };
 
