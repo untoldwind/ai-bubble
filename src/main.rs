@@ -1,4 +1,4 @@
-//! rs-bubble: a minimal bubblewrap-like sandbox.
+//! ai-bubble: a minimal bubblewrap-like sandbox.
 //!
 //! Module layout (who is allowed to do what):
 //!
@@ -34,8 +34,8 @@ use cli::Command;
 /// The JSON Schema for the spec file, generated from `src/spec/mod.rs` by
 /// `build.rs` at compile time. Printed by `--print-schema`; point an
 /// editor (e.g. VS Code's `json.schemas`) at it to get completion and
-/// validation for `.rs-bubble/spec.json`.
-pub const SPEC_SCHEMA: &str = include_str!(concat!(env!("OUT_DIR"), "/rs-bubble-schema.json"));
+/// validation for `.ai-bubble/spec.json`.
+pub const SPEC_SCHEMA: &str = include_str!(concat!(env!("OUT_DIR"), "/ai-bubble-schema.json"));
 
 fn main() {
     let cli = cli::Cli::parse();
@@ -52,7 +52,7 @@ fn main() {
         }) => {
             if command.is_empty() {
                 sandbox::die(
-                    "No command given; usage: rs-bubble run [--spec-dir DIR] -- COMMAND [args...]",
+                    "No command given; usage: ai-bubble run [--spec-dir DIR] -- COMMAND [args...]",
                 );
             }
             let mut spec = spec::Spec::load(cli.spec.as_deref());
@@ -60,7 +60,7 @@ fn main() {
             // Resolve the cache mappings (`session-cache`,
             // `project-cache`) against their backing directories before
             // anything is compiled: the session-cache tmp directory is
-            // created here and wiped once rs-bubble terminates (the
+            // created here and wiped once ai-bubble terminates (the
             // mirrored-fs server inherits the wipe).
             let spec_dir = cli
                 .spec
@@ -114,7 +114,7 @@ fn main() {
 
         Some(Command::Ls { path }) => ls(cli.spec.as_deref(), &path),
 
-        None => sandbox::die("No sub-command given; usage: rs-bubble run|ls ..."),
+        None => sandbox::die("No sub-command given; usage: ai-bubble run|ls ..."),
     }
 }
 

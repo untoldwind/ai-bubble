@@ -3,7 +3,7 @@
 //! Two independent servers live here, one per network namespace side:
 //!
 //! * `serve_connector` runs in the *host* network namespace (the original
-//!   rs-bubble process). It listens on a Unix-domain socket mounted into
+//!   ai-bubble process). It listens on a Unix-domain socket mounted into
 //!   the sandbox and turns `host:port` requests into real TCP connections.
 //!
 //! * `serve_sandbox_proxy` runs *inside* the sandbox network namespace
@@ -54,8 +54,7 @@ fn host_matches(pattern: &str, host: &str) -> bool {
         !suffix.is_empty()
             && !suffix.contains('*')
             && ends_with_ignore_ascii_case(host, suffix)
-            && host[..host.len() - suffix.len()]
-                .ends_with('.')
+            && host[..host.len() - suffix.len()].ends_with('.')
             && !host.contains('*')
     } else {
         pattern.eq_ignore_ascii_case(host)
@@ -93,14 +92,14 @@ async fn handle_connector_conn(mut stream: UnixStream, allow: &[String]) {
         return;
     };
     if !target_allowed(&target, allow) {
-        eprintln!("rs-bubble proxy: connection to {target} denied");
+        eprintln!("ai-bubble proxy: connection to {target} denied");
         let _ = stream.write_all(b"E").await;
         return;
     }
     let mut tcp = match TcpStream::connect(&target).await {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("rs-bubble proxy: can't connect to {target}: {e}");
+            eprintln!("ai-bubble proxy: can't connect to {target}: {e}");
             let _ = stream.write_all(b"E").await;
             return;
         }
@@ -135,14 +134,14 @@ async fn handle_connect_proxy(mut tcp: TcpStream, sock: &Path, allow: &[String])
         return;
     };
     if !target_allowed(&target, allow) {
-        eprintln!("rs-bubble proxy: CONNECT to {target} denied");
+        eprintln!("ai-bubble proxy: CONNECT to {target} denied");
         let _ = tcp.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
         return;
     }
     let mut unix = match UnixStream::connect(sock).await {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("rs-bubble proxy: can't reach connector: {e}");
+            eprintln!("ai-bubble proxy: can't reach connector: {e}");
             let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return;
         }
@@ -342,7 +341,7 @@ mod tests {
         });
 
         // Connector on a temporary Unix socket.
-        let dir = std::env::temp_dir().join(format!("rs-bubble-proxy-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ai-bubble-proxy-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("sock");
@@ -389,7 +388,7 @@ mod tests {
     async fn connect_denied_by_allow_list() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        let dir = std::env::temp_dir().join(format!("rs-bubble-deny-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ai-bubble-deny-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         tokio::spawn(serve_sandbox_proxy(

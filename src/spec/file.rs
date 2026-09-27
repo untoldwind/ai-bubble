@@ -1,7 +1,7 @@
 //! The spec file itself (JSON): the config-file view of the sandbox
 //! specification, and everything that maps 1:1 onto what the user writes.
 //!
-//! The default location is `.rs-bubble/spec.json` in the current
+//! The default location is `.ai-bubble/spec.json` in the current
 //! directory; `--spec-dir DIR` on the command line overrides it.
 //!
 //! Format:
@@ -41,7 +41,7 @@
 //! are applied in mapping order. Without any mappings the sandbox gets a
 //! plain tmpfs root and no FUSE filesystem is started. The cache mappings
 //! (`session-cache`, `project-cache`) are a writable redirect onto a
-//! per-run tmp directory (wiped when rs-bubble terminates) or the spec
+//! per-run tmp directory (wiped when ai-bubble terminates) or the spec
 //! directory's `cache` folder, respectively.
 //!
 //! This is only the *file* view: the sandbox machinery runs with the
@@ -82,7 +82,7 @@ use super::net::NetConfig;
 
 /// The default spec directory, looked up relative to the current
 /// directory.
-pub const DEFAULT_SPEC_DIR: &str = ".rs-bubble";
+pub const DEFAULT_SPEC_DIR: &str = ".ai-bubble";
 
 /// The name of the spec file inside the spec directory.
 pub const SPEC_FILE: &str = "spec.json";
@@ -144,7 +144,7 @@ pub struct Spec {
 
 impl Spec {
     /// Load the spec from the spec directory (typically `--spec-dir DIR`
-    /// or the default `.rs-bubble`). The directory is expected to contain
+    /// or the default `.ai-bubble`). The directory is expected to contain
     /// a `spec.json` file. A missing default spec directory is fine: an
     /// empty spec (empty root, no mounts, host network) is used in that
     /// case, while an explicit `--spec-dir` that cannot be read is a hard

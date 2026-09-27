@@ -90,7 +90,7 @@ impl SandboxConfig {
 
 impl Op {
     /// One-line human description of the op: what it does and where. Used
-    /// by `rs-bubble ls` to show the mount/symlink "actions" the config
+    /// by `ai-bubble ls` to show the mount/symlink "actions" the config
     /// performs.
     pub fn describe(&self) -> String {
         match self {

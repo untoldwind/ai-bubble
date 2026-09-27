@@ -54,7 +54,7 @@ pub unsafe fn run(
     die_with_parent: bool,
 ) -> ! {
     unsafe {
-        // The connector binds its lifecycle to rs-bubble's caller (see
+        // The connector binds its lifecycle to ai-bubble's caller (see
         // handle_die_with_parent); P and the sandboxed child set their own
         // PDEATHSIG after the forks below.
         handle_die_with_parent(die_with_parent);
@@ -222,7 +222,7 @@ unsafe fn isolated_parent(
 
 /// Create the temporary host directory for the proxy socket via mkdtemp(3).
 fn create_socket_dir() -> PathBuf {
-    let mut tmpl: Vec<u8> = b"/tmp/rs-bubble-net.XXXXXX".to_vec();
+    let mut tmpl: Vec<u8> = b"/tmp/ai-bubble-net.XXXXXX".to_vec();
     tmpl.push(0);
     unsafe {
         let tmpl_ptr = CString::from_vec_with_nul(tmpl).unwrap();

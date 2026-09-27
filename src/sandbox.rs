@@ -18,12 +18,12 @@ use crate::spec::internal::Op;
 use crate::spec::tmpfs::TmpfsPerms;
 
 pub(crate) fn die(msg: &str) -> ! {
-    eprintln!("rs-bubble: {msg}");
+    eprintln!("ai-bubble: {msg}");
     exit(1)
 }
 
 pub(crate) fn die_with_error(msg: &str) -> ! {
-    eprintln!("rs-bubble: {msg}: {}", io::Error::last_os_error());
+    eprintln!("ai-bubble: {msg}: {}", io::Error::last_os_error());
     exit(1)
 }
 
@@ -154,7 +154,7 @@ pub(crate) fn check_new_userns(old_userns: Option<(u64, u64)>) {
 /// every process in the chain must set it for itself: the launcher (in
 /// `setup_and_exec`, or `netns::run` for the connector and
 /// `netns::isolated_parent` for P) and the sandboxed child before exec (in
-/// `pidns_and_exec`). That way the death of rs-bubble's caller ripples down
+/// `pidns_and_exec`). That way the death of ai-bubble's caller ripples down
 /// and kills the whole process tree including the exec'd command.
 pub(crate) unsafe fn handle_die_with_parent(enabled: bool) {
     unsafe {
@@ -190,7 +190,7 @@ pub unsafe fn setup_and_exec(
     die_with_parent: bool,
 ) -> ! {
     unsafe {
-        // Optionally bind our lifecycle to that of the caller: when rs-bubble's
+        // Optionally bind our lifecycle to that of the caller: when ai-bubble's
         // parent dies, the kernel SIGKILLs this launcher (the sandboxed child
         // sets its own PDEATHSIG in pidns_and_exec, mirroring bwrap).
         handle_die_with_parent(die_with_parent);
@@ -474,7 +474,7 @@ pub(crate) unsafe fn mount_and_exec(
             }
         } else {
             // Create a fresh tmpfs to serve as the sandbox root.
-            let mut tmpl: Vec<u8> = b"/tmp/rs-bubble.XXXXXX".to_vec();
+            let mut tmpl: Vec<u8> = b"/tmp/ai-bubble.XXXXXX".to_vec();
             tmpl.push(0);
             let tmpl_ptr = CString::from_vec_with_nul(tmpl).unwrap();
             let root_path = libc::mkdtemp(tmpl_ptr.into_raw() as *mut libc::c_char);
@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     fn mkdir_p_creates_nested_dirs() {
-        let base = std::env::temp_dir().join("rs-bubble-test-mkdir-p");
+        let base = std::env::temp_dir().join("ai-bubble-test-mkdir-p");
         let _ = fs::remove_dir_all(&base);
         mkdir_p(&base, Path::new("a/b/c"));
         assert!(base.join("a/b/c").is_dir());
@@ -888,7 +888,7 @@ mod tests {
     fn mkdir_p_keeps_absolute_dest_under_newroot() {
         // Regression: Path::join("/usr") would replace the new root and
         // target the host filesystem instead.
-        let base = std::env::temp_dir().join("rs-bubble-test-mkdir-abs");
+        let base = std::env::temp_dir().join("ai-bubble-test-mkdir-abs");
         let _ = fs::remove_dir_all(&base);
         mkdir_p(&base, Path::new("/usr/lib"));
         assert!(base.join("usr/lib").is_dir());

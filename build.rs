@@ -3,12 +3,12 @@
 //! The build script compiles `src/spec/mod.rs` itself (with stand-ins for the
 //! pieces the main crate provides, like `crate::sandbox::die`) and uses
 //! `schemars` to derive a JSON Schema for `Spec`, honoring the serde
-//! attributes. The result is written to `OUT_DIR/rs-bubble-schema.json`,
+//! attributes. The result is written to `OUT_DIR/ai-bubble-schema.json`,
 //! which the main crate embeds as `spec::SPEC_SCHEMA` and prints with
 //! `--print-schema`. Point a spec file's editor at it (e.g. VS Code's
 //! `json.schemas`, or `"$schema"` once the schema lives somewhere the
 //! editor can find) to get completion and validation for
-//! `.rs-bubble/spec.json`.
+//! `.ai-bubble/spec.json`.
 //!
 //! Because the schema is generated from the very same source files that
 //! do the deserialization, it can never drift from what the program
@@ -45,10 +45,10 @@ fn main() {
         .metadata
         .as_mut()
         .expect("root schema has metadata")
-        .title = Some("rs-bubble sandbox spec".to_string());
+        .title = Some("ai-bubble sandbox spec".to_string());
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set for build scripts");
-    let path = std::path::Path::new(&out_dir).join("rs-bubble-schema.json");
+    let path = std::path::Path::new(&out_dir).join("ai-bubble-schema.json");
     let json = serde_json::to_string_pretty(&schema).expect("schema serializes");
     std::fs::write(&path, json + "\n").expect("can write into OUT_DIR");
 }

@@ -1,5 +1,5 @@
 {
-  "$schema": "./rs-bubble.spec.schema.json",
+  "$schema": "../ai-bubble.spec.schema.json",
   "hostfs": {
     "mappings": [
       {

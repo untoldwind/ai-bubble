@@ -161,10 +161,9 @@ pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
     // naming the path itself or a strict ancestor, before any direct
     // permission), so the last-match rule below only applies among the
     // non-`hide` patterns.
-    if compiled
-        .iter()
-        .any(|(p, permission)| *permission == Permission::Hide && (p.matches(path) || p.walk(path) == Walk::Ancestor))
-    {
+    if compiled.iter().any(|(p, permission)| {
+        *permission == Permission::Hide && (p.matches(path) || p.walk(path) == Walk::Ancestor)
+    }) {
         return Some(Permission::Hide);
     }
 
@@ -218,7 +217,7 @@ pub(crate) static HOST_MOUNT_POINT: std::sync::OnceLock<PathBuf> = std::sync::On
 static HOST_PID: AtomicI32 = AtomicI32::new(0);
 
 /// The per-run session-cache directory (from the spec's `session-cache`
-/// mappings), wiped when rs-bubble terminates. Set by the sandbox parent
+/// mappings), wiped when ai-bubble terminates. Set by the sandbox parent
 /// before `start_host_fs` forks.
 static SESSION_CACHE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -236,9 +235,9 @@ pub fn set_session_cache_root(path: &Path) {
 }
 /// Create the fresh per-run session-cache tmp directory (`mkdtemp`, like
 /// the mirrored-fs mountpoint). The caller records it with
-/// [`set_session_cache_root`] so it is wiped when rs-bubble terminates.
+/// [`set_session_cache_root`] so it is wiped when ai-bubble terminates.
 pub fn new_session_cache_dir() -> PathBuf {
-    let mut tmpl: Vec<u8> = b"/tmp/rs-bubble.cache.XXXXXX".to_vec();
+    let mut tmpl: Vec<u8> = b"/tmp/ai-bubble.cache.XXXXXX".to_vec();
     tmpl.push(0);
     let raw = unsafe { libc::mkdtemp(CString::from_vec_with_nul(tmpl).unwrap().into_raw()) };
     if raw.is_null() {
@@ -1871,7 +1870,7 @@ fn ts_to_timespec(ts: Option<Timestamp>) -> libc::timespec {
 pub fn start_host_fs(patterns: &crate::spec::internal::Patterns) {
     // Create the mountpoint directory in the parent so both the server and the
     // sandbox (and its children) can agree on a stable path.
-    let mut tmpl: Vec<u8> = b"/tmp/rs-bubble.host.XXXXXX".to_vec();
+    let mut tmpl: Vec<u8> = b"/tmp/ai-bubble.host.XXXXXX".to_vec();
     tmpl.push(0);
     let mountpoint = unsafe {
         let raw = libc::mkdtemp(CString::from_vec_with_nul(tmpl).unwrap().into_raw());
@@ -1977,7 +1976,7 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
 
     if let Err(e) = outcome {
         eprintln!(
-            "rs-bubble: Can't mount mirrored filesystem at {}: {e}",
+            "ai-bubble: Can't mount mirrored filesystem at {}: {e}",
             mountpoint.display()
         );
     }
@@ -2182,7 +2181,7 @@ mod tests {
     #[test]
     fn empty_paths_match_real_files_as_empty_files() {
         let base = std::env::temp_dir().join(format!(
-            "rs-bubble-hostfs-empty-test-{}",
+            "ai-bubble-hostfs-empty-test-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&base).unwrap();
@@ -2318,7 +2317,7 @@ mod tests {
     #[test]
     fn redirected_paths_show_the_source_content() {
         let base = std::env::temp_dir().join(format!(
-            "rs-bubble-hostfs-redirect-test-{}",
+            "ai-bubble-hostfs-redirect-test-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&base).unwrap();
@@ -2436,7 +2435,7 @@ mod tests {
     #[test]
     fn readdir_filters_non_matching_entries() {
         let base =
-            std::env::temp_dir().join(format!("rs-bubble-hostfs-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ai-bubble-hostfs-test-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("a.conf"), b"a").unwrap();
         std::fs::write(base.join("b.txt"), b"b").unwrap();
@@ -2531,7 +2530,7 @@ mod tests {
         assert!(block(f.dir_entries(Path::new("/"))).is_empty());
         // Siblings are unaffected; the hide is scoped to /etc.
         let base =
-            std::env::temp_dir().join(format!("rs-bubble-hostfs-hide-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ai-bubble-hostfs-hide-test-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("foo.conf"), b"f").unwrap();
         std::fs::create_dir_all(base.join("secret")).unwrap();
@@ -2632,7 +2631,10 @@ mod tests {
         // A non-UTF-8 component can never match a pattern, so its write
         // permission could never be derived from the spec: deny even
         // under a `**`-covered `rw` mirror that would allow a UTF-8 name.
-        let f = fs(&[("/work/**", Permission::Rw), ("/work/*secret*", Permission::Hide)]);
+        let f = fs(&[
+            ("/work/**", Permission::Rw),
+            ("/work/*secret*", Permission::Hide),
+        ]);
         assert!(f.writable(Path::new("/work/plain")));
         let weird = Path::new("/work").join(OsStr::from_bytes(b"\xffsecret\xff"));
         assert!(!f.writable(&weird));

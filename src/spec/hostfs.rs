@@ -160,7 +160,7 @@ pub enum Mapping {
     /// mappings share *one* tmp directory: each path maps onto the tmp
     /// directory plus its own relative sub-path (e.g. `/home/a/.cache` →
     /// `<tmpdir>/home/a/.cache`), so unrelated cache directories never
-    /// collide. The tmp directory is wiped once rs-bubble terminates (see
+    /// collide. The tmp directory is wiped once ai-bubble terminates (see
     /// [`HostFsConfig::prepare_caches`] and
     /// `crate::hostfs::set_session_cache_root`).
     ///
@@ -174,7 +174,7 @@ pub enum Mapping {
     },
     /// Like [`Mapping::SessionCache`], but backed by the **project cache**
     /// instead of a tmp directory: the path maps onto `cache/<path>` below
-    /// the directory the spec file lives in (`.rs-bubble/cache/...` by
+    /// the directory the spec file lives in (`.ai-bubble/cache/...` by
     /// default), so the content persists across runs — and is shared by
     /// every sandbox using that spec directory.
     #[serde(rename = "project-cache")]
@@ -316,7 +316,7 @@ fn warn_embedded_double_star(kind: &str, glob: &str) {
         .any(|c| c.contains("**") && c != "**")
     {
         eprintln!(
-            "rs-bubble: hostfs {kind} mapping: glob {glob:?} has `**` inside a path component, \
+            "ai-bubble: hostfs {kind} mapping: glob {glob:?} has `**` inside a path component, \
              where it acts like `*` (it does not cross `/`); use `dir/**/part` to span levels"
         );
     }
@@ -450,7 +450,7 @@ impl Mapping {
     }
 
     /// One-line human description of the mapping: its permission/action
-    /// and the paths it selects or mounts. Used by `rs-bubble ls`.
+    /// and the paths it selects or mounts. Used by `ai-bubble ls`.
     pub fn describe(&self) -> String {
         match self {
             Mapping::Ro { glob } => format!("ro     {glob}"),
@@ -499,7 +499,7 @@ impl Mapping {
                 // A cache mapping *is* a redirect-rw — to its backing
                 // directory. The real source is filled in by
                 // [`HostFsConfig::prepare_caches`] (which rewrites the
-                // mapping into a `redirect-rw`); only `rs-bubble ls` ever
+                // mapping into a `redirect-rw`); only `ai-bubble ls` ever
                 // sees mappings in this unresolved state, where the empty
                 // source just means "writable redirect, target not shown".
                 Permission::Redirect {
@@ -595,7 +595,7 @@ impl HostFsConfig {
     /// are left alone.
     pub(crate) fn resolve_relative_sources(&mut self, spec_dir: &Path) {
         // The spec dir itself may be relative (e.g. the default
-        // `.rs-bubble`): resolve it against the current directory first,
+        // `.ai-bubble`): resolve it against the current directory first,
         // so the redirect sources end up unambiguous.
         let dir = std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf());
         for mapping in &mut self.mappings {
@@ -631,11 +631,11 @@ impl HostFsConfig {
     ///   (`spec_dir/cache/<path>`); it persists across runs.
     ///
     /// Returns without changing anything when there are no cache mappings.
-    /// Called by `rs-bubble run` (never by `ls`, which only shows the
+    /// Called by `ai-bubble run` (never by `ls`, which only shows the
     /// unresolved mappings).
     pub fn prepare_caches(&mut self, spec_dir: &Path, session_root: Option<&Path>) {
         // The spec dir itself may be relative (e.g. the default
-        // `.rs-bubble`): resolve it against the current directory first,
+        // `.ai-bubble`): resolve it against the current directory first,
         // like `resolve_relative_sources` does.
         let dir = std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf());
         for mapping in &mut self.mappings {
@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn cache_mappings_parse_and_prepare_caches_rewrites_them() {
         let dir =
-            std::env::temp_dir().join(format!("rs-bubble-spec-caches-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ai-bubble-spec-caches-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut spec = parse(
             r#"{ "hostfs": { "mappings": [
@@ -987,7 +987,7 @@ mod tests {
             parse(r#"{ "hostfs": { "mappings": [ { "type": "rw", "glob": "/etc" } ] } }"#);
         assert!(!spec.hostfs.has_session_caches());
         spec.hostfs
-            .prepare_caches(Path::new("/nonexistent-rs-bubble-test"), None);
+            .prepare_caches(Path::new("/nonexistent-ai-bubble-test"), None);
         assert_eq!(spec.hostfs.mappings.len(), 1);
     }
 

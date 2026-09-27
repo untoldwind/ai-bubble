@@ -1,20 +1,20 @@
-# rs-bubble
+# ai-bubble
 
 A minimal Rust reimplementation of the basic functionality of
 [bubblewrap](https://github.com/flatpak/bubblewrap) (`bwrap`), built as a
 simple CLI on top of [clap](https://docs.rs/clap).
 
 The sandbox is configured through a **spec file** (JSON), not through
-command-line options. By default rs-bubble looks for `.rs-bubble/spec.json`
+command-line options. By default ai-bubble looks for `.ai-bubble/spec.json`
 in the current directory; `--spec-dir DIR` points it at a different spec
 directory. The spec directory itself (and everything in it — `spec.json`,
 the env file, the project cache) is **always hidden** from the sandboxed
-command: rs-bubble appends an internal `hide` mapping for it, so even a
+command: ai-bubble appends an internal `hide` mapping for it, so even a
 mapping that mirrors the directory containing it cannot expose it.
 
 ## Spec file format
 
-All fields are optional. A missing `.rs-bubble/spec.json` means: empty tmpfs
+All fields are optional. A missing `.ai-bubble/spec.json` means: empty tmpfs
 root, no mounts at all (not even procfs), and the host network.
 
 ```json
@@ -75,8 +75,8 @@ root, no mounts at all (not even procfs), and the host network.
   where the spec asks for it, with a `{"type": "proc", "path": ...}`
   mapping (mounted with `MS_NOSUID|MS_NOEXEC|MS_NODEV`)
 - `net.isolated` — run the command in a fresh **network namespace**
-  (no interfaces besides loopback, which rs-bubble brings up) while the
-  rs-bubble process stays on the host and acts as a **TCP proxy**
+  (no interfaces besides loopback, which ai-bubble brings up) while the
+  ai-bubble process stays on the host and acts as a **TCP proxy**
 - `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`, and an
   entry host may start with `*.` for a subdomain wildcard (`*.github.com`
   matches `api.github.com` but not `github.com`).
@@ -119,13 +119,13 @@ Everything on the command line (optionally after a `--` separator) is the
 command to run inside the sandbox:
 
 ```sh
-rs-bubble -- /bin/sh
-rs-bubble --spec-dir custom /bin/sh
+ai-bubble -- /bin/sh
+ai-bubble --spec-dir custom /bin/sh
 ```
 
 ### Equivalence with bwrap's namespace flags
 
-Every run of rs-bubble unshares the same namespaces as
+Every run of ai-bubble unshares the same namespaces as
 `bwrap --unshare-all` (user, cgroup, ipc, pid, uts, mount). The only knob
 is the network namespace, which corresponds to bwrap's `--share-net`:
 
@@ -133,15 +133,15 @@ is the network namespace, which corresponds to bwrap's `--share-net`:
   (everything unshared, but the command keeps the host network)
 - with `"net": { "isolated": true }` → like plain
   `bwrap --unshare-all` (a fresh network namespace with only a brought-up
-  loopback interface — bwrap's `loopback_setup()` — plus rs-bubble's proxy)
+  loopback interface — bwrap's `loopback_setup()` — plus ai-bubble's proxy)
 
-Not covered by that equivalence (see "Notes" below): rs-bubble's
+Not covered by that equivalence (see "Notes" below): ai-bubble's
 `/proc` mounts are always fresh procfs instances and the command always
 runs as PID 1 of its PID namespace, mirroring `--as-pid-1`.
 
 `--die-with-parent` is on by default (it uses `PR_SET_PDEATHSIG`, like
 bwrap's option of the same name): the sandboxed command is killed with
-SIGKILL when rs-bubble — or rs-bubble's parent — dies. Pass
+SIGKILL when ai-bubble — or ai-bubble's parent — dies. Pass
 `--no-die-with-parent` to switch this off. Every process in the chain
 (launcher, isolated-net parent and connector, sandboxed child) sets it for
 itself, because the setting does not survive fork.
@@ -160,7 +160,7 @@ Like bwrap, the tool:
    exist on the host, never as (namespace) root.
 4. Unshares fresh **IPC**, **UTS** and **PID namespaces** and forks: the
    command becomes **PID 1** of the new PID namespace (like bwrap's
-   `--unshare-pid` + `--as-pid-1`), while the rs-bubble process supervises it
+   `--unshare-pid` + `--as-pid-1`), while the ai-bubble process supervises it
    and forwards its exit status.
 5. Marks the mount tree as a **slave**, so nothing mounted inside
    propagates back to the host.
@@ -191,7 +191,7 @@ bubblewrap example works the same way here:
 }
 ```
 
-`rs-bubble -- /bin/sh` then reproduces:
+`ai-bubble -- /bin/sh` then reproduces:
 
 `/lib`, `/lib64` and `/bin` are symlinks created inside the sandbox, pointing
 into the bound `/usr` — exactly like the corresponding
@@ -206,7 +206,7 @@ Notes:
 
 - Bind/symlink destinations are created on the tmpfs root as needed. If a
   destination lies inside an earlier bind mount, it must already exist there
-  (rs-bubble does not create directories inside a bind mount).
+  (ai-bubble does not create directories inside a bind mount).
 - The fresh procfs is mounted with `MS_NOSUID|MS_NOEXEC|MS_NODEV`. Unlike
   bwrap, the `/proc/sys`, `/proc/sysrq-trigger`, `/proc/irq` and `/proc/bus`
   "cover" mounts are not applied; the command runs with no capabilities at
@@ -221,16 +221,16 @@ Notes:
 With `net.isolated = true` the sandboxed command gets a network namespace that
 is completely isolated from the host (only a freshly brought-up loopback
 interface; the sandbox also gets its own UTS namespace) — while the
-rs-bubble process tree provides a proxy **inside** that namespace, so the
+ai-bubble process tree provides a proxy **inside** that namespace, so the
 command can reach the outside world transparently.
 
 This mode is the network part of `bwrap --unshare-all`: it unshares the
 network namespace like `bwrap --unshare-net` (loopback up, nothing else).
-Without it, rs-bubble corresponds to `bwrap --unshare-all --share-net`.
+Without it, ai-bubble corresponds to `bwrap --unshare-all --share-net`.
 
 ### Architecture
 
-Since `execve` replaces the process, rs-bubble forks into three roles:
+Since `execve` replaces the process, ai-bubble forks into three roles:
 
 - **connector** (stays in the host network namespace): answers proxy
   requests with real TCP connections (name resolution included, so DNS
@@ -256,7 +256,7 @@ besides loopback and no routes to the host, so direct connections
 ### Usage
 
 ```sh
-rs-bubble --spec-dir isolated -- /bin/sh
+ai-bubble --spec-dir isolated -- /bin/sh
 ```
 
 with `isolated.json`:
@@ -386,14 +386,14 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
 ### The "empty" mappings are the mount points
 
 ```sh
-rs-bubble --spec-dir hostfs -- /bin/sh
+ai-bubble --spec-dir hostfs -- /bin/sh
 ```
 
 The mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`, `bind`) expose
 their path as an empty, unwritable (mode 0555) directory — a pure mount
 point, taking *precedence* over the mirror (nothing below it is visible,
 and no mirror pattern can bring content back). It must exist for every
-mount point, because rs-bubble does not create directories on the FUSE
+mount point, because ai-bubble does not create directories on the FUSE
 filesystem itself — which is exactly why the mount-point mappings provide
 it automatically. The `dev` and `tmpfs` mounts (and the fresh procfs,
 from a `proc` mapping or `proc` op) then cover
@@ -412,7 +412,7 @@ sandbox-only `/proc` on top of the host view.
 Starter project — the spec file's `hostfs.mappings` (ro, rw, hide, empty,
 dev, tmpfs, proc, bind, symlink, redirect-ro, redirect-rw), `net.isolated`
 and `net.allow` are
-implemented. Namespace-wise rs-bubble always unshares user, cgroup, ipc,
+implemented. Namespace-wise ai-bubble always unshares user, cgroup, ipc,
 pid, uts and mount namespaces (see "Equivalence with bwrap's namespace
 flags" above); the network namespace is unshared with `net.isolated`.
 Natural next steps would be further bubblewrap option coverage.

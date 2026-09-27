@@ -5,7 +5,7 @@
 //!
 //! * The config file — [`file::Spec`] and its sections ([`env`],
 //!   [`hostfs`], [`net`], [`tmpfs`]): everything that maps 1:1 onto what the user
-//!   writes in the JSON spec file (`.rs-bubble/spec.json`, or
+//!   writes in the JSON spec file (`.ai-bubble/spec.json`, or
 //!   `--spec-dir DIR`).
 //!   These types carry the serde and JSON-schema attributes and are
 //!   documented for the file format.
@@ -103,7 +103,7 @@ pub(crate) mod tests {
     fn env_file_entries_are_merged_into_values() {
         unsafe { std::env::set_var("RS_BUBBLE_TEST_ENV_FILE_HOME", "/home/me") };
         let dir =
-            std::env::temp_dir().join(format!("rs-bubble-spec-envfile-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ai-bubble-spec-envfile-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(crate::spec::file::SPEC_FILE),
@@ -328,8 +328,8 @@ QUOTED="quoted file value"
 
     #[test]
     fn schema_key_is_accepted_but_ignored() {
-        let spec = parse(r#"{ "$schema": "./rs-bubble.spec.schema.json" }"#);
-        assert_eq!(spec.schema.as_deref(), Some("./rs-bubble.spec.schema.json"));
+        let spec = parse(r#"{ "$schema": "./ai-bubble.spec.schema.json" }"#);
+        assert_eq!(spec.schema.as_deref(), Some("./ai-bubble.spec.schema.json"));
         // It must be advertised in the generated schema (it's a real
         // field with skip_serializing), so editors accept it.
         let schema: serde_json::Value = serde_json::from_str(crate::SPEC_SCHEMA).unwrap();
@@ -339,7 +339,7 @@ QUOTED="quoted file value"
     #[test]
     fn redirect_sources_are_resolved_relative_to_the_spec_dir() {
         let dir =
-            std::env::temp_dir().join(format!("rs-bubble-spec-redirect-{}", std::process::id()));
+            std::env::temp_dir().join(format!("ai-bubble-spec-redirect-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(crate::spec::file::SPEC_FILE);
         std::fs::write(
@@ -376,7 +376,7 @@ QUOTED="quoted file value"
     fn embedded_schema_is_valid_json_and_covers_all_mapping_types() {
         let schema: serde_json::Value = serde_json::from_str(crate::SPEC_SCHEMA).unwrap();
         assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
-        assert_eq!(schema["title"], "rs-bubble sandbox spec");
+        assert_eq!(schema["title"], "ai-bubble sandbox spec");
         // The mappings are a "type"-tagged enum: every variant's tag must
         // show up in the generated schema.
         for tag in [
@@ -417,8 +417,8 @@ QUOTED="quoted file value"
         // A spec that mirrors everything — including the directory the
         // spec file lives in.
         let parent =
-            std::env::temp_dir().join(format!("rs-bubble-spec-hide-{}", std::process::id()));
-        let dir = parent.join(".rs-bubble");
+            std::env::temp_dir().join(format!("ai-bubble-spec-hide-{}", std::process::id()));
+        let dir = parent.join(".ai-bubble");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(crate::spec::file::SPEC_FILE),
@@ -462,7 +462,8 @@ QUOTED="quoted file value"
     fn no_spec_dir_no_hide() {
         // Without a spec file (and thus without a spec directory) nothing
         // is hidden: the spec stays empty.
-        let dir = std::env::temp_dir().join(format!("rs-bubble-spec-nohide-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ai-bubble-spec-nohide-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let saved = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
@@ -475,7 +476,7 @@ QUOTED="quoted file value"
 
     #[test]
     fn missing_default_file_is_an_empty_spec() {
-        let dir = std::env::temp_dir().join(format!("rs-bubble-spec-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ai-bubble-spec-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let saved = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
@@ -487,7 +488,7 @@ QUOTED="quoted file value"
 
     #[test]
     fn explicit_spec_dir_is_required() {
-        let dir = std::env::temp_dir().join(format!("rs-bubble-spec-test2-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ai-bubble-spec-test2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(crate::spec::file::SPEC_FILE);
         std::fs::write(&path, r#"{ "net": { "isolated": true } }"#).unwrap();
@@ -501,7 +502,7 @@ QUOTED="quoted file value"
         // Every string value in the spec file may reference environment
         // variables as ${VAR}: they are expanded right after the file is
         // read, so the parsed spec only ever sees the expanded text.
-        let dir = std::env::temp_dir().join(format!("rs-bubble-spec-env-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ai-bubble-spec-env-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(crate::spec::file::SPEC_FILE);
         std::fs::write(
