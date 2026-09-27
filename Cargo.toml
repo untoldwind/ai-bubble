@@ -18,10 +18,3 @@ libc = "0.2.189"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "net", "io-util", "fs", "macros", "time"] }
-
-# Vendored with a fix for the InodePathBridge rename race (see FINDINGS.md):
-# on rename the bridge dropped the source inode's name mapping and re-pointed
-# the new name at the old target's inode, so every operation on the kernel's
-# moved dentry failed with ENOENT until the dentry TTL expired.
-[patch.crates-io]
-fuse3 = { path = "vendor/fuse3" }

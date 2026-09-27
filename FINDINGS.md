@@ -93,14 +93,24 @@ just-truncated path no longer matches reality, so a reader gets stale-sized
   second after `write`/`open(O_TRUNC)`/`setattr`, because `ReplyWrite` carries
   no updated attributes.
 
-## Fix directions
+## Resolution
 
-1. **Vendor a patched fuse3** and map the new name to the *source* inode after
-   rename: in `rename`/`rename2`, fetch the source inode before
-   `remove_name`, then remap `Name(new_parent, new_name) → source_inode`
-   (without allocating a new inode), removing any pre-existing mapping for the
-   target name (the kernel will FORGET that inode).
-   Can be done via `[patch.crates-io] fuse3 = { path = "vendor/fuse3" }` in
-   `Cargo.toml`.
+1. **Drop the vendored path bridge entirely.** The hostfs server now implements
+   fuse3's **raw** `Filesystem` (inode-based) directly instead of the
+   `PathFilesystem` wrapper, so no `InodePathBridge` — and no vendored fuse3
+   (`[patch.crates-io]` is gone; fuse3 0.9.0 comes from crates.io).
+   The nodeid ↔ path mapping lives in `src/hostfs/inodes.rs` (`InodeMap`),
+   simplified for this filesystem and hardened:
+   * on `rename`, the new path is re-pointed at the **source** nodeid (the
+     kernel moves the dentry keeping its inode), and the overwritten target's
+     mapping is dropped — the kernel then `FORGET`s a nodeid with no mapping,
+     which is a no-op (this is the erratic-`cargo build` fix);
+   * nodeids are **never reused** (monotonic counter, not a recycled slab), so
+     a stale kernel dentry can never alias a new file;
+   * a nodeid whose lookup references are gone but which still has open
+     handles keeps its last path (a "zombie") so stateless (`fh = 0`) IO on
+     those handles still resolves, freed on the last release.
+   The debug tracing (`fuselog`, `RS_BUBBLE_FUSE_LOG`) moved from the vendor
+   into `src/hostfs/fuselog.rs`.
 2. Longer term: implement `link`, and consider smaller TTLs or explicit
    attribute invalidation after writes.

@@ -12,8 +12,15 @@ static LOG: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
 fn file() -> Option<&'static Mutex<File>> {
     LOG.get_or_init(|| {
-        std::env::var_os("RS_BUBBLE_FUSE_LOG")
-            .map(|p| Mutex::new(OpenOptions::new().create(true).append(true).open(p).unwrap()))
+        std::env::var_os("RS_BUBBLE_FUSE_LOG").map(|p| {
+            Mutex::new(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .unwrap(),
+            )
+        })
     })
     .as_ref()
 }

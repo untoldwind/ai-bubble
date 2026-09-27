@@ -68,12 +68,12 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use fuse3::path::reply::{
+use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyCreated, ReplyData,
     ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs, ReplyWrite,
 };
-use fuse3::path::{PathFilesystem, Session};
-use fuse3::{FileType, MountOptions, Result, SetAttr, Timestamp};
+use fuse3::raw::{Filesystem, Request, Session};
+use fuse3::{FileType, Inode, MountOptions, Result, SetAttr, Timestamp};
 use futures_util::stream;
 
 use tokio::fs as tokio_fs;
@@ -82,7 +82,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::sandbox::die_with_error;
 use crate::spec::internal::{Patterns, Permission};
 
-use fuse3::fuselog;
+mod fuselog;
+mod inodes;
+use inodes::InodeMap;
 
 /// Log a failed FUSE op with the mirrored and the real host path (debug
 /// helper, only active with `RS_BUBBLE_FUSE_LOG` set).
@@ -90,7 +92,8 @@ fn log_op_err(op: &str, mirrored: &Path, real: Option<&Path>, err: &std::io::Err
     fuselog::event(&format!(
         "FS {op} err={err} mirrored={} real={}",
         mirrored.display(),
-        real.map(|p| p.display().to_string()).unwrap_or_else(|| "-".into()),
+        real.map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".into()),
     ));
 }
 
@@ -167,6 +170,12 @@ pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
     path.ancestors()
         .skip(1)
         .find_map(|a| direct(a).filter(|p| p.is_mirrored()))
+}
+
+/// Whether any pattern grants write access: the FUSE mount is mounted
+/// read-only unless it does.
+fn has_writable_patterns(patterns: &Patterns) -> bool {
+    patterns.iter().any(|(_, permission)| permission.is_writable())
 }
 
 /// The sandbox-absolute path the host filesystem is mounted at.
@@ -270,6 +279,12 @@ impl MirrorPattern {
 /// Nothing is pre-expanded; every operation matches against the patterns
 /// directly.
 ///
+/// This is a **raw** fuse3 `Filesystem`: the kernel hands over nodeids and
+/// this implementation resolves each one to its mirrored path through
+/// [`InodeMap`] — the job the vendored fuse3 path bridge (`InodePathBridge`)
+/// used to do, and which broke on rename (see `FINDINGS.md`). Owning the map
+/// removes the vendored dependency entirely.
+///
 /// Paths matched with the `"empty"` permission are exposed empty: as an
 /// empty, unwritable directory when the path is (or would be) a directory,
 /// or as an empty file when it matches a real file. They take
@@ -288,11 +303,15 @@ impl MirrorPattern {
 /// visible matches stay navigable as long as no hidden pattern stands
 /// between them and the matches below. Writes additionally require the
 /// `rw` permission (see [`HostFs::write_permission`]).
-#[derive(Clone)]
 struct HostFs {
     uid: u32,
     gid: u32,
     patterns: Vec<MirrorPattern>,
+    /// The nodeid ↔ mirrored-path map (see [`inodes`]). There is exactly one
+    /// map per FUSE session: the filesystem is *moved* into the mount, and
+    /// the mount fallback builds a fresh filesystem (the failed attempt never
+    /// reached the kernel, so an empty map is correct there).
+    inodes: tokio::sync::RwLock<InodeMap>,
 }
 
 impl HostFs {
@@ -309,7 +328,19 @@ impl HostFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             patterns: compiled,
+            inodes: tokio::sync::RwLock::new(InodeMap::new()),
         }
+    }
+
+    /// Resolve a nodeid to its mirrored path (falling back to a zombie's
+    /// last path while open handles remain), or ENOENT when the kernel
+    /// dentry is unknown to the map.
+    async fn resolve(&self, inode: Inode) -> std::io::Result<PathBuf> {
+        self.inodes
+            .read()
+            .await
+            .path_of(inode)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))
     }
 
     /// Whether the mirrored path is matched with the `empty` permission (by
@@ -432,12 +463,6 @@ impl HostFs {
             .is_some_and(|p| p.is_writable())
     }
 
-    /// Whether any pattern grants write access: the FUSE mount is mounted
-    /// read-only unless it does.
-    fn has_writable_patterns(&self) -> bool {
-        self.patterns.iter().any(|p| p.permission.is_writable())
-    }
-
     /// The permission of the **last** pattern that names the path itself
     /// (exactly, or via a `**` that covers it), or `None` when no pattern
     /// names it.
@@ -512,13 +537,15 @@ impl HostFs {
 
     /// The attributes of an empty path (or a purely virtual ancestor of
     /// one): a mode-0555 directory, so nothing can be created inside it.
+    /// (`ino` is filled in by the callers that know the nodeid.)
     fn empty_dir_attr(&self) -> FileAttr {
         FileAttr {
+            ino: 0,
             size: 0,
             blocks: 0,
-            atime: SystemTime::UNIX_EPOCH,
-            mtime: SystemTime::UNIX_EPOCH,
-            ctime: SystemTime::UNIX_EPOCH,
+            atime: SystemTime::UNIX_EPOCH.into(),
+            mtime: SystemTime::UNIX_EPOCH.into(),
+            ctime: SystemTime::UNIX_EPOCH.into(),
             kind: FileType::Directory,
             perm: 0o555,
             nlink: 2,
@@ -603,32 +630,32 @@ impl HostFs {
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
         let unfiltered = self.matches(mirrored);
-        let mut names: Vec<std::ffi::OsString> =
-            if self.is_host_dir(&self.redirect(mirrored)).await {
-                match tokio_fs::read_dir(self.redirect(mirrored)).await {
-                    Ok(mut entries) => {
-                        let mut names = Vec::new();
-                        while let Ok(Some(entry)) = entries.next_entry().await {
-                            let name = entry.file_name();
-                            let child = mirrored.join(&name);
-                            // Empty-path precedence: nothing below an empty path is
-                            // visible, not even a mirror match. Denied entries (and
-                            // everything below a hidden directory) are hidden even
-                            // inside a recursively mirrored directory.
-                            if self.under_empty(&child) || self.hidden(&child) {
-                                continue;
-                            }
-                            if unfiltered || self.exists(&child) {
-                                names.push(name);
-                            }
+        let mut names: Vec<std::ffi::OsString> = if self.is_host_dir(&self.redirect(mirrored)).await
+        {
+            match tokio_fs::read_dir(self.redirect(mirrored)).await {
+                Ok(mut entries) => {
+                    let mut names = Vec::new();
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let name = entry.file_name();
+                        let child = mirrored.join(&name);
+                        // Empty-path precedence: nothing below an empty path is
+                        // visible, not even a mirror match. Denied entries (and
+                        // everything below a hidden directory) are hidden even
+                        // inside a recursively mirrored directory.
+                        if self.under_empty(&child) || self.hidden(&child) {
+                            continue;
                         }
-                        names
+                        if unfiltered || self.exists(&child) {
+                            names.push(name);
+                        }
                     }
-                    Err(_) => Vec::new(),
+                    names
                 }
-            } else {
-                Vec::new()
-            };
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         // Empty-path entries living directly under this directory (also
         // when the real directory itself cannot be listed): every `empty`
         // pattern with a purely literal next component contributes one.
@@ -676,14 +703,19 @@ fn attr_from_metadata(md: &std::fs::Metadata) -> FileAttr {
         FileType::RegularFile
     };
     FileAttr {
+        // Filled in by the reply sites that know the nodeid.
+        ino: 0,
         size: md.size(),
         blocks: md.blocks(),
-        atime: SystemTime::UNIX_EPOCH
-            + Duration::new(md.atime().max(0) as u64, md.atime_nsec().max(0) as u32),
-        mtime: SystemTime::UNIX_EPOCH
-            + Duration::new(md.mtime().max(0) as u64, md.mtime_nsec().max(0) as u32),
-        ctime: SystemTime::UNIX_EPOCH
-            + Duration::new(md.ctime().max(0) as u64, md.ctime_nsec().max(0) as u32),
+        atime: (SystemTime::UNIX_EPOCH
+            + Duration::new(md.atime().max(0) as u64, md.atime_nsec().max(0) as u32))
+        .into(),
+        mtime: (SystemTime::UNIX_EPOCH
+            + Duration::new(md.mtime().max(0) as u64, md.mtime_nsec().max(0) as u32))
+        .into(),
+        ctime: (SystemTime::UNIX_EPOCH
+            + Duration::new(md.ctime().max(0) as u64, md.ctime_nsec().max(0) as u32))
+        .into(),
         kind,
         perm: (md.mode() & 0o7777) as u16,
         nlink: md.nlink() as u32,
@@ -696,11 +728,13 @@ fn attr_from_metadata(md: &std::fs::Metadata) -> FileAttr {
 
 fn root_attr(uid: u32, gid: u32) -> FileAttr {
     FileAttr {
+        // Filled in by the reply sites that know the nodeid.
+        ino: 0,
         size: 0,
         blocks: 0,
-        atime: SystemTime::UNIX_EPOCH,
-        mtime: SystemTime::UNIX_EPOCH,
-        ctime: SystemTime::UNIX_EPOCH,
+        atime: SystemTime::UNIX_EPOCH.into(),
+        mtime: SystemTime::UNIX_EPOCH.into(),
+        ctime: SystemTime::UNIX_EPOCH.into(),
         kind: FileType::Directory,
         perm: 0o755,
         nlink: 2,
@@ -717,74 +751,129 @@ fn is_root(path: &OsStr) -> bool {
     path == Path::new("/") || path.is_empty()
 }
 
-impl PathFilesystem for HostFs {
-    async fn init(&self, _req: fuse3::raw::Request) -> Result<ReplyInit> {
+impl Filesystem for HostFs {
+    async fn init(&self, _req: Request) -> Result<ReplyInit> {
         Ok(ReplyInit {
             max_write: NonZeroU32::new(4096).unwrap(),
         })
     }
 
-    async fn destroy(&self, _req: fuse3::raw::Request) {}
+    async fn destroy(&self, _req: Request) {}
 
-    async fn lookup(
-        &self,
-        _req: fuse3::raw::Request,
-        parent: &OsStr,
-        name: &OsStr,
-    ) -> Result<ReplyEntry> {
-        // The path-based API calls lookup with the parent path; "/" means the
+    /// A forgotten nodeid loses its mapping (the kernel is done with the
+    /// dentry); a nodeid with open handles keeps its last path as a zombie.
+    async fn forget(&self, _req: Request, inode: Inode, nlookup: u64) {
+        let path = self.inodes.write().await.forget(inode);
+        fuselog::event(&format!(
+            "INODE forget inode={inode} nlookup={nlookup} path={}",
+            path.map(|p| fuselog::path_string(p.as_os_str()))
+                .unwrap_or_else(|| "<gone>".into())
+        ));
+    }
+
+    async fn batch_forget(&self, _req: Request, inodes: &[Inode]) {
+        let mut map = self.inodes.write().await;
+        for &inode in inodes {
+            let path = map.forget(inode);
+            fuselog::event(&format!(
+                "INODE batch-forget inode={inode} path={}",
+                path.map(|p| fuselog::path_string(p.as_os_str()))
+                    .unwrap_or_else(|| "<gone>".into())
+            ));
+        }
+    }
+
+    async fn lookup(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
+        // The nodeid resolves to the parent's mirrored path; "/" means the
         // root directory itself.
-        let mirrored = self.mirror_path(parent).join(name);
+        let parent_path = match self.resolve(parent).await {
+            Ok(p) => p,
+            Err(e) => {
+                fuselog::event(&format!(
+                    "INODE lookup no-parent inode={parent} name={}",
+                    fuselog::path_string(name)
+                ));
+                return Err(e.into());
+            }
+        };
+        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
         if self.exists(&mirrored) {
             match self.attr(&mirrored).await {
-                Ok(attr) => return Ok(ReplyEntry { ttl: TTL, attr }),
+                Ok(mut attr) => {
+                    let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
+                    attr.ino = inode;
+                    return Ok(ReplyEntry {
+                        ttl: TTL,
+                        attr,
+                        generation: 0,
+                    });
+                }
                 Err(e) => {
                     log_op_err("lookup", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        // The kernel dentry is stale: drop the mapping so the
+                        // next lookup re-maps the path (a zombie stays while
+                        // open handles remain).
+                        self.inodes.write().await.release_path(&mirrored);
+                    }
                     return Err(e.into());
                 }
             }
         }
-        log_op_err("lookup", &mirrored, None, &std::io::Error::from_raw_os_error(libc::ENOENT));
+        log_op_err(
+            "lookup",
+            &mirrored,
+            None,
+            &std::io::Error::from_raw_os_error(libc::ENOENT),
+        );
+        self.inodes.write().await.release_path(&mirrored);
         Err(libc::ENOENT.into())
     }
 
     async fn getattr(
         &self,
-        _req: fuse3::raw::Request,
-        path: Option<&OsStr>,
+        _req: Request,
+        inode: Inode,
         _fh: Option<u64>,
         _flags: u32,
     ) -> Result<ReplyAttr> {
-        match path {
-            Some(p) if is_root(p) => Ok(ReplyAttr {
-                ttl: TTL,
-                attr: root_attr(self.uid, self.gid),
-            }),
-            Some(p) => {
-                let mirrored = self.mirror_path(p);
-                if self.exists(&mirrored) {
-                    match self.attr(&mirrored).await {
-                        Ok(attr) => return Ok(ReplyAttr { ttl: TTL, attr }),
-                        Err(e) => {
-                            log_op_err("getattr", &mirrored, Some(&self.redirect(&mirrored)), &e);
-                            return Err(e.into());
-                        }
-                    }
-                }
-                log_op_err(
-                    "getattr",
-                    &mirrored,
-                    None,
-                    &std::io::Error::from_raw_os_error(libc::ENOENT),
-                );
-                Err(libc::ENOENT.into())
+        let p = match self.resolve(inode).await {
+            Ok(p) => p,
+            Err(e) => {
+                fuselog::event(&format!("INODE getattr no-path inode={inode}"));
+                return Err(e.into());
             }
-            None => Err(libc::ENOENT.into()),
+        };
+        if is_root(p.as_os_str()) {
+            let mut attr = root_attr(self.uid, self.gid);
+            attr.ino = inode;
+            return Ok(ReplyAttr { ttl: TTL, attr });
         }
+        let mirrored = self.mirror_path(p.as_os_str());
+        if self.exists(&mirrored) {
+            match self.attr(&mirrored).await {
+                Ok(mut attr) => {
+                    attr.ino = inode;
+                    return Ok(ReplyAttr { ttl: TTL, attr });
+                }
+                Err(e) => {
+                    log_op_err("getattr", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                    return Err(e.into());
+                }
+            }
+        }
+        log_op_err(
+            "getattr",
+            &mirrored,
+            None,
+            &std::io::Error::from_raw_os_error(libc::ENOENT),
+        );
+        Err(libc::ENOENT.into())
     }
 
-    async fn readlink(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyData> {
-        let mirrored = self.mirror_path(path);
+    async fn readlink(&self, _req: Request, inode: Inode) -> Result<ReplyData> {
+        let p = self.resolve(inode).await?;
+        let mirrored = self.mirror_path(p.as_os_str());
         if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
@@ -794,8 +883,9 @@ impl PathFilesystem for HostFs {
         )))
     }
 
-    async fn open(&self, _req: fuse3::raw::Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
-        let mirrored = self.mirror_path(path);
+    async fn open(&self, _req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
+        let p = self.resolve(inode).await?;
+        let mirrored = self.mirror_path(p.as_os_str());
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
         if !self.exists(&mirrored) {
@@ -866,27 +956,31 @@ impl PathFilesystem for HostFs {
             }
         }
         // fh 0 = stateless IO; every read re-opens the host file.
+        self.inodes.write().await.open_handle(inode);
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
     async fn read(
         &self,
-        _req: fuse3::raw::Request,
-        path: Option<&OsStr>,
+        _req: Request,
+        inode: Inode,
         _fh: u64,
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
-        let Some(p) = path else {
-            log_op_err(
-                "read",
-                Path::new("<none>"),
-                None,
-                &std::io::Error::from_raw_os_error(libc::ENOENT),
-            );
-            return Err(libc::ENOENT.into());
+        let p = match self.resolve(inode).await {
+            Ok(p) => p,
+            Err(e) => {
+                log_op_err(
+                    "read",
+                    Path::new("<none>"),
+                    None,
+                    &std::io::Error::from_raw_os_error(libc::ENOENT),
+                );
+                return Err(e.into());
+            }
         };
-        let mirrored = self.mirror_path(p);
+        let mirrored = self.mirror_path(p.as_os_str());
         if !self.exists(&mirrored) {
             log_op_err(
                 "read",
@@ -931,24 +1025,27 @@ impl PathFilesystem for HostFs {
 
     async fn write(
         &self,
-        _req: fuse3::raw::Request,
-        path: Option<&OsStr>,
+        _req: Request,
+        inode: Inode,
         _fh: u64,
         offset: u64,
         data: &[u8],
         _write_flags: u32,
         flags: u32,
     ) -> Result<ReplyWrite> {
-        let Some(p) = path else {
-            log_op_err(
-                "write",
-                Path::new("<none>"),
-                None,
-                &std::io::Error::from_raw_os_error(libc::ENOENT),
-            );
-            return Err(libc::ENOENT.into());
+        let p = match self.resolve(inode).await {
+            Ok(p) => p,
+            Err(e) => {
+                log_op_err(
+                    "write",
+                    Path::new("<none>"),
+                    None,
+                    &std::io::Error::from_raw_os_error(libc::ENOENT),
+                );
+                return Err(e.into());
+            }
         };
-        let mirrored = self.mirror_path(p);
+        let mirrored = self.mirror_path(p.as_os_str());
         if !self.exists(&mirrored) {
             log_op_err(
                 "write",
@@ -998,15 +1095,16 @@ impl PathFilesystem for HostFs {
         };
         Ok(ReplyWrite { written: n as u32 })
     }
-    async fn statfs(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyStatFs> {
+    async fn statfs(&self, _req: Request, inode: Inode) -> Result<ReplyStatFs> {
         // Report the real filesystem holding the mirrored path (or "/" for
         // the root), so tools like `df` behave sensibly. The path is opened
         // with `O_NOFOLLOW` and `fstatvfs` runs on the descriptor: symlinks
         // are never followed to a filesystem outside the mirror.
-        let mirrored = if is_root(path) {
+        let p = self.resolve(inode).await?;
+        let mirrored = if is_root(p.as_os_str()) {
             PathBuf::from("/")
         } else {
-            self.redirect(&self.mirror_path(path))
+            self.redirect(&self.mirror_path(p.as_os_str()))
         };
         let cpath =
             CString::new(mirrored.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
@@ -1022,11 +1120,7 @@ impl PathFilesystem for HostFs {
             let rc = unsafe { libc::fstatvfs(fd, &mut vfs) };
             let err = std::io::Error::last_os_error();
             unsafe { libc::close(fd) };
-            if rc != 0 {
-                Err(err)
-            } else {
-                Ok(vfs)
-            }
+            if rc != 0 { Err(err) } else { Ok(vfs) }
         })
         .await
         .map(|vfs| {
@@ -1043,29 +1137,31 @@ impl PathFilesystem for HostFs {
         })?
     }
 
-    async fn opendir(
-        &self,
-        _req: fuse3::raw::Request,
-        path: &OsStr,
-        _flags: u32,
-    ) -> Result<ReplyOpen> {
-        let mirrored = self.mirror_path(path);
-        if !self.exists(&mirrored) || !is_root(path) && !self.is_listable_dir(&mirrored).await {
+    async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
+        let p = self.resolve(inode).await?;
+        let mirrored = self.mirror_path(p.as_os_str());
+        if !self.exists(&mirrored)
+            || !is_root(p.as_os_str()) && !self.is_listable_dir(&mirrored).await
+        {
             return Err(libc::ENOENT.into());
         }
+        self.inodes.write().await.open_handle(inode);
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
     async fn readdir<'a>(
         &'a self,
-        _req: fuse3::raw::Request,
-        path: &'a OsStr,
+        _req: Request,
+        parent: Inode,
         _fh: u64,
         offset: i64,
     ) -> Result<ReplyDirectory<impl futures_util::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
-        let mirrored = self.mirror_path(path);
-        if !self.exists(&mirrored) || !is_root(path) && !self.is_listable_dir(&mirrored).await {
+        let p = self.resolve(parent).await?;
+        let mirrored = self.mirror_path(p.as_os_str());
+        if !self.exists(&mirrored)
+            || !is_root(p.as_os_str()) && !self.is_listable_dir(&mirrored).await
+        {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
@@ -1074,8 +1170,23 @@ impl PathFilesystem for HostFs {
             .into_iter()
             .skip(offset.max(0) as usize)
             .enumerate()
+            .collect();
+        // Every listed entry needs a nodeid for the kernel's dentry cache:
+        // "." is the directory itself, ".." its parent, everything else is
+        // mapped (or re-mapped) under the directory's nodeid.
+        let mut map = self.inodes.write().await;
+        let entries: Vec<_> = entries
+            .into_iter()
             .map(|(i, (name, attr))| {
+                let inode = if name == *OsStr::new(".") {
+                    parent
+                } else if name == *OsStr::new("..") {
+                    map.parent_of(parent).unwrap_or(inodes::ROOT_INODE)
+                } else {
+                    map.get_or_insert(&mirrored.join(&name), parent)
+                };
                 Ok(DirectoryEntry {
+                    inode,
                     kind: attr.map(|a| a.kind).unwrap_or(FileType::RegularFile),
                     name,
                     offset: offset.max(0) + i as i64 + 1,
@@ -1089,8 +1200,8 @@ impl PathFilesystem for HostFs {
 
     async fn readdirplus<'a>(
         &'a self,
-        _req: fuse3::raw::Request,
-        path: &'a OsStr,
+        _req: Request,
+        parent: Inode,
         _fh: u64,
         offset: u64,
         _lock_owner: u64,
@@ -1099,8 +1210,11 @@ impl PathFilesystem for HostFs {
             impl futures_util::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a,
         >,
     > {
-        let mirrored = self.mirror_path(path);
-        if !self.exists(&mirrored) || !is_root(path) && !self.is_listable_dir(&mirrored).await {
+        let p = self.resolve(parent).await?;
+        let mirrored = self.mirror_path(p.as_os_str());
+        if !self.exists(&mirrored)
+            || !is_root(p.as_os_str()) && !self.is_listable_dir(&mirrored).await
+        {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
@@ -1109,8 +1223,29 @@ impl PathFilesystem for HostFs {
             .into_iter()
             .skip(offset as usize)
             .enumerate()
+            .collect();
+        // Every listed entry needs a nodeid for the kernel's dentry cache:
+        // "." is the directory itself, ".." its parent, everything else is
+        // mapped (or re-mapped) under the directory's nodeid — and carries
+        // its attributes with the nodeid filled in.
+        let mut map = self.inodes.write().await;
+        let entries: Vec<_> = entries
+            .into_iter()
             .map(|(i, (name, attr))| {
+                let inode = if name == *OsStr::new(".") {
+                    parent
+                } else if name == *OsStr::new("..") {
+                    map.parent_of(parent).unwrap_or(inodes::ROOT_INODE)
+                } else {
+                    map.get_or_insert(&mirrored.join(&name), parent)
+                };
+                let mut attr = attr;
+                if let Ok(a) = attr.as_mut() {
+                    a.ino = inode;
+                }
                 Ok(DirectoryEntryPlus {
+                    inode,
+                    generation: 0,
                     kind: attr
                         .as_ref()
                         .map(|a| a.kind)
@@ -1128,8 +1263,9 @@ impl PathFilesystem for HostFs {
         })
     }
 
-    async fn access(&self, _req: fuse3::raw::Request, path: &OsStr, mask: u32) -> Result<()> {
-        let mirrored = self.mirror_path(path);
+    async fn access(&self, _req: Request, inode: Inode, mask: u32) -> Result<()> {
+        let p = self.resolve(inode).await?;
+        let mirrored = self.mirror_path(p.as_os_str());
         if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
@@ -1184,15 +1320,13 @@ impl PathFilesystem for HostFs {
 
     async fn setattr(
         &self,
-        _req: fuse3::raw::Request,
-        path: Option<&OsStr>,
+        _req: Request,
+        inode: Inode,
         _fh: Option<u64>,
         set_attr: SetAttr,
     ) -> Result<ReplyAttr> {
-        let Some(p) = path else {
-            return Err(libc::ENOENT.into());
-        };
-        let mirrored = self.mirror_path(p);
+        let p = self.resolve(inode).await?;
+        let mirrored = self.mirror_path(p.as_os_str());
         if self.is_empty(&mirrored) {
             // Empty paths are virtual: nothing to change.
             return Err(libc::EACCES.into());
@@ -1256,19 +1390,21 @@ impl PathFilesystem for HostFs {
             })
             .await?;
         }
-        let attr = self.attr(&mirrored).await?;
+        let mut attr = self.attr(&mirrored).await?;
+        attr.ino = inode;
         Ok(ReplyAttr { ttl: TTL, attr })
     }
 
     async fn mkdir(
         &self,
-        _req: fuse3::raw::Request,
-        parent: &OsStr,
+        _req: Request,
+        parent: Inode,
         name: &OsStr,
         mode: u32,
         _umask: u32,
     ) -> Result<ReplyEntry> {
-        let mirrored = self.mirror_path(parent).join(name);
+        let parent_path = self.resolve(parent).await?;
+        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
         if !self.writable(&mirrored) {
             log_op_err(
                 "mkdir",
@@ -1307,12 +1443,19 @@ impl PathFilesystem for HostFs {
             fuse3::Errno::from(e)
         })?;
         log_op_ok("mkdir", &mirrored, &self.redirect(&mirrored));
-        let attr = self.attr(&mirrored).await?;
-        Ok(ReplyEntry { ttl: TTL, attr })
+        let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
+        let mut attr = self.attr(&mirrored).await?;
+        attr.ino = inode;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr,
+            generation: 0,
+        })
     }
 
-    async fn unlink(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
-        let mirrored = self.mirror_path(parent).join(name);
+    async fn unlink(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<()> {
+        let parent_path = self.resolve(parent).await?;
+        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
         if self.is_empty(&mirrored) {
             // Empty paths are virtual mount points; they cannot be removed.
             return Err(libc::EACCES.into());
@@ -1337,13 +1480,23 @@ impl PathFilesystem for HostFs {
         }
         if let Err(e) = tokio_fs::remove_file(self.redirect(&mirrored)).await {
             log_op_err("unlink", &mirrored, Some(&self.redirect(&mirrored)), &e);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                // A stale kernel dentry: drop the mapping.
+                self.inodes.write().await.release_path(&mirrored);
+            } else if e.raw_os_error() == Some(libc::EISDIR) {
+                // Unlinking a directory: the kernel keeps the dentry, so the
+                // name must stay resolvable.
+                self.inodes.write().await.get_or_insert(&mirrored, parent);
+            }
             return Err(e.into());
         }
         log_op_ok("unlink", &mirrored, &self.redirect(&mirrored));
+        self.inodes.write().await.release_path(&mirrored);
         Ok(())
     }
-    async fn rmdir(&self, _req: fuse3::raw::Request, parent: &OsStr, name: &OsStr) -> Result<()> {
-        let mirrored = self.mirror_path(parent).join(name);
+    async fn rmdir(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<()> {
+        let parent_path = self.resolve(parent).await?;
+        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
         if self.is_empty(&mirrored) {
             return Err(libc::EACCES.into());
         }
@@ -1367,22 +1520,35 @@ impl PathFilesystem for HostFs {
         }
         if let Err(e) = tokio_fs::remove_dir(self.redirect(&mirrored)).await {
             log_op_err("rmdir", &mirrored, Some(&self.redirect(&mirrored)), &e);
+            if e.kind() == std::io::ErrorKind::NotFound {
+                // A stale kernel dentry: drop the mapping.
+                self.inodes.write().await.release_path(&mirrored);
+            } else if e.raw_os_error() == Some(libc::ENOTDIR) {
+                // Rmdir of a non-directory: the kernel keeps the dentry, so
+                // the name must stay resolvable.
+                self.inodes.write().await.get_or_insert(&mirrored, parent);
+            }
             return Err(e.into());
         }
         log_op_ok("rmdir", &mirrored, &self.redirect(&mirrored));
+        self.inodes.write().await.release_path(&mirrored);
         Ok(())
     }
 
     async fn rename(
         &self,
-        _req: fuse3::raw::Request,
-        origin_parent: &OsStr,
+        _req: Request,
+        origin_parent: Inode,
         origin_name: &OsStr,
-        parent: &OsStr,
+        parent: Inode,
         name: &OsStr,
     ) -> Result<()> {
-        let old = self.mirror_path(origin_parent).join(origin_name);
-        let new = self.mirror_path(parent).join(name);
+        let origin_parent_path = self.resolve(origin_parent).await?;
+        let new_parent_path = self.resolve(parent).await?;
+        let old = self
+            .mirror_path(origin_parent_path.as_os_str())
+            .join(origin_name);
+        let new = self.mirror_path(new_parent_path.as_os_str()).join(name);
         if self.is_empty(&old) || self.is_empty(&new) {
             return Err(libc::EACCES.into());
         }
@@ -1405,27 +1571,43 @@ impl PathFilesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         if let Err(e) = tokio_fs::rename(self.redirect(&old), self.redirect(&new)).await {
-            log_op_err(
-                "rename",
-                &old,
-                Some(&self.redirect(&new)),
-                &e,
-            );
+            log_op_err("rename", &old, Some(&self.redirect(&new)), &e);
             return Err(e.into());
         }
         log_op_ok("rename", &old, &self.redirect(&new));
+
+        // The kernel moves the dentry on rename, re-hashing `old` as `new`
+        // *keeping the source's nodeid*. Re-point the new path at the source
+        // nodeid — dropping the overwritten target's mapping, which the
+        // kernel is about to forget — so every operation arriving on the
+        // moved dentry still resolves (see `FINDINGS.md`).
+        let mut map = self.inodes.write().await;
+        let source_inode = map.inode_of(&old);
+        let old_target = map.inode_of(&new);
+        fuselog::event(&format!(
+            "INODE rename src_inode={} new={} old_target_inode={}",
+            source_inode
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".into()),
+            fuselog::path_string(new.as_os_str()),
+            old_target
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ));
+        map.rename(&old, &new, parent);
         Ok(())
     }
 
     async fn create(
         &self,
-        _req: fuse3::raw::Request,
-        parent: &OsStr,
+        _req: Request,
+        parent: Inode,
         name: &OsStr,
         mode: u32,
         flags: u32,
     ) -> Result<ReplyCreated> {
-        let mirrored = self.mirror_path(parent).join(name);
+        let parent_path = self.resolve(parent).await?;
+        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
         if !self.writable(&mirrored) {
             log_op_err(
                 "create",
@@ -1487,9 +1669,13 @@ impl PathFilesystem for HostFs {
             };
             let md = file.metadata().await?;
             log_op_ok("create", &mirrored, &self.redirect(&mirrored));
+            let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
+            self.inodes.write().await.open_handle(inode);
+            let mut attr = attr_from_metadata(&md);
+            attr.ino = inode;
             return Ok(ReplyCreated {
                 ttl: TTL,
-                attr: attr_from_metadata(&md),
+                attr,
                 generation: 0,
                 fh: 0,
                 flags: 0,
@@ -1515,8 +1701,11 @@ impl PathFilesystem for HostFs {
             }
         };
         let md = file.metadata().await?;
-        let attr = attr_from_metadata(&md);
+        let mut attr = attr_from_metadata(&md);
         log_op_ok("create-new", &mirrored, &self.redirect(&mirrored));
+        let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
+        self.inodes.write().await.open_handle(inode);
+        attr.ino = inode;
         Ok(ReplyCreated {
             ttl: TTL,
             attr,
@@ -1524,6 +1713,28 @@ impl PathFilesystem for HostFs {
             fh: 0,
             flags: 0,
         })
+    }
+
+    /// Release an open file: all IO is stateless (`fh = 0`), so there is
+    /// nothing to flush — the handle bookkeeping is all that remains. The
+    /// reply mirrors the path API's default (`ENOSYS`), which the kernel
+    /// does not propagate to `close()`.
+    async fn release(
+        &self,
+        _req: Request,
+        inode: Inode,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+    ) -> Result<()> {
+        self.inodes.write().await.close_handle(inode);
+        Err(libc::ENOSYS.into())
+    }
+
+    async fn releasedir(&self, _req: Request, inode: Inode, _fh: u64, _flags: u32) -> Result<()> {
+        self.inodes.write().await.close_handle(inode);
+        Ok(())
     }
 }
 
@@ -1612,7 +1823,6 @@ pub fn start_host_fs(patterns: &crate::spec::internal::Patterns) {
 fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
-    let fs = HostFs::collect(&patterns);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1621,13 +1831,12 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
 
     let outcome = {
         let mp = mountpoint.clone();
-        fuselog::event(&format!(
-            "SERVER start mountpoint={}",
-            mountpoint.display()
-        ));
+        fuselog::event(&format!("SERVER start mountpoint={}", mountpoint.display()));
         runtime.block_on(async move {
             let handle =
-                match mount_with_fallback(&mp, uid, gid, &fs, !fs.has_writable_patterns()).await {
+                match mount_with_fallback(&mp, uid, gid, &patterns, !has_writable_patterns(&patterns))
+                    .await
+                {
                     Ok(handle) => handle,
                     Err(e) => return Err(e),
                 };
@@ -1678,9 +1887,12 @@ async fn mount_with_fallback(
     mountpoint: &Path,
     uid: u32,
     gid: u32,
-    fs: &HostFs,
+    patterns: &Patterns,
     read_only: bool,
 ) -> std::io::Result<fuse3::raw::MountHandle> {
+    // The mount consumes the filesystem, so each attempt builds its own
+    // `HostFs` — cheap (pattern compilation only), and correct: a failed
+    // attempt never reached the kernel, so its inode map was never touched.
     let options = || {
         let mut o = MountOptions::default();
         o.uid(uid)
@@ -1692,12 +1904,12 @@ async fn mount_with_fallback(
         o
     };
     match Session::new(options())
-        .mount_with_unprivileged(fs.clone(), mountpoint)
+        .mount_with_unprivileged(HostFs::collect(patterns), mountpoint)
         .await
     {
         Ok(handle) => Ok(handle),
         Err(unprivileged_err) => Session::new(options())
-            .mount(fs.clone(), mountpoint)
+            .mount(HostFs::collect(patterns), mountpoint)
             .await
             .map_err(|privileged_err| {
                 std::io::Error::other(format!(
@@ -2059,9 +2271,21 @@ mod tests {
             },
         )]));
         assert!(!ro.writable(Path::new("/a/f")));
-        assert!(!ro.has_writable_patterns());
+        assert!(!has_writable_patterns(&Patterns(vec![(
+            "/a".to_string(),
+            Permission::Redirect {
+                source: PathBuf::from("/x"),
+                writable: false,
+            },
+        )])));
         assert!(rw.writable(Path::new("/a/f")));
-        assert!(rw.has_writable_patterns());
+        assert!(has_writable_patterns(&Patterns(vec![(
+            "/a".to_string(),
+            Permission::Redirect {
+                source: PathBuf::from("/x"),
+                writable: true,
+            },
+        )])));
     }
 
     #[test]
@@ -2286,10 +2510,14 @@ mod tests {
 
     #[test]
     fn writable_patterns_are_detected_for_the_mount_options() {
-        assert!(!fs(&[("/etc", Permission::Ro)]).has_writable_patterns());
-        assert!(
-            fs(&[("/etc", Permission::Ro), ("/tmp/x", Permission::Rw)]).has_writable_patterns()
-        );
-        assert!(!fs(&[]).has_writable_patterns());
+        assert!(!has_writable_patterns(&Patterns(vec![(
+            "/etc".to_string(),
+            Permission::Ro
+        )])));
+        assert!(has_writable_patterns(&Patterns(vec![
+            ("/etc".to_string(), Permission::Ro),
+            ("/tmp/x".to_string(), Permission::Rw),
+        ])));
+        assert!(!has_writable_patterns(&Patterns(vec![])));
     }
 }
