@@ -198,6 +198,53 @@ impl Pattern {
         }
     }
 
+    /// Walk the pattern alongside a (partial) path like [`Pattern::walk`],
+    /// also returning how many path components were matched before the
+    /// walk concluded (`None` on `Walk::Fail`): the full path component
+    /// count for `Exact` and `CouldReach`, the pattern's component count
+    /// for `Ancestor`, and the number of components before the `**` for
+    /// `StarStar`. Used to compare *how deep* two patterns reach into a
+    /// directory subtree (the rename restriction, see `HostFs`).
+    pub fn walk_depth(&self, path: &Path) -> Option<(Walk, usize)> {
+        let mut pi = 0;
+        let mut matched = 0usize;
+        for c in path.components() {
+            let Component::Normal(name) = c else {
+                continue;
+            };
+            if pi >= self.comps.len() {
+                // The pattern ran out: it names a strict ancestor (see
+                // `walk` for the non-UTF-8 ordering rationale).
+                return Some((Walk::Ancestor, self.comps.len()));
+            }
+            // Non-UTF-8 components can never match a pattern.
+            let name = name.to_str()?;
+            match &self.comps[pi] {
+                Comp::DoubleStar => {
+                    // The pattern covers this directory and everything
+                    // below it; only the components before the `**` were
+                    // matched literally.
+                    return Some((Walk::StarStar, pi));
+                }
+                Comp::Chars(tokens) => {
+                    let chars: Vec<char> = name.chars().collect();
+                    if !match_component(tokens, &chars) {
+                        return None;
+                    }
+                }
+            }
+            pi += 1;
+            matched += 1;
+        }
+        if pi == self.comps.len() {
+            Some((Walk::Exact, matched))
+        } else if matches!(self.comps[pi], Comp::DoubleStar) {
+            Some((Walk::StarStar, pi))
+        } else {
+            Some((Walk::CouldReach, matched))
+        }
+    }
+
     /// If walking `path` leaves the pattern with a next component that is
     /// purely literal (no wildcards), return that component. Used to
     /// enumerate the virtual directory entries of `empty` paths below a

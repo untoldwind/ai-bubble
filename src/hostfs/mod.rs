@@ -551,6 +551,77 @@ impl HostFs {
         )
     }
 
+    /// Whether some `hide` or `ro` pattern might apply to a path strictly
+    /// below the given mirrored directory — without being uniformly
+    /// shadowed there by a writable pattern that covers the whole subtree.
+    ///
+    /// This is the rename-restriction check: a directory rename carries
+    /// every child from one pattern context to another, so a `hide` or
+    /// `ro` rule that might govern a child must block the move — moving
+    /// the directory out of such a rule's reach would expose (or make
+    /// writable) content that the spec hides or keeps read-only, and
+    /// moving *into* such a subtree would plant content that a later
+    /// move back out could expose the same way. Checked for both the
+    /// source and the destination of a directory rename.
+    fn subtree_restricted(&self, dir: &Path) -> bool {
+        for (idx, p) in self.patterns.iter().enumerate() {
+            if !matches!(p.permission, Permission::Ro | Permission::Hide) {
+                continue;
+            }
+            let Some((walk, depth)) = p.pattern.walk_depth(dir) else {
+                continue;
+            };
+            // How the pattern might govern a strictly-below path:
+            //
+            // * `StarStar`/`CouldReach`: the pattern matches — or could
+            //   match — paths below the directory *directly*, so the
+            //   last-match rule applies and only a **later** pattern
+            //   naming every possible child can shadow it (`**` covers
+            //   the directory and everything below it).
+            // * `Exact`: the pattern names the directory itself — a `hide`
+            //   hides the whole subtree (never shadowable), an `ro` mirror
+            //   is recursive, so its permission reaches every child.
+            // * `Ancestor`: the pattern names a strict ancestor — it
+            //   governs children only through the hide-ancestor rule
+            //   (`hide`, never shadowable) or the nearest-mirrored-
+            //   ancestor fallback (`ro`), which a *deeper* mirrored
+            //   writable ancestor replaces regardless of list order.
+            let shadowed = if matches!(walk, Walk::StarStar | Walk::CouldReach) {
+                self.patterns[idx + 1..].iter().any(|q| {
+                    q.permission.is_writable() && matches!(q.pattern.walk(dir), Walk::StarStar)
+                })
+            } else if walk == Walk::Exact {
+                // The last pattern naming the directory itself decides
+                // the children's fallback permission; a writable one
+                // replaces the `ro` (a `hide` there would have hidden
+                // the directory, and the rename is rejected before this
+                // check even runs).
+                self.patterns[idx + 1..]
+                    .iter()
+                    .rev()
+                    .find(|q| q.names(dir))
+                    .is_some_and(|q| q.permission.is_writable())
+            } else {
+                // Walk::Ancestor: any writable mirrored pattern that
+                // covers the directory itself (or reaches deeper than
+                // this pattern does) is the nearer mirrored ancestor of
+                // every child.
+                self.patterns.iter().any(|q| {
+                    q.permission.is_writable()
+                        && q.pattern.walk_depth(dir).is_some_and(|(w, d)| match w {
+                            Walk::StarStar | Walk::Exact => true,
+                            Walk::Ancestor => d > depth,
+                            Walk::CouldReach | Walk::Fail => false,
+                        })
+                })
+            };
+            if !shadowed {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The attributes of an empty path (or a purely virtual ancestor of
     /// one): a mode-0555 directory, so nothing can be created inside it.
     /// (`ino` is filled in by the callers that know the nodeid.)
@@ -1594,6 +1665,26 @@ impl Filesystem for HostFs {
             );
             return Err(libc::EACCES.into());
         }
+        // A *directory* rename carries every child from one pattern
+        // context to another: a `hide` or `ro` rule that might apply to a
+        // child of the source (or of the destination) must block the
+        // move. Moving the directory out of such a rule's reach would
+        // expose — or make writable — content the spec hides or keeps
+        // read-only (e.g. `/project/src` is `rw` but
+        // `/project/src/**/*.bin` is `hide`); moving another directory
+        // *into* such a subtree is denied as well, so content cannot be
+        // planted there and carried back out with the same effect.
+        let dir_rename = self.is_host_dir(&self.redirect(&old)).await
+            || self.is_host_dir(&self.redirect(&new)).await;
+        if dir_rename && (self.subtree_restricted(&old) || self.subtree_restricted(&new)) {
+            log_op_err(
+                "rename",
+                &old,
+                Some(&self.redirect(&new)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
+            return Err(libc::EACCES.into());
+        }
         if let Err(e) = tokio_fs::rename(self.redirect(&old), self.redirect(&new)).await {
             log_op_err("rename", &old, Some(&self.redirect(&new)), &e);
             return Err(e.into());
@@ -1620,6 +1711,30 @@ impl Filesystem for HostFs {
         ));
         map.rename(&old, &new, parent);
         Ok(())
+    }
+
+    /// Create a symlink: always denied. A host symlink visible through the
+    /// mirror is only ever shown *as a symlink* (never followed), and
+    /// creating one in the sandbox could link outside the mirrored paths —
+    /// so the operation is refused outright. `EACCES` ("Permission denied")
+    /// reports this as the policy decision it is; the implicit `ENOSYS`
+    /// default would instead pretend the feature is missing.
+    async fn symlink(
+        &self,
+        _req: Request,
+        parent: Inode,
+        name: &OsStr,
+        _link: &std::ffi::OsStr,
+    ) -> Result<ReplyEntry> {
+        let parent_path = self.resolve(parent).await?;
+        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
+        log_op_err(
+            "symlink",
+            &mirrored,
+            Some(&self.redirect(&mirrored)),
+            &std::io::Error::from_raw_os_error(libc::EACCES),
+        );
+        Err(libc::EACCES.into())
     }
 
     /// Create a hard link: the new name points at the *same real host file*
@@ -2641,5 +2756,120 @@ mod tests {
         assert!(!f.exists(&weird));
         // The UTF-8 spelling of the same name stays hidden.
         assert!(!f.writable(Path::new("/work/secret")));
+    }
+
+    #[test]
+    fn walk_depth_reports_how_deep_a_pattern_reaches() {
+        let p = Pattern::new("/etc/*.conf").unwrap();
+        assert_eq!(p.walk_depth(Path::new("/etc")), Some((Walk::CouldReach, 1)));
+        assert_eq!(
+            p.walk_depth(Path::new("/etc/foo.conf")),
+            Some((Walk::Exact, 2))
+        );
+        assert_eq!(p.walk_depth(Path::new("/var")), None);
+
+        let p = Pattern::new("/usr/share/**").unwrap();
+        assert_eq!(
+            p.walk_depth(Path::new("/usr/share/doc")),
+            Some((Walk::StarStar, 2))
+        );
+        assert_eq!(
+            p.walk_depth(Path::new("/usr/share")),
+            Some((Walk::StarStar, 2))
+        );
+
+        let p = Pattern::new("/etc").unwrap();
+        assert_eq!(
+            p.walk_depth(Path::new("/etc/passwd")),
+            Some((Walk::Ancestor, 1))
+        );
+    }
+
+    #[test]
+    fn restricted_subtrees_block_directory_renames() {
+        // The motivating case: `/project/src` is rw, but a followup hide
+        // glob might apply to one of its children — the directory must
+        // not be renamable (out of, or into, its pattern context).
+        let f = fs(&[
+            ("/project/src", Permission::Rw),
+            ("/project/src/**/*.bin", Permission::Hide),
+        ]);
+        assert!(f.writable(Path::new("/project/src")));
+        assert!(f.subtree_restricted(Path::new("/project/src")));
+        // Moving some other directory to /project/src is restricted, too:
+        // the *destination* subtree carries the hide rule.
+        assert!(f.subtree_restricted(Path::new("/project/src")));
+        assert!(!f.subtree_restricted(Path::new("/elsewhere")));
+        // Unrelated directories are not restricted.
+        assert!(!f.subtree_restricted(Path::new("/other/place")));
+
+        // The same holds for an ro glob below a writable directory.
+        let f = fs(&[
+            ("/project/src", Permission::Rw),
+            ("/project/src/**/*.bin", Permission::Ro),
+        ]);
+        assert!(f.subtree_restricted(Path::new("/project/src")));
+
+        // An exactly-named ro directory is a recursive mirror: its
+        // children are read-only, so it must not be renamable either.
+        let f = fs(&[
+            ("/project", Permission::Rw),
+            ("/project/src", Permission::Ro),
+        ]);
+        assert!(f.subtree_restricted(Path::new("/project/src")));
+        // ...and the writable parent is restricted, too: the ro child
+        // (and its subtree) would travel with the rename.
+        assert!(f.subtree_restricted(Path::new("/project")));
+        // A sibling subtree without the ro rule inside stays free.
+        assert!(!f.subtree_restricted(Path::new("/project/other")));
+    }
+
+    #[test]
+    fn a_writable_recursive_mirror_shadows_ro_ancestors() {
+        // A broad ro pattern above a deeper rw mirror: the rw mirror is
+        // the nearer mirrored ancestor of everything below it, so the ro
+        // pattern never governs the children — renames inside stay free.
+        let f = fs(&[("/", Permission::Ro), ("/home/me/work", Permission::Rw)]);
+        assert!(!f.subtree_restricted(Path::new("/home/me/work/sub")));
+        // Outside the rw mirror the ro ancestor still governs.
+        assert!(f.subtree_restricted(Path::new("/home/elsewhere")));
+
+        // A `**` rw pattern shadows equally (it names every child).
+        let f = fs(&[("/home", Permission::Ro), ("/home/me/**", Permission::Rw)]);
+        assert!(!f.subtree_restricted(Path::new("/home/me/work")));
+        // ...but only from below the `**`: /home itself is still ro-governed.
+        assert!(f.subtree_restricted(Path::new("/home/other")));
+
+        // Shadowing needs the shadowing pattern to come *after* the
+        // restrictive one: here the later ro re-restricts the subtree.
+        let f = fs(&[
+            ("/home", Permission::Ro),
+            ("/home/me/**", Permission::Rw),
+            ("/home/me/work/*.key", Permission::Ro),
+        ]);
+        assert!(f.subtree_restricted(Path::new("/home/me/work")));
+    }
+
+    #[test]
+    fn an_rw_dir_named_after_the_ro_rule_shadows_it() {
+        // The ro pattern names the directory itself; a later rw pattern
+        // naming it too hands the children's fallback permission to the
+        // writable mirror — renames stay allowed.
+        let f = fs(&[
+            ("/project/src", Permission::Ro),
+            ("/project/src", Permission::Rw),
+        ]);
+        assert!(!f.subtree_restricted(Path::new("/project/src")));
+        // Without the later rw, the ro governs: restricted.
+        let f = fs(&[("/project/src", Permission::Ro)]);
+        assert!(f.subtree_restricted(Path::new("/project/src")));
+    }
+
+    #[test]
+    fn hidden_directories_are_always_restricted_subtrees() {
+        let f = fs(&[("/project/src", Permission::Hide)]);
+        assert!(f.subtree_restricted(Path::new("/project/src")));
+        assert!(f.subtree_restricted(Path::new("/project")));
+        assert!(!f.subtree_restricted(Path::new("/other")));
     }
 }
