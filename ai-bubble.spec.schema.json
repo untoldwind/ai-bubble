@@ -20,7 +20,7 @@
       ]
     },
     "env": {
-      "description": "The isolated environment: the *complete* set of environment variables the sandboxed command sees. Nothing is inherited from the host; use `${VAR}` in the values to copy host variables in explicitly (see [`super::env`]).",
+      "description": "The isolated environment: the *complete* set of environment variables the sandboxed command sees. Nothing is inherited from the host; use `${VAR}` in the values to copy host variables in explicitly, and `env_file` to load dotenv-style entries from a file (see [`super::env`]).",
       "allOf": [
         {
           "$ref": "#/definitions/EnvConfig"
@@ -47,11 +47,25 @@
   "additionalProperties": false,
   "definitions": {
     "EnvConfig": {
-      "description": "The `env` section: variable name → value. A `BTreeMap` keeps the iteration order deterministic.\n\nThe variable names are used as-is (they become the names the sandboxed command sees); only the values are `${VAR}`-expanded.",
+      "description": "The `env` section: the variables of the sandbox's isolated environment.",
       "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/EnvVar"
-      }
+      "properties": {
+        "env_file": {
+          "description": "An optional dotenv-style file (relative to the spec directory) whose `KEY=VALUE` lines are loaded into the environment. Entries already present in [`EnvConfig::values`] win over the file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "values": {
+          "description": "The environment variables, name → value. A `BTreeMap` keeps the iteration order deterministic.\n\nThe variable names are used as-is (they become the names the sandboxed command sees); only the values are `${VAR}`-expanded.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/EnvVar"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "EnvVar": {
       "description": "One environment value: a string whose `${VAR}` references are expanded from the **host** environment while the spec is read (see [`super::file::expand_str`]), so everything downstream only ever sees the fully expanded text.",
@@ -117,7 +131,7 @@
           "additionalProperties": false
         },
         {
-          "description": "The matched paths are hidden (a hidden directory hides its whole subtree).",
+          "description": "The matched paths are hidden (a hidden directory hides its whole subtree).\n\nGlob semantics: `**` spans directory levels only as a **whole** component; inside a longer component (`**secret**`) it degrades to `*` and matches only direct children of the named directory. Use `dir/**/*secret*` to hide every entry named `*secret*` anywhere below `dir`. Matching is case-sensitive.",
           "type": "object",
           "required": [
             "glob",
@@ -409,24 +423,49 @@
       ]
     },
     "NetConfig": {
-      "description": "Network-related configuration for isolated networking.",
-      "type": "object",
-      "properties": {
-        "allow": {
-          "description": "Allow-list of `host` or `host:port` targets for the proxy. Empty means: allow everything.",
-          "default": [],
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
+      "description": "Network-related configuration for the sandboxed command: how it reaches the network.\n\n- `{\"mode\": \"host\"}` (the default): the command shares the host network. - `{\"mode\": \"proxy\", \"allow\": [...]}`: the command runs in a fresh network namespace and its connections are proxied from the host side, gated by `allow`.",
+      "oneOf": [
+        {
+          "description": "Share the host network (the default).",
+          "type": "object",
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "host"
+              ]
+            }
+          },
+          "additionalProperties": false
         },
-        "isolated": {
+        {
           "description": "Run the command in a fresh network namespace and proxy its connections from the host side.",
-          "default": false,
-          "type": "boolean"
+          "type": "object",
+          "required": [
+            "allow",
+            "mode"
+          ],
+          "properties": {
+            "allow": {
+              "description": "Allow-list of `host`, `host:port`, or `*.domain[:port]` targets for the proxy. A `*.domain` entry matches subdomains of `domain` at any depth, but not `domain` itself. Required in proxy mode. Empty means: nothing is proxied — every target must be listed explicitly.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "proxy"
+              ]
+            }
+          },
+          "additionalProperties": false
         }
-      },
-      "additionalProperties": false
+      ]
     }
   }
 }

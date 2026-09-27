@@ -24,13 +24,14 @@ pub const PROXY_ADDR: &str = "127.0.0.2:3128";
 pub const PROXY_URL: &str = "http://127.0.0.2:3128";
 
 /// Check a `host:port` target against the allow-list. An empty list allows
-/// everything. List entries are `host` (any port) or `host:port`. An entry
-/// host may start with `*.` for a simple subdomain wildcard: `*.github.com`
-/// matches `api.github.com` (any suffix ending in `.github.com`), but not
-/// `github.com` itself. Matching is case-insensitive.
+/// nothing: every target must be listed explicitly. List entries are `host`
+/// (any port) or `host:port`. An entry host may start with `*.` for a simple
+/// subdomain wildcard: `*.github.com` matches `api.github.com` (any suffix
+/// ending in `.github.com`), but not `github.com` itself. Matching is
+/// case-insensitive.
 pub fn target_allowed(target: &str, allow: &[String]) -> bool {
     if allow.is_empty() {
-        return true;
+        return false;
     }
     let (host, port) = match target.rsplit_once(':') {
         Some((h, p)) => (h, p.parse::<u16>().ok()),
@@ -246,8 +247,9 @@ mod tests {
         assert!(!target_allowed("evil.com:443", &allow));
         // "localhost" has no port: any port is fine.
         assert!(target_allowed("localhost:1234", &allow));
-        // Empty list allows everything.
-        assert!(target_allowed("anything.example:9999", &[]));
+        // Empty list allows nothing: every target must be listed
+        // explicitly.
+        assert!(!target_allowed("anything.example:9999", &[]));
     }
 
     #[test]
@@ -348,7 +350,10 @@ mod tests {
         let std_listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
         let _ = std_listener.set_nonblocking(true);
         let unix = tokio::net::UnixListener::from_std(std_listener).unwrap();
-        tokio::spawn(serve_connector(unix, vec![]));
+        tokio::spawn(serve_connector(
+            unix,
+            vec![format!("127.0.0.1:{}", echo_addr.port())],
+        ));
 
         // Sandbox-side CONNECT proxy.
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();

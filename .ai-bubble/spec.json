@@ -81,7 +81,7 @@
   },
   "cwd": "${PWD}",
   "net": {
-    "isolated": true,
+    "mode": "proxy",
     "allow": [
       "google.com:443",
       "*.crates.io:443",

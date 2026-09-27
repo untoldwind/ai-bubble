@@ -43,6 +43,12 @@ pub(crate) mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    /// Parse a spec file snippet that is expected to fail, returning the
+    /// error (or panicking when it unexpectedly parses).
+    pub(crate) fn parse_err(json: &str) -> Option<serde_json::Error> {
+        serde_json::from_str::<Spec>(json).err()
+    }
+
     /// The compiled-down ops of a spec file snippet.
     pub(crate) fn compile_ops(json: &str) -> Vec<Op> {
         SandboxConfig::compile(&parse(json)).ops
@@ -491,10 +497,10 @@ QUOTED="quoted file value"
         let dir = std::env::temp_dir().join(format!("ai-bubble-spec-test2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(crate::spec::file::SPEC_FILE);
-        std::fs::write(&path, r#"{ "net": { "isolated": true } }"#).unwrap();
+        std::fs::write(&path, r#"{ "net": { "mode": "proxy", "allow": [] } }"#).unwrap();
         let spec = Spec::load(Some(&dir));
         std::fs::remove_dir_all(&dir).ok();
-        assert!(spec.net.isolated);
+        assert_eq!(spec.net, crate::spec::net::NetConfig::Proxy { allow: vec![] });
     }
 
     #[test]
@@ -607,8 +613,13 @@ QUOTED="quoted file value"
         // ...while other string fields are left untouched: an ${VAR}
         // reference in net.allow or $schema is a literal (and here just
         // an odd, but legal, allow entry).
-        let spec = parse(r#"{ "net": { "allow": ["${RS_BUBBLE_TEST_HOME}:443"] } }"#);
-        assert_eq!(spec.net.allow, ["${RS_BUBBLE_TEST_HOME}:443"]);
+        let spec = parse(r#"{ "net": { "mode": "proxy", "allow": ["${RS_BUBBLE_TEST_HOME}:443"] } }"#);
+        assert_eq!(
+            spec.net,
+            crate::spec::net::NetConfig::Proxy {
+                allow: vec!["${RS_BUBBLE_TEST_HOME}:443".to_string()]
+            }
+        );
         unsafe { std::env::remove_var("RS_BUBBLE_TEST_HOME") };
     }
 
@@ -621,10 +632,11 @@ QUOTED="quoted file value"
             )
             .is_err()
         );
-        // The same reference outside the mapping fields is accepted.
+        // The same reference outside the mapping fields is accepted (in
+        // proxy mode — a `net` object must name its `mode`).
         assert!(
             serde_json::from_str::<Spec>(
-                r#"{ "net": { "allow": ["${RS_BUBBLE_TEST_UNSET}:443"] } }"#
+                r#"{ "net": { "mode": "proxy", "allow": ["${RS_BUBBLE_TEST_UNSET}:443"] } }"#
             )
             .is_ok()
         );

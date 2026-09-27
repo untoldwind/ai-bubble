@@ -25,7 +25,7 @@ root, no mounts at all (not even procfs), and the host network.
     { "type": "dev" },
     { "type": "tmpfs", "path": "/tmp", "perms": "1777" }
   ] },
-  "net": { "isolated": true, "allow": ["example.com:443"] },
+  "net": { "mode": "proxy", "allow": ["example.com:443"] },
   "env": { "values": { "PATH": "${PATH}", "HOME": "${HOME}" } },
   "cwd": "/work"
 }
@@ -74,13 +74,16 @@ root, no mounts at all (not even procfs), and the host network.
 - `proc` — there is no separate `proc` config: procfs is only mounted
   where the spec asks for it, with a `{"type": "proc", "path": ...}`
   mapping (mounted with `MS_NOSUID|MS_NOEXEC|MS_NODEV`)
-- `net.isolated` — run the command in a fresh **network namespace**
-  (no interfaces besides loopback, which ai-bubble brings up) while the
-  ai-bubble process stays on the host and acts as a **TCP proxy**
-- `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`, and an
-  entry host may start with `*.` for a subdomain wildcard (`*.github.com`
-  matches `api.github.com` but not `github.com`).
-  Empty or missing means every target is allowed
+- `net.mode` — how the command reaches the network: `"host"` (default)
+  shares the host network; `"proxy"` runs the command in a fresh
+  **network namespace** (no interfaces besides loopback, which ai-bubble
+  brings up) while the ai-bubble process stays on the host and acts as a
+  **TCP proxy**
+- `net.allow` — allow-list for the proxy (required in `proxy` mode);
+  entries are `HOST[:PORT]`, and an entry host may start with `*.` for a
+  subdomain wildcard (`*.github.com` matches `api.github.com` but not
+  `github.com`).
+  Empty means nothing is proxied — every target must be listed explicitly
 - **Environment variables** — the path-like mapping fields (`glob`,
   `path`, `src`, `dest`, `source`) may reference environment variables
   as `${VAR}` (e.g. `"glob": "${HOME}/project"`); the references are
@@ -129,9 +132,10 @@ Every run of ai-bubble unshares the same namespaces as
 `bwrap --unshare-all` (user, cgroup, ipc, pid, uts, mount). The only knob
 is the network namespace, which corresponds to bwrap's `--share-net`:
 
-- without `net.isolated` → like `bwrap --unshare-all --share-net`
-  (everything unshared, but the command keeps the host network)
-- with `"net": { "isolated": true }` → like plain
+- without `net.mode` (i.e. `"mode": "host"`) → like
+  `bwrap --unshare-all --share-net` (everything unshared, but the command
+  keeps the host network)
+- with `"net": { "mode": "proxy" }` → like plain
   `bwrap --unshare-all` (a fresh network namespace with only a brought-up
   loopback interface — bwrap's `loopback_setup()` — plus ai-bubble's proxy)
 
@@ -218,7 +222,7 @@ Notes:
 
 ## Isolated networking
 
-With `net.isolated = true` the sandboxed command gets a network namespace that
+With `"net": { "mode": "proxy" }` the sandboxed command gets a network namespace that
 is completely isolated from the host (only a freshly brought-up loopback
 interface; the sandbox also gets its own UTS namespace) — while the
 ai-bubble process tree provides a proxy **inside** that namespace, so the
@@ -267,7 +271,7 @@ with `isolated.json`:
     { "type": "bind", "src": "/usr" },
     { "type": "symlink", "src": "usr/lib", "dest": "/lib" }
   ] },
-  "net": { "isolated": true, "allow": ["example.com:443"] }
+  "net": { "mode": "proxy", "allow": ["example.com:443"] }
 }
 ```
 
@@ -410,9 +414,10 @@ sandbox-only `/proc` on top of the host view.
 ## Status
 
 Starter project — the spec file's `hostfs.mappings` (ro, rw, hide, empty,
-dev, tmpfs, proc, bind, symlink, redirect-ro, redirect-rw), `net.isolated`
+dev, tmpfs, proc, bind, symlink, redirect-ro, redirect-rw), `net.mode`
 and `net.allow` are
 implemented. Namespace-wise ai-bubble always unshares user, cgroup, ipc,
 pid, uts and mount namespaces (see "Equivalence with bwrap's namespace
-flags" above); the network namespace is unshared with `net.isolated`.
+flags" above); the network namespace is unshared with
+`"net": { "mode": "proxy" }`.
 Natural next steps would be further bubblewrap option coverage.

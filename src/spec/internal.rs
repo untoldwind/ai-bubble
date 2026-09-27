@@ -20,16 +20,22 @@ use super::tmpfs::TmpfsPerms;
 pub struct Net {
     /// Run the command in a fresh network namespace behind a proxy.
     pub isolated: bool,
-    /// The proxy allow-list; empty means: allow everything. Entries may
+    /// The proxy allow-list; empty means: allow nothing. Entries may
     /// use a `*.` subdomain wildcard.
     pub allow: Vec<String>,
 }
 
 impl From<&NetConfig> for Net {
     fn from(net: &NetConfig) -> Net {
-        Net {
-            isolated: net.isolated,
-            allow: net.allow.clone(),
+        match net {
+            NetConfig::Host => Net {
+                isolated: false,
+                allow: vec![],
+            },
+            NetConfig::Proxy { allow } => Net {
+                isolated: true,
+                allow: allow.clone(),
+            },
         }
     }
 }
