@@ -2,6 +2,8 @@
 name = "ai-bubble"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Minimal bubblewrap-like sandboxing CLI, configured via a spec file"
 
 [build-dependencies]
 schemars = "0.8"

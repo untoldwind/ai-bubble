@@ -2,30 +2,103 @@
 
 The AI bubble that shall not burst.
 
-Run agents in a sandbox similar to a [bubblewrap](https://github.com/flatpak/bubblewrap) (`bwrap`), but with a more focued setup.
+Run agents in a sandbox similar to a [bubblewrap](https://github.com/flatpak/bubblewrap) (`bwrap`), but with a more focused setup.
 
 Key differences:
 
-* The sandbox is configured through a **spec file** (JSON), not through command-line options. By default ai-bubble looks for `.ai-bubble/spec.json` in the current directory; `--spec-dir DIR` points it at a different spec directory. The spec directory itself (and everything in it — `spec.json`, the env file, the project cache) is **always hidden** from the sandboxed command: ai-bubble appends an internal `hide` mapping for it, so even a mapping that mirrors the directory containing it cannot expose it.
-* Network access can be restricted through an embedded http-proxy (not exposing the host network)
-* Filesystem access can be routed through a FUSE filesystem that can be configured via glob patterns. This also acts as a uid/gid translation layer so that the agent can run with its own uid (within its own user-namesoace)
-* `--unshare-all`, `--drop-cap ALL` is pretty much the default (only exception if you actually want to give the agent direct access to the host network)
+* The sandbox is configured through a **spec file** (JSON), not through
+  command-line options. By default ai-bubble looks for `.ai-bubble/spec.json`
+  in the current directory; the global `--spec-dir DIR` option points it at a
+  different spec directory. The spec directory itself (and everything in it —
+  `spec.json`, the env file, the project cache) is **always hidden** from the
+  sandboxed command: ai-bubble appends an internal `hide` mapping for it, so
+  even a mapping that mirrors the directory containing it cannot expose it.
+* Network access can be restricted through an embedded HTTP proxy (not
+  exposing the host network).
+* Filesystem access is served by a FUSE filesystem that is configured via
+  glob patterns. It also acts as a uid/gid translation layer so that the
+  agent can run with its own uid (within its own user namespace).
+* `--unshare-all`, `--cap-drop ALL` is pretty much the default (the only
+  exception is the network namespace, which is only unshared when the spec
+  asks for proxy mode).
+
+## Usage
+
+ai-bubble has sub-commands; `--spec-dir DIR` is a global option that selects
+which spec directory to use (default: `.ai-bubble` in the current
+directory).
+
+```sh
+# Run COMMAND inside the sandbox configured by the spec file.
+# Everything after the first bare argument (or after `--`) is the command,
+# and its own flags pass through verbatim:
+ai-bubble run -- /bin/sh -c 'ls -l'
+ai-bubble run /bin/sh
+ai-bubble --spec-dir custom run -- /bin/sh
+
+# List a host path (default: the current directory), annotated with the
+# effective sandbox permission of the current spec, plus the spec's
+# mappings themselves:
+ai-bubble ls /etc
+
+# Print the JSON Schema for the spec file (see below):
+ai-bubble --print-schema > ai-bubble.spec.schema.json
+```
+
+Notes:
+
+* A missing `.ai-bubble/spec.json` is fine: an **empty spec** is used (empty
+  tmpfs root, no mounts, host network). An *explicit* `--spec-dir` that
+  cannot be read is a hard error.
+* `run` sets `PR_SET_PDEATHSIG` so the sandboxed command is killed with
+  SIGKILL when ai-bubble — or ai-bubble's parent — dies (like bwrap's
+  `--die-with-parent`, which is the default here); `run
+  --no-die-with-parent` switches it off.
+* A typical spec directory:
+
+  ```
+  .ai-bubble/
+  ├── spec.json      # the sandbox spec (see below)
+  ├── env            # optional dotenv-style file (spec: env.env_file)
+  └── cache/         # backing store of `project-cache` mappings
+  ```
+
+### Editor support
+
+The spec file's JSON Schema is generated at build time and printed by
+`ai-bubble --print-schema`. Point an editor at it (e.g. VS Code's
+`json.schemas` setting) to get completion and validation for
+`.ai-bubble/spec.json`; the spec file may also name the schema itself:
+
+```json
+{ "$schema": "./ai-bubble.spec.schema.json", "hostfs": { "mappings": [] } }
+```
+
+The `$schema` field is accepted for editor tooling only and is otherwise
+ignored.
 
 ## Spec file format
 
-All fields are optional. A missing `.ai-bubble/spec.json` means: empty tmpfs
-root, no mounts at all (not even procfs), and the host network.
+All fields are optional. A complete example:
 
 ```json
 {
   "hostfs": { "mappings": [
     { "type": "ro",    "glob": "/usr" },
-    { "type": "bind",  "path": "/etc" },
+    { "type": "rw",    "glob": "${HOME}/project" },
     { "type": "dev" },
-    { "type": "tmpfs", "path": "/tmp", "perms": "1777" }
+    { "type": "tmpfs", "path": "/tmp", "perms": "1777" },
+    { "type": "proc" },
+    { "type": "redirect-ro", "dest": "/etc/motd", "source": "motd" },
+    { "type": "session-cache", "path": "/home/agent/.cache" },
+    { "type": "project-cache", "path": "/home/agent/.local" },
+    { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
   ] },
-  "net": { "mode": "proxy", "allow": ["example.com:443"] },
-  "env": { "values": { "PATH": "${PATH}", "HOME": "${HOME}" } },
+  "net": { "mode": "proxy", "allow": ["example.com:443", "*.github.com"] },
+  "env": {
+    "values": { "PATH": "${PATH}", "HOME": "${HOME}" },
+    "env_file": "env"
+  },
   "cwd": "/work"
 }
 ```
@@ -35,12 +108,14 @@ root, no mounts at all (not even procfs), and the host network.
   host; a missing (or empty) `env` section means the command runs with an
   empty environment. `values` maps variable names to values, which may
   reference host variables as `${VAR}`, so the variables the sandbox
-  needs are copied over explicitly, one by one (e.g.
-  `"PATH": "${PATH}"`). Referencing an unset host variable is an error.
-  Optionally, `env_file` names a dotenv-style file (relative to the spec
-  directory) whose `KEY=VALUE` lines (comments, quotes and an optional
-  `export` prefix are supported) are loaded as well; entries already
-  present in `values` win over the file
+  needs are copied over explicitly, one by one (e.g. `"PATH": "${PATH}"`).
+  Referencing an unset host variable is an error. Optionally, `env_file`
+  names a dotenv-style file (relative to the spec directory) whose
+  `KEY=VALUE` lines (comments, quotes and an optional `export` prefix are
+  supported) are loaded as well; entries already present in `values` win
+  over the file. In proxy mode the proxy variables (see
+  [Isolated networking](#isolated-networking)) are added to this
+  environment, with the spec's `env` entries winning over them.
 
 - `cwd` — the command's **working directory inside the sandbox**
   (default: `/`). An absolute sandbox path without `..` components; it
@@ -48,90 +123,117 @@ root, no mounts at all (not even procfs), and the host network.
   fields. The directory must exist inside the sandbox (e.g. via a
   hostfs mapping or a mount-point mapping such as `tmpfs`) — nothing
   is created automatically, and a missing directory is a hard error
-  right before exec
+  right before exec.
 
 - `hostfs.mappings` — an **ordered** array of mappings, each selecting
   host paths for one treatment (`type`); see below for the details.
-  The mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`, `bind`)
-  name an absolute path exactly and do two things at once: expose the
-  path empty in the host filesystem (a mount point) and stack the
-  corresponding mount op on top of it inside the sandbox —
-  `dev` a minimal `/dev` (defaulting to `path: "/dev"`), `tmpfs` a fresh
-  tmpfs (with optional `perms` and `size`, like bwrap's `--tmpfs`),
-  `proc` a fresh procfs instance (defaulting to `path: "/proc"`), and
-  `bind` the host path `src` at `dest` (which defaults to `src`). Bind
-  mounts bypass the FUSE mirror's permission model, so they are mounted
-  **read-only** unless `"rw": true` is set. The
-  `symlink` mapping creates a symlink at `dest` pointing to `src` (like
-  bwrap's `--symlink`; `src` may be relative to the sandbox root) without
-  touching the host filesystem. The `redirect-ro`/`redirect-rw` mappings
-  show the host file or directory `source` at the sandbox path `dest` —
-  a lightweight bind routed through the FUSE host filesystem (no mount
-  happens; `source` may be relative to the spec directory). All generated
-  ops are applied in
-  mapping order, exactly like bwrap's command line
-- `proc` — there is no separate `proc` config: procfs is only mounted
-  where the spec asks for it, with a `{"type": "proc", "path": ...}`
-  mapping (mounted with `MS_NOSUID|MS_NOEXEC|MS_NODEV`)
-- `net.mode` — how the command reaches the network: `"host"` (default)
-  shares the host network; `"proxy"` runs the command in a fresh
-  **network namespace** (no interfaces besides loopback, which ai-bubble
-  brings up) while the ai-bubble process stays on the host and acts as a
-  **TCP proxy**
-- `net.allow` — allow-list for the proxy (required in `proxy` mode);
-  entries are `HOST[:PORT]`, and an entry host may start with `*.` for a
-  subdomain wildcard (`*.github.com` matches `api.github.com` but not
-  `github.com`).
-  Empty means nothing is proxied — every target must be listed explicitly
+  Everything the sandbox sees of the host filesystem comes from these
+  mappings; when there are any, the FUSE filesystem itself becomes the
+  sandbox root (see [The host filesystem as the sandbox
+  root](#the-host-filesystem-as-the-sandbox-root)), otherwise the
+  sandbox gets a plain tmpfs root and no FUSE filesystem is started.
+
+- `net` — how the command reaches the network; see
+  [Isolated networking](#isolated-networking).
+
+### The mapping types
+
+| `type` | fields | effect |
+|---|---|---|
+| `ro` / `rw` / `hide` | `glob` | mirror the matched paths read-only / read-write / hide them (with their subtree) |
+| `empty` | `path` | expose the path **empty** — a mount point |
+| `dev` | `path` (default `/dev`) | `empty` **plus** a minimal `/dev` mount (like bwrap's `--dev`) |
+| `tmpfs` | `path`, `perms`, `size` | `empty` **plus** a fresh tmpfs (like bwrap's `--tmpfs`; `perms` is an octal mode, e.g. `"1777"` or `1777`, default `0755`; `size` is the maximum size in bytes) |
+| `proc` | `path` (default `/proc`) | `empty` **plus** a fresh procfs instance showing only the sandbox's own processes |
+| `bind` | `src`, `dest` (default `src`), `rw` | `empty` at `dest` **plus** a real bind mount of the host path `src` on top of it; read-only unless `"rw": true` |
+| `redirect-ro` / `redirect-rw` | `dest`, `source` | show the host path `source` at the sandbox path `dest` — a lightweight bind routed through the FUSE filesystem (no mount happens; `source` may be relative to the spec directory) |
+| `session-cache` | `path` | writable, backed by a **per-run temporary directory** (wiped when ai-bubble terminates) |
+| `project-cache` | `path` | writable, backed by the spec directory's `cache` folder — **persists across runs** and is shared by every sandbox using that spec directory |
+| `symlink` | `src`, `dest` | create a symlink at `dest` pointing to `src` (like bwrap's `--symlink`; `src` may be relative to the sandbox root) without touching the host filesystem |
+
+All generated ops are applied in mapping order, exactly like bwrap's
+command line.
+
+### Mapping semantics
+
+- `ro`, `rw` and `hide` select paths with a **glob** pattern of absolute
+  host paths (`*`, `?`, `[...]`, `**`); every other mapping names
+  absolute **paths** exactly (it makes no sense to glob a mount point).
+  Mirrored paths are exposed inside the sandbox at their absolute host
+  paths (`/etc/passwd` → `/etc/passwd`). A mapping that names a directory
+  exactly (`/usr/share/doc`) mirrors that directory **recursively**; `**`
+  spans directory levels (`/usr/share/**/*.rs`). Ancestor directories are
+  shown so the tree is navigable down to the matched leaves.
+- **Order matters**: when a path matches several mappings, the **last**
+  matching mapping decides — e.g. mirror `/etc` and then hide
+  `/etc/passwd`. Put more specific mappings after broader ones.
+- `empty` exposes the named path **empty**: as an empty, unwritable
+  directory (mode 0555) when the path is (or would be) a directory — or as
+  an **empty file** when it matches a real file. Empty paths take
+  *precedence* over the mirror: nothing below them is visible, and they
+  are shown even when a mirror mapping (or the real host path) covers
+  them. Their purpose is to provide mount points for the mount-point
+  mappings (`dev`, `tmpfs`, `proc`, `bind`), which are shorthand for an
+  `empty` mapping *plus* the corresponding mount op.
+- `bind` mounts bypass the FUSE mirror's permission model entirely (the
+  host path appears with its real permissions), so they are mounted
+  **read-only** unless `"rw": true` is set. `redirect-ro`/`redirect-rw`,
+  in contrast, live entirely inside the FUSE filesystem: no mount
+  happens, and the redirected path is monitored and permission-checked
+  like any mirrored path. A redirected path may be a file or a directory
+  (which is then shown with its whole subtree); its `dest` must be
+  absolute, free of wildcards and of `..` components. A relative
+  `source` is resolved relative to the directory the spec file lives in.
+- `session-cache` and `project-cache` are writable redirects with a
+  managed backing directory. The sandbox path maps onto the backing
+  directory plus its relative sub-path (e.g. `/home/a/.cache` →
+  `<root>/home/a/.cache`), so several cache mappings share **one**
+  backing directory without colliding. `session-cache` backs onto a
+  fresh tmp directory per run, wiped once ai-bubble terminates;
+  `project-cache` backs onto `cache/<path>` below the spec directory,
+  which persists across runs.
+- Glob semantics: `**` spans directory levels only as a **whole**
+  component — inside a longer component (`**secret**`) it degrades to `*`
+  and matches only direct children of the named directory (use
+  `dir/**/*secret*` for "any entry whose name contains `secret` anywhere
+  below `dir`"). Matching is **case-sensitive** (`*secret*` does not match
+  `My-Secret.txt`). A path component that is not valid UTF-8 can never
+  match a pattern, so such paths are simply not visible and not writable
+  through the mirror.
+- Hard links (`ln`) require **both** names to be writable, so a read-only
+  mapped file cannot be linked into a writable path and written through
+  the link (the write would follow the host inode and bypass the source's
+  `ro` permission).
+- The host tree is **not** crawled at startup: every FUSE operation
+  matches the requested path against the patterns on the fly, so a large
+  host tree costs nothing and only the accessed paths are touched.
+- Host **symlinks are never followed**: a mirrored symlink is visible only
+  as a symlink (`readlink` shows its target); opening it for reading or
+  writing fails with `ELOOP`, so a mirrored symlink can never expose the
+  content of a path the mappings do not select. The same holds for
+  directory listings, `statfs` and access checks.
+- Writes only go through where a mapping says `rw` (or a redirect says
+  `redirect-rw`): the last mapping naming the path (or its nearest
+  mirrored ancestor — an exactly-named or `**`-covered directory is a
+  recursive mirror, so its permission governs everything below it)
+  decides, and the **real** host file or directory permissions still
+  apply on top. The mount itself is read-only unless some mapping says
+  `rw`.
 - **Environment variables** — the path-like mapping fields (`glob`,
   `path`, `src`, `dest`, `source`) may reference environment variables
   as `${VAR}` (e.g. `"glob": "${HOME}/project"`); the references are
   expanded while the spec is read, so everything downstream only ever
   sees the fully expanded text. Other fields (`net.allow`, ...) are
   never expanded. Referencing an unset variable is an error; only the
-  `${VAR}` form is recognized (a bare `$` stays untouched)
-- `hostfs.mappings` — an **ordered** array of mappings, each selecting
-  host paths for one treatment (`type`): `ro`, `rw` or `hide` select
-  paths with a **glob** pattern of absolute host paths (`"glob"`);
-  `empty` names a single absolute path (`"path"`) exactly. Mirrored
-  paths are exposed inside the sandbox at their absolute host paths
-  (`/etc/passwd` → `/etc/passwd`). A mapping that names a directory
-  exactly (`/usr/share/doc`) mirrors that directory **recursively**; `**`
-  spans directory levels (`/usr/share/**/*.rs`). Ancestor directories are
-  shown so the tree is navigable down to the matched leaves.
-  **Order matters**: when a path matches several mappings, the **last**
-  matching mapping decides — e.g. mirror `/etc` and then hide
-  `/etc/passwd`. A hidden directory hides its whole
-  subtree, too. `ro` mirrors the matched paths **read-only** (they can
-  be read, and executed when the underlying file has the exec bits);
-  `rw` mirrors them **read-write** — content, metadata, creation and
-  deletion are passed through as far as the *real* host file or
-  directory permissions allow, and only if the last mapping naming the
-  path (or its nearest mirrored ancestor) says `rw`. `empty` exposes
-  the named path **empty**: as an empty, unwritable directory (mode
-  0555) when the path is (or would be) a directory — or as an **empty
-  file** when it matches a real file. Empty paths take
-  *precedence* over the mirror: nothing below them is visible, and they
-  are shown even when a mirror mapping (or the real host path) covers
-  them. Their purpose is to provide mount points for the mount-point
-  mappings (`dev`, `tmpfs`, `proc`, `bind`) — see below. Missing
-  or empty mappings expose nothing.
+  `${VAR}` form is recognized (a bare `$` stays untouched).
 
-Everything on the command line (optionally after a `--` separator) is the
-command to run inside the sandbox:
-
-```sh
-ai-bubble -- /bin/sh
-ai-bubble --spec-dir custom /bin/sh
-```
-
-### Equivalence with bwrap's namespace flags
+## Equivalence with bwrap's namespace flags
 
 Every run of ai-bubble unshares the same namespaces as
 `bwrap --unshare-all` (user, cgroup, ipc, pid, uts, mount). The only knob
 is the network namespace, which corresponds to bwrap's `--share-net`:
 
-- without `net.mode` (i.e. `"mode": "host"`) → like
+- without `net` (i.e. `"mode": "host"`) → like
   `bwrap --unshare-all --share-net` (everything unshared, but the command
   keeps the host network)
 - with `"net": { "mode": "proxy" }` → like plain
@@ -167,20 +269,18 @@ Like bwrap, the tool:
    and forwards its exit status.
 5. Marks the mount tree as a **slave**, so nothing mounted inside
    propagates back to the host.
-6. Creates a fresh **tmpfs** as the sandbox root — unless the spec has
-   `hostfs` mappings, in which case the FUSE filesystem itself becomes
-   the root (see below).
+6. Creates the sandbox root: a fresh **tmpfs** — or, when the spec has
+   `hostfs` mappings, the FUSE filesystem itself (see below).
 7. Applies the filesystem ops (all of them generated by the `hostfs`
-   mappings) **in the
-   order they were given** (order matters, exactly like bwrap). Because
-   the PID namespace is created before the mounts (the mounting process
-   is PID 1 of it), a fresh procfs instance only ever shows the
-   sandbox's own processes — never host processes.
+   mappings) **in the order they were given** (order matters, exactly like
+   bwrap). Because the PID namespace is created before the mounts (the
+   mounting process is PID 1 of it), a fresh procfs instance only ever shows
+   the sandbox's own processes — never host processes.
 8. Drops **all capabilities** (permitted, effective, inheritable, ambient
    and the bounding set — like `bwrap --cap-drop ALL`) and `chroot`s into
    the sandbox root, then `execvp`s the command.
 
-The sandbox root starts empty: only what you bind in exists. The standard
+The sandbox root starts empty: only what the mappings expose exists. The standard
 bubblewrap example works the same way here:
 
 ```json
@@ -194,7 +294,7 @@ bubblewrap example works the same way here:
 }
 ```
 
-`ai-bubble -- /bin/sh` then reproduces:
+`ai-bubble run -- /bin/sh` then reproduces:
 
 `/lib`, `/lib64` and `/bin` are symlinks created inside the sandbox, pointing
 into the bound `/usr` — exactly like the corresponding
@@ -241,8 +341,8 @@ Since `execve` replaces the process, ai-bubble forks into three roles:
 - **proxy** (`P`): unshares user + network + cgroup + UTS namespaces, brings
   up loopback, and listens on **`127.0.0.2:3128`** as an **HTTP CONNECT
   proxy**. It forks the actual sandboxed command.
-- **sandbox** (`C`): unshares the mount namespace, builds the tmpfs
-  root and execs COMMAND.
+- **sandbox** (`C`): unshares the mount namespace, builds the sandbox root
+  and execs COMMAND.
 
 The proxy and the command share the network namespace, which means any
 TCP connection to `127.0.0.2` inside the sandbox lands on the proxy —
@@ -259,10 +359,10 @@ besides loopback and no routes to the host, so direct connections
 ### Usage
 
 ```sh
-ai-bubble --spec-dir isolated -- /bin/sh
+ai-bubble --spec-dir isolated run -- /bin/sh
 ```
 
-with `isolated.json`:
+with `isolated/spec.json`:
 
 ```json
 {
@@ -274,6 +374,13 @@ with `isolated.json`:
 }
 ```
 
+`net.allow` is **required** in proxy mode. Entries are `HOST[:PORT]`
+(omitting the port allows any port on that host), and an entry host may
+start with `*.` for a subdomain wildcard (`*.github.com` matches
+`api.github.com` but not `github.com`; it matches subdomains at any
+depth). Empty means nothing is proxied — every target must be listed
+explicitly.
+
 Standard tools automatically use the proxy, because the sandbox sets the
 following variables in its (isolated) environment — entries from the
 spec's `env` section win over these:
@@ -281,6 +388,7 @@ spec's `env` section win over these:
 - `http_proxy` / `HTTP_PROXY` = `http://127.0.0.2:3128`
 - `https_proxy` / `HTTPS_PROXY` = same
 - `all_proxy` / `ALL_PROXY` = same
+- `NO_PROXY` = `localhost,127.0.0.1,::1`
 - `RS_BUBBLE_PROXY` = `/net/sock` (raw protocol, see below)
 
 For example, inside the sandbox:
@@ -302,9 +410,7 @@ printf 'example.com:443\n' >&3
 head -c 1 <&3   # 'K' if the connector connected
 ```
 
-`net.allow` entries (`HOST[:PORT]`) restrict both proxy paths;
-entries without a port allow any port on that host. Without them, every
-target is allowed.
+`net.allow` restricts both proxy paths.
 
 Exit status: the connector forwards the sandbox's status; a killed
 command yields `128+signal`.
@@ -320,9 +426,9 @@ namespace split.
 ## The host filesystem as the sandbox root
 
 With `hostfs` mappings, the FUSE filesystem itself becomes the sandbox
-root instead of a plain tmpfs (and it is not mounted at `/host`): everything
-the mirror exposes appears at its absolute host path, and the ops (`dev`,
-`tmpfs`, proc, binds) are mounted **on top of** it. A sandbox without any
+root instead of a plain tmpfs: everything the mirror exposes appears at
+its absolute host path, and the ops (`dev`, `tmpfs`, `proc`, binds,
+symlinks) are mounted **on top of** it. A sandbox without any
 `hostfs` mappings gets the plain tmpfs root and does not use FUSE at all:
 
 ```json
@@ -342,81 +448,45 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
 }
 ```
 
-- Mappings are standard globs (`*`, `?`, `[...]`, `**`); they must be
-  absolute, and `*` does not cross directory separators (use `**` for
-  that). A mapping that names a directory exactly mirrors it with its
-  whole subtree. The mapping `type` is `ro` (the matched paths are
-  mirrored read-only), `rw` (they are mirrored read-write — writes,
-  creates and deletes are passed through to the real host file system as
-  far as its permissions allow), `hide` (they are hidden; a hidden
-  directory hides its whole subtree) or `empty` (the named path is
-  exposed empty — an empty, unwritable directory, or an empty file when
-  it matches a real file) or `redirect-ro`/`redirect-rw` (the absolute
-  path `dest` is named exactly and shows the host path `source` in its
-  place — a lightweight bind routed through the FUSE filesystem, so it
-  is monitored and permission-checked like any mirrored path; no mount
-  happens, and `source` may be relative to the spec directory). The
-  mappings are tried in the order they are
-  written and the **last** match wins — put more specific mappings after
-  broader ones, e.g. mirror `/etc` and then hide `/etc/ssh`.
-- Glob semantics: `**` spans directory levels only as a **whole**
-  component — inside a longer component (`**secret**`) it degrades to `*`
-  and matches only direct children of the named directory (use
-  `dir/**/*secret*` for "any entry whose name contains `secret` anywhere
-  below `dir`"). Matching is **case-sensitive** (`*secret*` does not match
-  `My-Secret.txt`). A path component that is not valid UTF-8 can never
-  match a pattern, so such paths are simply not visible and not writable
-  through the mirror.
-- Hard links (`ln`) require **both** names to be writable, so a read-only
-  mapped file cannot be linked into a writable path and written through
-  the link (the write would follow the host inode and bypass the source's
-  `ro` permission).
-- The host tree is **not** crawled at startup: every FUSE operation
-  matches the requested path against the patterns on the fly, so a large
-  host tree costs nothing and only the accessed paths are touched.
-- Host **symlinks are never followed**: a mirrored symlink is visible only
-  as a symlink (`readlink` shows its target); opening it for reading or
-  writing fails with `ELOOP`, so a mirrored symlink can never expose the
-  content of a path the mappings do not select. The same holds for
-  directory listings, `statfs` and access checks.
-- Writes only go through where a mapping says `rw`: the last mapping
-  naming the path (or its nearest mirrored ancestor — an exactly-named or
-  `**`-covered directory is a recursive mirror, so its permission governs
-  everything below it) decides, and the **real** host file or directory
-  permissions still apply on top. The mount itself is read-only unless
-  some mapping says `rw`.
-
-### The "empty" mappings are the mount points
-
 ```sh
-ai-bubble --spec-dir hostfs -- /bin/sh
+ai-bubble --spec-dir hostfs run -- /bin/sh
 ```
 
 The mount-point mappings (`empty`, `dev`, `tmpfs`, `proc`, `bind`) expose
 their path as an empty, unwritable (mode 0555) directory — a pure mount
 point, taking *precedence* over the mirror (nothing below it is visible,
-and no mirror pattern can bring content back). It must exist for every
-mount point, because ai-bubble does not create directories on the FUSE
-filesystem itself — which is exactly why the mount-point mappings provide
-it automatically. The `dev` and `tmpfs` mounts (and the fresh procfs,
-from a `proc` mapping or `proc` op) then cover
-the empty dirs, giving a writable `/dev` and `/tmp` and a
-sandbox-only `/proc` on top of the host view.
+and no mirror pattern can bring content back). A mount point must exist,
+because ai-bubble does not create directories on the FUSE filesystem
+itself — which is exactly why the mount-point mappings provide it
+automatically. The `dev` and `tmpfs` mounts (and the fresh procfs, from a
+`proc` mapping) then cover the empty dirs, giving a writable `/dev` and
+`/tmp` and a sandbox-only `/proc` on top of the host view.
+
+Because the FUSE filesystem is the root, the pattern matching and
+permission model of the mappings applies to *every* path in the sandbox
+(see [Mapping semantics](#mapping-semantics) above); the `ls` sub-command
+shows the effective permission for a host path under the current spec.
 
 ## Requirements
 
 - Linux with unprivileged user namespaces enabled
   (`/proc/sys/kernel/unprivileged_userns_clone` must be `1` on Debian/Ubuntu,
   and no LSM must block it).
-- Run tests: `cargo test`
+- FUSE support for the host filesystem (`hostfs` mappings).
+- Build: `cargo build` (the spec file's JSON Schema is generated from the
+  source at build time); run tests: `cargo test`.
 
 ## Status
 
 Starter project — the spec file's `hostfs.mappings` (ro, rw, hide, empty,
-dev, tmpfs, proc, bind, symlink, redirect-ro, redirect-rw), `net.mode`
-and `net.allow` are
-implemented. Namespace-wise ai-bubble always unshares user, cgroup, ipc,
-pid, uts and mount namespaces (see "Equivalence with bwrap's namespace
-flags" above); the network namespace is unshared with
-`"net": { "mode": "proxy" }`.
+dev, tmpfs, proc, bind, symlink, redirect-ro, redirect-rw, session-cache,
+project-cache), `net.mode` and `net.allow` are implemented, along with the
+`run` and `ls` sub-commands and `--print-schema`. Namespace-wise ai-bubble
+always unshares user, cgroup, ipc, pid, uts and mount namespaces (see
+"Equivalence with bwrap's namespace flags" above); the network namespace is
+unshared with `"net": { "mode": "proxy" }`.
 Natural next steps would be further bubblewrap option coverage.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
