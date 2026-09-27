@@ -213,6 +213,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cwd_is_parsed_expanded_and_compiled() {
+        unsafe { std::env::set_var("RS_BUBBLE_TEST_CWD", "/work") };
+        let spec = parse(r#"{ "cwd": "${RS_BUBBLE_TEST_CWD}/project" }"#);
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_CWD") };
+        assert_eq!(spec.cwd.as_deref(), Some("/work/project"));
+        let compiled = SandboxConfig::compile(&spec);
+        assert_eq!(compiled.cwd, Some(PathBuf::from("/work/project")));
+
+        // Without a cwd the command starts at the sandbox root.
+        assert_eq!(SandboxConfig::compile(&parse(r#"{}"#)).cwd, None);
+    }
+
+    #[test]
+    fn cwd_must_be_absolute_and_dotdot_free() {
+        for bad in [
+            r#"{ "cwd": "relative/dir" }"#,
+            r#"{ "cwd": "/a/../.."}"#,
+            r#"{ "cwd": "" }"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Spec>(bad).is_err(),
+                "should reject cwd {bad}"
+            );
+        }
+        // `..` inside a component name is fine; it is not a parent ref.
+        assert!(serde_json::from_str::<Spec>(r#"{ "cwd": "/a..b/c" }"#).is_ok());
+    }
+
+    #[test]
+    fn unset_env_var_in_cwd_is_a_deserialize_error() {
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_UNSET") };
+        assert!(serde_json::from_str::<Spec>(r#"{ "cwd": "${RS_BUBBLE_TEST_UNSET}/x" }"#).is_err());
+    }
+
+    #[test]
     fn unknown_fields_are_rejected() {
         assert!(serde_json::from_str::<Spec>(r#"{ "nope": true }"#).is_err());
         // The top-level "proc" field is gone: procfs is configured with a

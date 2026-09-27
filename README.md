@@ -23,7 +23,8 @@ root, no mounts at all (not even procfs), and the host network.
     { "type": "tmpfs", "path": "/tmp", "perms": "1777" }
   ] },
   "net": { "isolated": true, "allow": ["example.com:443"] },
-  "env": { "PATH": "${PATH}", "HOME": "${HOME}" }
+  "env": { "PATH": "${PATH}", "HOME": "${HOME}" },
+  "cwd": "/work"
 }
 ```
 
@@ -34,6 +35,14 @@ root, no mounts at all (not even procfs), and the host network.
   the variables the sandbox needs are copied over explicitly, one by one
   (e.g. `"PATH": "${PATH}"`). Referencing an unset host variable is an
   error
+
+- `cwd` — the command's **working directory inside the sandbox**
+  (default: `/`). An absolute sandbox path without `..` components; it
+  may reference host variables as `${VAR}` like the path-like mapping
+  fields. The directory must exist inside the sandbox (e.g. via a
+  hostfs mapping or a mount-point mapping such as `tmpfs`) — nothing
+  is created automatically, and a missing directory is a hard error
+  right before exec
 
 - `hostfs.mappings` — an **ordered** array of mappings, each selecting
   host paths for one treatment (`type`); see below for the details.

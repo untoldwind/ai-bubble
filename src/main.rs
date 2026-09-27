@@ -97,6 +97,7 @@ fn main() {
                         &command,
                         &sandbox_config.net,
                         &sandbox_config.env,
+                        sandbox_config.cwd.as_deref(),
                         die_with_parent,
                     );
                 } else {
@@ -104,6 +105,7 @@ fn main() {
                         &sandbox_config.ops,
                         &command,
                         &sandbox_config.env,
+                        sandbox_config.cwd.as_deref(),
                         die_with_parent,
                     );
                 }

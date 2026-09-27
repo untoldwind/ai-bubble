@@ -19,7 +19,8 @@
 //!     { "type": "project-cache", "path": "/home/me/.local" }
 //!   ] },
 //!   "net": { "isolated": true, "allow": ["example.com:443"] },
-//!   "env": { "PATH": "${PATH}", "HOME": "${HOME}" }
+//!   "env": { "PATH": "${PATH}", "HOME": "${HOME}" },
+//!   "cwd": "/work"
 //! }
 //! ```
 //!
@@ -55,6 +56,12 @@
 //! [`super::env`]). Values may use `${VAR}` to copy host variables in
 //! explicitly. Without an `env` section (or with an empty one) the
 //! command runs with an empty environment.
+//!
+//! The working directory: `cwd` sets the directory the command starts
+//! in *inside* the sandbox (default: `/`). Like the path-like mapping
+//! fields it may use `${VAR}` references, must be an absolute sandbox
+//! path without `..` components, and must exist inside the sandbox (be
+//! it through a hostfs mapping or as a mount point).
 
 use std::path::Path;
 
@@ -90,6 +97,20 @@ pub struct Spec {
     /// the host; use `${VAR}` in the values to copy host variables in
     /// explicitly (see [`super::env`]).
     pub env: EnvConfig,
+    /// The working directory of the sandboxed command, *inside* the
+    /// sandbox (default: `/`). Like the path-like mapping fields the
+    /// value may reference host environment variables as `${VAR}`; it
+    /// must be an absolute sandbox path without `..` components. The
+    /// directory must exist inside the sandbox — in hostfs-root mode
+    /// through a mapping, on the tmpfs root because a mount or symlink
+    /// created it. Nothing is created automatically: a missing directory
+    /// is a hard error right before exec.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "cwd_string"
+    )]
+    pub cwd: Option<String>,
     /// Accepted for editor tooling only: it names the JSON schema
     /// (`--print-schema`) so the spec file can get completion and
     /// validation. Never serialized back out.
@@ -135,6 +156,33 @@ impl Spec {
             Err(e) => crate::sandbox::die(&format!("Invalid spec file {}: {e}", path.display())),
         }
     }
+}
+
+/// Deserialize the spec's `cwd` field: a `${VAR}`-expanded, absolute
+/// sandbox path without `..` components (see [`expand_str`] and
+/// [`Spec::cwd`]). The checks run at parse time so a bad working
+/// directory is reported like any other spec error, not as a late
+/// failure right before exec.
+fn cwd_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let raw = String::deserialize(deserializer)?;
+    let expanded = expand_str(&raw).map_err(serde::de::Error::custom)?;
+    let path = Path::new(&expanded);
+    if !path.is_absolute() {
+        return Err(serde::de::Error::custom(format!(
+            "cwd {expanded:?} is not an absolute sandbox path"
+        )));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(serde::de::Error::custom(format!(
+            "cwd {expanded:?} must not contain \"..\" components"
+        )));
+    }
+    Ok(Some(expanded))
 }
 
 /// Expand the `${VAR}` references in one string. Only the `${VAR}` form

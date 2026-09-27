@@ -43,12 +43,14 @@ use crate::spec::internal::{Net, Op};
 /// reach the connector.
 ///
 /// `env` is the sandbox's isolated environment (the spec's `env` section);
-/// the proxy variables are merged into it below.
+/// the proxy variables are merged into it below. `cwd` is the command's
+/// working directory inside the sandbox (see `sandbox::mount_and_exec`).
 pub unsafe fn run(
     ops: &[Op],
     command: &[String],
     net: &Net,
     env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
     die_with_parent: bool,
 ) -> ! {
     unsafe {
@@ -72,7 +74,7 @@ pub unsafe fn run(
         }
         if pid == 0 {
             drop(listener);
-            isolated_parent(&netdir, net, ops, command, env, die_with_parent);
+            isolated_parent(&netdir, net, ops, command, env, cwd, die_with_parent);
         }
 
         // Connector: serve proxy connections from the host side and watch
@@ -104,6 +106,7 @@ unsafe fn isolated_parent(
     ops: &[Op],
     command: &[String],
     env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
     die_with_parent: bool,
 ) -> ! {
     unsafe {
@@ -195,7 +198,7 @@ unsafe fn isolated_parent(
         }
         if child_pid == 0 {
             // PID 1 of its own PID namespace (see pidns_and_exec).
-            pidns_and_exec(&child_ops, command, &child_env, die_with_parent);
+            pidns_and_exec(&child_ops, command, &child_env, cwd, die_with_parent);
         }
 
         // Serve CONNECT requests while the command runs.

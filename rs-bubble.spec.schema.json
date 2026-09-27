@@ -12,6 +12,13 @@
         "null"
       ]
     },
+    "cwd": {
+      "description": "The working directory of the sandboxed command, *inside* the sandbox (default: `/`). Like the path-like mapping fields the value may reference host environment variables as `${VAR}`; it must be an absolute sandbox path without `..` components. The directory must exist inside the sandbox — in hostfs-root mode through a mapping, on the tmpfs root because a mount or symlink created it. Nothing is created automatically: a missing directory is a hard error right before exec.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "env": {
       "description": "The isolated environment: the *complete* set of environment variables the sandboxed command sees. Nothing is inherited from the host; use `${VAR}` in the values to copy host variables in explicitly (see [`super::env`]).",
       "allOf": [
@@ -246,7 +253,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Shorthand for `empty` at `dest` **plus** a bind mount of the host path `src` on top of it. `dest` defaults to `src` — the plain \"bind the real host path at the same path\" case. The field is also accepted under its old name `path` (deprecated alias for `src`).",
+          "description": "Shorthand for `empty` at `dest` **plus** a bind mount of the host path `src` on top of it. `dest` defaults to `src` — the plain \"bind the real host path at the same path\" case. The field is also accepted under its old name `path` (deprecated alias for `src`).\n\nBind mounts bypass the FUSE mirror entirely: the host path appears in the sandbox with its real permissions and no pattern-based write policy. They are therefore mounted **read-only** by default; set `rw: true` to expose the host path read-write (as far as the real host permissions allow).",
           "type": "object",
           "required": [
             "src",
@@ -260,6 +267,11 @@
                 "string",
                 "null"
               ]
+            },
+            "rw": {
+              "description": "Whether the bind mount is writable. Defaults to `false`: bind mounts are read-only unless explicitly asked for.",
+              "default": false,
+              "type": "boolean"
             },
             "src": {
               "description": "An absolute host path to bind (named exactly, no wildcards). Also accepted under its old name `path` (deprecated alias, meaning \"bind at the same path\").",
@@ -321,6 +333,48 @@
               "type": "string",
               "enum": [
                 "redirect-rw"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The named path is backed by a **per-run temporary directory**: a fresh, empty host directory (created under `/tmp` when the sandbox starts) is shown at the path — writable, like `redirect-rw`, but nothing it contains outlives the run. Several `session-cache` mappings share *one* tmp directory: each path maps onto the tmp directory plus its own relative sub-path (e.g. `/home/a/.cache` → `<tmpdir>/home/a/.cache`), so unrelated cache directories never collide. The tmp directory is wiped once rs-bubble terminates (see [`HostFsConfig::prepare_caches`] and `crate::hostfs::set_session_cache_root`).\n\nPurely a FUSE redirect (see [`Mapping::op`]); the mapping is rewritten into a `redirect-rw` at startup — [`Mapping::SessionCache`] mappings only exist in the unresolved config view.",
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "path": {
+              "description": "An absolute sandbox path, named exactly (no wildcards).",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "session-cache"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Like [`Mapping::SessionCache`], but backed by the **project cache** instead of a tmp directory: the path maps onto `cache/<path>` below the directory the spec file lives in (`.rs-bubble/cache/...` by default), so the content persists across runs — and is shared by every sandbox using that spec directory.",
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "path": {
+              "description": "An absolute sandbox path, named exactly (no wildcards).",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "project-cache"
               ]
             }
           },

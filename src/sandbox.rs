@@ -180,10 +180,13 @@ const CAP_LAST: libc::c_ulong = 40; // CAP_CHECKPOINT_RESTORE
 /// mappings, then the sandbox filesystem and exec.
 ///
 /// `env` is the sandbox's isolated environment (see [`mount_and_exec`]).
+/// `cwd` is the command's working directory *inside* the sandbox
+/// (see [`mount_and_exec`]).
 pub unsafe fn setup_and_exec(
     ops: &[Op],
     command: &[String],
     env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
     die_with_parent: bool,
 ) -> ! {
     unsafe {
@@ -245,7 +248,7 @@ pub unsafe fn setup_and_exec(
 
         // The command must also run in its own PID namespace (and get a
         // fresh /proc), like bwrap's --unshare-pid + --proc.
-        pidns_and_exec(ops, command, env, die_with_parent);
+        pidns_and_exec(ops, command, env, cwd, die_with_parent);
     }
 }
 
@@ -277,6 +280,7 @@ pub(crate) unsafe fn pidns_and_exec(
     ops: &[Op],
     command: &[String],
     env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
     die_with_parent: bool,
 ) -> ! {
     unsafe {
@@ -295,7 +299,7 @@ pub(crate) unsafe fn pidns_and_exec(
             // the sandboxed process must bind its own lifecycle to the
             // launcher before doing anything else.
             handle_die_with_parent(die_with_parent);
-            mount_and_exec(ops, command, env);
+            mount_and_exec(ops, command, env, cwd);
         }
 
         // Parent: supervise the PID-1 child and forward its exit status.
@@ -423,6 +427,13 @@ pub(crate) unsafe fn mount_tmpfs(
 /// Everything inherited from the host is dropped first, so nothing leaks
 /// in by accident; the spec decides what exists.
 ///
+/// `cwd` is the command's working directory *inside* the sandbox, from
+/// the spec's `cwd` field (already `${VAR}`-expanded and validated as an
+/// absolute, `..`-free path at parse time). It is entered after the
+/// chroot; the sandbox machinery never verifies that it exists beyond
+/// the chdir itself, which fails with a clean error when it doesn't.
+/// `None` means the sandbox root, `/`.
+///
 /// Unshares the mount namespace. This requires CAP_SYS_ADMIN over the user
 /// namespace owning the *current* mount namespace, so the isolated path
 /// must reach this in the child that inherited the fresh user namespace
@@ -432,6 +443,7 @@ pub(crate) unsafe fn mount_and_exec(
     ops: &[Op],
     command: &[String],
     env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
 ) -> ! {
     unsafe {
         if libc::unshare(libc::CLONE_NEWNS) != 0 {
@@ -776,8 +788,36 @@ pub(crate) unsafe fn mount_and_exec(
         if libc::chroot(CString::new(".").unwrap().as_ptr()) != 0 {
             die_with_error("Can't chroot into sandbox");
         }
-        if libc::chdir(CString::new("/").unwrap().as_ptr()) != 0 {
-            die_with_error("Can't chdir to / in sandbox");
+
+        // The command's working directory: the spec's `cwd` (already
+        // validated as absolute and `..`-free at parse time; re-checked
+        // here defensively), or the sandbox root. The chdir is the point
+        // where a non-existent directory surfaces — with a hint pointing
+        // at the spec, since the sandbox does not create it.
+        let workdir: PathBuf = match cwd {
+            Some(cwd) => {
+                if !cwd.is_absolute()
+                    || cwd
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    die(&format!("Invalid working directory {}", cwd.display()));
+                }
+                cwd.to_path_buf()
+            }
+            None => PathBuf::from("/"),
+        };
+        if libc::chdir(cstring(workdir.as_os_str()).as_ptr()) != 0 {
+            let hint = if crate::hostfs::root_mode() {
+                " (the hostfs root only exposes mirrored paths; add a mapping for it \
+                 or a parent directory to hostfs.mappings)"
+            } else {
+                " (create it with a hostfs mapping or mount it, e.g. with a tmpfs mapping)"
+            };
+            die_with_error(&format!(
+                "Can't chdir to working directory {}{hint}",
+                workdir.display()
+            ));
         }
 
         // All privileged work is done; run the command with as little

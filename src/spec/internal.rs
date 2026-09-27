@@ -51,6 +51,11 @@ pub struct SandboxConfig {
     /// (expansion happens while the spec is parsed, so the values are
     /// fixed here). The command inherits nothing else from the host.
     pub env: BTreeMap<String, String>,
+    /// The working directory of the sandboxed command *inside* the
+    /// sandbox, from the spec's `cwd` field (default: none, meaning `/`).
+    /// Already `${VAR}`-expanded and validated as an absolute, `..`-free
+    /// path at parse time (see `crate::spec::file::cwd_string`).
+    pub cwd: Option<PathBuf>,
 }
 
 impl SandboxConfig {
@@ -76,6 +81,7 @@ impl SandboxConfig {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.0.clone()))
                 .collect(),
+            cwd: spec.cwd.as_deref().map(PathBuf::from),
         }
     }
 }

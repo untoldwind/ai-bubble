@@ -71,6 +71,7 @@
       }
     ]
   },
+  "cwd": "${PWD}",
   "net": {
     "isolated": true,
     "allow": [
