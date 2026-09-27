@@ -113,7 +113,8 @@ pub(crate) mod tests {
                 },
                 Op::Bind {
                     src: "/usr".into(),
-                    dest: PathBuf::from("/usr")
+                    dest: PathBuf::from("/usr"),
+                    rw: false,
                 },
                 Op::Symlink {
                     src: "y".into(),
@@ -353,7 +354,7 @@ pub(crate) mod tests {
             other => panic!("expected an rw mapping, got {other:?}"),
         }
         match &spec.hostfs.mappings[1] {
-            Mapping::Bind { src, dest: None } => assert_eq!(src, "/home/me/etc"),
+            Mapping::Bind { src, dest: None, .. } => assert_eq!(src, "/home/me/etc"),
             other => panic!("expected a bind mapping, got {other:?}"),
         }
     }
@@ -418,7 +419,7 @@ pub(crate) mod tests {
             Op::Dev { .. },
             Op::Tmpfs { .. },
             Op::Proc { .. },
-            Op::Bind { src, dest },
+            Op::Bind { src, dest, .. },
             Op::Symlink {
                 src: symlink_src, ..
             },

@@ -37,11 +37,7 @@
       },
       {
         "type": "rw",
-        "glob": "${HOME}/workspaces"
-      },
-      {
-        "type": "hide",
-        "glob": "${HOME}/workspaces/**/target"
+        "glob": "${PWD}"
       },
       {
         "type": "dev"
@@ -72,13 +68,19 @@
     "allow": [
       "google.com:443",
       "opencode.ai:443",
+      "models.opencode.ai:443",
       "registry.npmjs.org:443",
-      "api.github.com:443"
+      "api.github.com:443",
+      "ai.bettermarks.com:443",
+      "api.tokenfactory.nebius.com:443",
+      "api.together.ai:443"
     ]
   },
   "env": {
     "PATH": "${PATH}",
     "HOME": "${HOME}",
-    "TERM": "${TERM}"
+    "TERM": "${TERM}",
+    "NEBIUS_TOKEN": "${NEBIUS_TOKEN}",
+    "TOGETHER_AI_TOKEN": "${TOGETHER_AI_TOKEN}"
   }
 }

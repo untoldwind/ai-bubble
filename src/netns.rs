@@ -182,6 +182,9 @@ unsafe fn isolated_parent(
         let child_ops: Vec<Op> = std::iter::once(Op::Bind {
             src: netdir.display().to_string(),
             dest: PathBuf::from("/net"),
+            // The connector's Unix socket at /net/sock must be connectable;
+            // keep this internal bind writable.
+            rw: true,
         })
         .chain(ops.iter().cloned())
         .collect();

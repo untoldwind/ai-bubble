@@ -96,6 +96,12 @@ pub enum Mapping {
     /// "bind the real host path at the same path" case. The field is
     /// also accepted under its old name `path` (deprecated alias for
     /// `src`).
+    ///
+    /// Bind mounts bypass the FUSE mirror entirely: the host path appears
+    /// in the sandbox with its real permissions and no pattern-based
+    /// write policy. They are therefore mounted **read-only** by default;
+    /// set `rw: true` to expose the host path read-write (as far as the
+    /// real host permissions allow).
     Bind {
         /// An absolute host path to bind (named exactly, no wildcards).
         /// Also accepted under its old name `path` (deprecated alias,
@@ -105,6 +111,10 @@ pub enum Mapping {
         /// An absolute sandbox path to bind it at. Defaults to `src`.
         #[serde(default)]
         dest: Option<String>,
+        /// Whether the bind mount is writable. Defaults to `false`:
+        /// bind mounts are read-only unless explicitly asked for.
+        #[serde(default)]
+        rw: bool,
     },
     /// A **lightweight bind** routed through the host filesystem: the
     /// host file or directory `source` is shown *in the FUSE mirror* at
@@ -233,6 +243,7 @@ enum UncheckedMapping {
         src: String,
         #[serde(default, deserialize_with = "env_opt_string")]
         dest: Option<String>,
+        rw: Option<bool>,
     },
     #[serde(rename = "redirect-ro")]
     RedirectRo {
@@ -341,12 +352,13 @@ impl TryFrom<UncheckedMapping> for Mapping {
             UncheckedMapping::Proc { path } => Mapping::Proc {
                 path: absolute("proc", "path", path)?,
             },
-            UncheckedMapping::Bind { src, dest } => Mapping::Bind {
+            UncheckedMapping::Bind { src, dest, rw } => Mapping::Bind {
                 src: absolute("bind", "src", src)?,
                 dest: match dest {
                     Some(dest) => Some(absolute("bind", "dest", dest)?),
                     None => None,
                 },
+                rw: rw.unwrap_or(false),
             },
             UncheckedMapping::RedirectRo { dest, source } => Mapping::RedirectRo {
                 dest: redirect_dest("redirect-ro", dest)?,
@@ -391,7 +403,7 @@ impl Mapping {
             | Mapping::Dev { path }
             | Mapping::Tmpfs { path, .. }
             | Mapping::Proc { path } => Some(path),
-            Mapping::Bind { src, dest } => Some(dest.as_deref().unwrap_or(src)),
+            Mapping::Bind { src, dest, .. } => Some(dest.as_deref().unwrap_or(src)),
             Mapping::RedirectRo { dest, .. } | Mapping::RedirectRw { dest, .. } => Some(dest),
             Mapping::SessionCache { path } | Mapping::ProjectCache { path } => Some(path),
             Mapping::Symlink { .. } => None,
@@ -409,9 +421,11 @@ impl Mapping {
             Mapping::Dev { path } => format!("dev    {path}"),
             Mapping::Tmpfs { path, .. } => format!("tmpfs  {path}"),
             Mapping::Proc { path } => format!("proc   {path}"),
-            Mapping::Bind { src, dest } => match dest {
-                Some(dest) => format!("bind   {src} -> {dest}"),
-                None => format!("bind   {src}"),
+            Mapping::Bind { src, dest, rw } => match (rw, dest) {
+                (false, Some(dest)) => format!("bind-ro {src} -> {dest}"),
+                (false, None) => format!("bind-ro {src}"),
+                (true, Some(dest)) => format!("bind-rw {src} -> {dest}"),
+                (true, None) => format!("bind-rw {src}"),
             },
             Mapping::RedirectRo { dest, source } => {
                 format!("redirect-ro {source} -> {dest}")
@@ -476,9 +490,10 @@ impl Mapping {
             Mapping::Proc { path } => Some(Op::Proc {
                 dest: PathBuf::from(path),
             }),
-            Mapping::Bind { src, dest } => Some(Op::Bind {
+            Mapping::Bind { src, dest, rw } => Some(Op::Bind {
                 src: src.clone(),
                 dest: PathBuf::from(dest.as_deref().unwrap_or(src)),
+                rw: *rw,
             }),
             Mapping::Symlink { src, dest } => Some(Op::Symlink {
                 src: src.clone(),
@@ -750,7 +765,8 @@ mod tests {
                 { "type": "tmpfs", "path": "/var/tmp" },
                 { "type": "proc", "path": "/proc" },
                 { "type": "bind", "src": "/usr" },
-                { "type": "bind", "src": "/opt/extra", "dest": "/extra" }
+                { "type": "bind", "src": "/opt/extra", "dest": "/extra" },
+                { "type": "bind", "src": "/var/data", "dest": "/data", "rw": true }
             ] } }"#,
         );
         // The FUSE side sees an empty path for every mount-point mapping,
@@ -764,6 +780,7 @@ mod tests {
                 ("/proc".to_string(), Permission::Empty),
                 ("/usr".to_string(), Permission::Empty),
                 ("/extra".to_string(), Permission::Empty),
+                ("/data".to_string(), Permission::Empty),
             ])
         );
         // The sandbox side gets the ops, in mapping order.
@@ -788,11 +805,18 @@ mod tests {
                 },
                 Op::Bind {
                     src: "/usr".to_string(),
-                    dest: PathBuf::from("/usr")
+                    dest: PathBuf::from("/usr"),
+                    rw: false
                 },
                 Op::Bind {
                     src: "/opt/extra".to_string(),
-                    dest: PathBuf::from("/extra")
+                    dest: PathBuf::from("/extra"),
+                    rw: false
+                },
+                Op::Bind {
+                    src: "/var/data".to_string(),
+                    dest: PathBuf::from("/data"),
+                    rw: true
                 },
             ]
         );
@@ -818,7 +842,8 @@ mod tests {
             vec![
                 Op::Bind {
                     src: "/usr".to_string(),
-                    dest: PathBuf::from("/usr")
+                    dest: PathBuf::from("/usr"),
+                    rw: false
                 },
                 Op::Symlink {
                     src: "usr/lib".to_string(),
@@ -1016,6 +1041,42 @@ mod tests {
     }
 
     #[test]
+    fn bind_mounts_are_read_only_by_default() {
+        // A bind mount bypasses the FUSE mirror's write policy, so it is
+        // read-only unless the spec explicitly asks for `rw: true`.
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "bind", "src": "/etc" },
+                { "type": "bind", "src": "/data", "rw": true }
+            ] } }"#,
+        );
+        assert_eq!(
+            spec.hostfs.ops(),
+            vec![
+                Op::Bind {
+                    src: "/etc".to_string(),
+                    dest: PathBuf::from("/etc"),
+                    rw: false
+                },
+                Op::Bind {
+                    src: "/data".to_string(),
+                    dest: PathBuf::from("/data"),
+                    rw: true
+                },
+            ]
+        );
+        assert_eq!(spec.hostfs.mappings[0].describe(), "bind-ro /etc");
+        assert_eq!(spec.hostfs.mappings[1].describe(), "bind-rw /data");
+        // A non-boolean `rw` is rejected.
+        assert!(
+            serde_json::from_str::<crate::spec::Spec>(
+                r#"{ "hostfs": { "mappings": [ { "type": "bind", "src": "/etc", "rw": "yes" } ] } }"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn empty_tmpfs_and_bind_require_a_src() {
         for mapping in [
             r#"{ "type": "empty" }"#,
@@ -1087,7 +1148,8 @@ mod tests {
             spec.hostfs.ops(),
             vec![Op::Bind {
                 src: "/etc".to_string(),
-                dest: PathBuf::from("/etc")
+                dest: PathBuf::from("/etc"),
+                rw: false
             }]
         );
         assert_eq!(

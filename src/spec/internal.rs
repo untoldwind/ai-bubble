@@ -86,11 +86,12 @@ impl Op {
     /// performs.
     pub fn describe(&self) -> String {
         match self {
-            Op::Bind { src, dest } => {
+            Op::Bind { src, dest, rw } => {
+                let kind = if *rw { "bind-rw" } else { "bind-ro" };
                 if src == &dest.to_string_lossy() {
-                    format!("bind   {src}")
+                    format!("{kind} {src}")
                 } else {
-                    format!("bind   {src} -> {}", dest.display())
+                    format!("{kind} {src} -> {}", dest.display())
                 }
             }
             Op::Symlink { src, dest } => format!("symlink {} -> {src}", dest.display()),
@@ -116,9 +117,13 @@ impl Op {
 /// [`crate::spec::hostfs::Mapping::op`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
+    /// Bind-mount the host path `src` at `dest` inside the sandbox.
+    /// Bind mounts bypass the FUSE mirror's policy, so they are mounted
+    /// read-only unless `rw` is set (see [`crate::spec::hostfs::Mapping::Bind`]).
     Bind {
         src: String,
         dest: PathBuf,
+        rw: bool,
     },
     Symlink {
         src: String,

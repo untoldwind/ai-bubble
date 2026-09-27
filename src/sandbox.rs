@@ -514,7 +514,7 @@ pub(crate) unsafe fn mount_and_exec(
         // Apply the setup operations in order.
         for op in ops {
             match op {
-                Op::Bind { src, dest } => {
+                Op::Bind { src, dest, rw } => {
                     if dest
                         .components()
                         .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -542,6 +542,25 @@ pub(crate) unsafe fn mount_and_exec(
                     ) != 0
                     {
                         die_with_error(&format!("Can't bind mount {src} -> {}", dest.display()));
+                    }
+                    // Bind mounts are read-only unless explicitly asked for
+                    // (they bypass the FUSE mirror's write policy). The
+                    // read-only flag is applied with a remount: MS_BIND
+                    // mounts do not reliably pick up MS_RDONLY in the
+                    // initial mount call.
+                    if !rw
+                        && libc::mount(
+                            std::ptr::null(),
+                            dest_c.as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                            std::ptr::null(),
+                        ) != 0
+                    {
+                        die_with_error(&format!(
+                            "Can't make bind mount {src} -> {} read-only",
+                            dest.display()
+                        ));
                     }
                 }
                 Op::Proc { dest } => {

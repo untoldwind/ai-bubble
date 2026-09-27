@@ -44,7 +44,9 @@ root, no mounts at all (not even procfs), and the host network.
   `dev` a minimal `/dev` (defaulting to `path: "/dev"`), `tmpfs` a fresh
   tmpfs (with optional `perms` and `size`, like bwrap's `--tmpfs`),
   `proc` a fresh procfs instance (defaulting to `path: "/proc"`), and
-  `bind` the host path `src` at `dest` (which defaults to `src`). The
+  `bind` the host path `src` at `dest` (which defaults to `src`). Bind
+  mounts bypass the FUSE mirror's permission model, so they are mounted
+  **read-only** unless `"rw": true` is set. The
   `symlink` mapping creates a symlink at `dest` pointing to `src` (like
   bwrap's `--symlink`; `src` may be relative to the sandbox root) without
   touching the host filesystem. The `redirect-ro`/`redirect-rw` mappings
@@ -378,5 +380,4 @@ and `net.allow` are
 implemented. Namespace-wise rs-bubble always unshares user, cgroup, ipc,
 pid, uts and mount namespaces (see "Equivalence with bwrap's namespace
 flags" above); the network namespace is unshared with `net.isolated`.
-Natural next steps would be read-only bind mounts and further
-bubblewrap option coverage.
+Natural next steps would be further bubblewrap option coverage.
