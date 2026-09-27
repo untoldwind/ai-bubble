@@ -77,9 +77,11 @@
     "allow": [
       "google.com:443",
       "index.crates.io:443",
+      "static.crates.io:443",
       "opencode.ai:443",
       "models.opencode.ai:443",
       "registry.npmjs.org:443",
+      "github.com:443",
       "api.github.com:443",
       "ai.bettermarks.com:443",
       "api.tokenfactory.nebius.com:443",

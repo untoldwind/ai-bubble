@@ -767,11 +767,15 @@ impl PathFilesystem for HostFs {
         // openable (a directory that merely leads to a match is not), and
         // symlinks are never followed: a host symlink cannot be opened
         // through the mirror (its target may not be mirrored at all).
-        match tokio_fs::symlink_metadata(self.redirect(&mirrored)).await {
-            Ok(md) if md.file_type().is_symlink() => return Err(libc::ELOOP.into()),
-            Ok(md) if md.is_dir() => return Err(libc::EISDIR.into()),
-            Ok(_) => {}
-            Err(_) => return Err(libc::EISDIR.into()),
+        let md = match tokio_fs::symlink_metadata(self.redirect(&mirrored)).await {
+            Ok(md) => md,
+            Err(_) => return Err(libc::ENOENT.into()),
+        };
+        if md.file_type().is_symlink() {
+            return Err(libc::ELOOP.into());
+        }
+        if md.is_dir() {
+            return Err(libc::EISDIR.into());
         }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
         if write_flags && !self.writable(&mirrored) {
@@ -779,6 +783,18 @@ impl PathFilesystem for HostFs {
             // never writable; the real file permissions are checked by the
             // host filesystem on the actual write.
             return Err(libc::EACCES.into());
+        }
+        // The kernel passes O_TRUNC through to the server: the server must
+        // do the truncation itself. Write paths (rustc, cargo, …) always
+        // open their outputs with O_TRUNC, so ignoring it would leave the
+        // tail of the old content in place behind the newly written data.
+        if write_flags && flags & libc::O_TRUNC as u32 != 0 {
+            tokio_fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(self.redirect(&mirrored))
+                .await?;
         }
         // fh 0 = stateless IO; every read re-opens the host file.
         Ok(ReplyOpen { fh: 0, flags: 0 })
@@ -1219,13 +1235,40 @@ impl PathFilesystem for HostFs {
         if !self.writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
-        // Only a *real* entry at the target means EEXIST; a path merely
-        // matched by a wildcard pattern may not exist yet.
-        if tokio_fs::symlink_metadata(self.redirect(&mirrored))
-            .await
-            .is_ok()
-        {
-            return Err(libc::EEXIST.into());
+        // Only with O_EXCL does a *real* entry at the target mean EEXIST;
+        // a plain O_CREAT (without O_EXCL) opens an existing file like the
+        // host filesystem would. A path merely matched by a wildcard
+        // pattern may not exist yet.
+        let existing = match tokio_fs::symlink_metadata(self.redirect(&mirrored)).await {
+            Ok(md) => Some(md),
+            Err(_) => None,
+        };
+        let excl = flags & libc::O_EXCL as u32 != 0;
+        let truncate = flags & libc::O_TRUNC as u32 != 0;
+        if let Some(md) = existing {
+            if md.file_type().is_symlink() {
+                return Err(libc::ELOOP.into());
+            }
+            if excl {
+                return Err(libc::EEXIST.into());
+            }
+            if md.is_dir() {
+                return Err(libc::EISDIR.into());
+            }
+            let mut opts = tokio_fs::OpenOptions::new();
+            opts.write(true).custom_flags(libc::O_NOFOLLOW);
+            if truncate {
+                opts.truncate(true);
+            }
+            let file = opts.open(self.redirect(&mirrored)).await?;
+            let md = file.metadata().await?;
+            return Ok(ReplyCreated {
+                ttl: TTL,
+                attr: attr_from_metadata(&md),
+                generation: 0,
+                fh: 0,
+                flags: 0,
+            });
         }
         let mut opts = tokio_fs::OpenOptions::new();
         opts.write(true).create_new(true);
