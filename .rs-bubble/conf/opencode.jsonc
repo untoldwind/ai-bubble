@@ -1,0 +1,158 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "lsp": true,
+  "provider": {
+    "anthropic": {
+      "name": "Anthropic AI Gateway PRO",
+      // https://ai-sdk.dev/providers/ai-sdk-providers/anthropic
+      "npm": "@ai-sdk/anthropic",
+      "options": {
+        "baseURL": "https://ai.bettermarks.com/anthropic",
+        "headers": {
+          "Cf-Access-Token": "{env:CF_ACCESS_TOKEN}",
+        },
+        "apiKey": "dummy",
+      },
+      "models": {
+        // @see https://developers.cloudflare.com/ai/models/?authors=anthropic
+        "claude-sonnet-4-6": {},
+        "claude-opus-4-8": {},
+        "claude-haiku-4-5": {},
+      },
+      "whitelist": ["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5"],
+    },
+    "cloudflare-worker-ai": {
+      "name": "Worker AI PRO",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://ai.bettermarks.com/ai/v1",
+        "headers": {
+          "Cf-Access-Token": "{env:CF_ACCESS_TOKEN}",
+        },
+      },
+      "models": {
+        "@cf/moonshotai/kimi-k2.7-code": {
+          "name": "kimi-k2.7",
+          "cost": {
+            "input": 0.95,
+            "output": 4,
+            "cache_read": 0.19
+          }
+        },
+        "@cf/google/gemma-4-26b-a4b-it": {
+          "name": "gemma-4-26b-a4b-it",
+          "limit": {
+            "context": 25600,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0.1,
+            "output": 0.3,
+            "cache_read": 0.19
+          }
+        },
+        "@cf/deepseek-ai/deepseek-v4-flash-0731": {
+          "name": "deepseek-v4-flash-0731",
+          "variants": {
+            "low": {
+              "reasoningEffort": "low",
+            },
+            "high": {
+              "reasoningEffort": "high",
+            },
+            "max": {
+              "reasoningEffort": "max",
+            },
+          },
+          "limit": {
+            "context": 1310720,
+            "output": 1048576
+          },
+          "cost": {
+            "input": 0.44,
+            "output": 1.32,
+            "cache_read": 0.014
+          }
+        },
+        "@cf/zai-org/glm-5.3-flash": {
+          "name": "glm-5.3-flash",
+          "variants": {
+            "low": {
+              "reasoningEffort": "low",
+            },
+            "high": {
+              "reasoningEffort": "high",
+            },
+            "max": {
+              "reasoningEffort": "max",
+            },
+          },
+          "limit": {
+            "context": 1310720,
+            "output": 1048576
+          },
+          "cost": {
+            "input": 0.15,
+            "output": 0.5,
+            "cache_read": 0.03
+          }
+        },
+      },
+      "whitelist": [
+        "@cf/moonshotai/kimi-k2.7-code",
+        "@cf/google/gemma-4-26b-a4b-it",
+        "@cf/zai-org/glm-5.3-flash",
+      ],
+    },
+    "google-ai-studio": {
+      "name": "Google AI Studio Gateway PRO",
+      // https://ai-sdk.dev/providers/ai-sdk-providers/google-generative-ai
+      "npm": "@ai-sdk/google",
+      "options": {
+        "baseURL": "https://ai.bettermarks.com/google-ai-studio/v1beta",
+        "headers": {
+          "Cf-Access-Token": "{env:CF_ACCESS_TOKEN}",
+        },
+        "apiKey": "dummy",
+      },
+      "models": {
+        // @see https://developers.cloudflare.com/ai/models/?authors=google
+        "gemini-3.1-pro-preview": {},
+        "gemini-3.5-flash": {},
+      },
+      "whitelist": ["gemini-3.1-pro-preview", "gemini-3.5-flash"],
+    },
+    "openai": {
+      "name": "OpenAI Gateway PRO",
+      // https://ai-sdk.dev/providers/ai-sdk-providers/openai
+      "npm": "@ai-sdk/openai",
+      "options": {
+        "baseURL": "https://ai.bettermarks.com/openai",
+        "headers": {
+          "Cf-Access-Token": "{env:CF_ACCESS_TOKEN}",
+        },
+        "apiKey": "dummy",
+      },
+      "models": {
+        // @see https://developers.cloudflare.com/ai/models/?authors=openai
+        "gpt-4o-mini": {},
+        "gpt-5.5": {},
+      },
+      "whitelist": ["gpt-4o-mini", "gpt-5.5"],
+    },
+    "nebius": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "apiKey": "{env:NEBIUS_TOKEN}",
+      },
+    },
+    "togetherai": {
+      "npm": "@ai-sdk/togetherai",
+      "options": {
+        "apiKey": "{env:TOGETHER_AI_TOKEN}",
+      },
+    },
+  },
+  "model": "cloudflare-worker-ai/@cf/google/gemma-4-26b-a4b-it",
+  "share": "disabled",
+}

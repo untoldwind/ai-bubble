@@ -23,7 +23,7 @@ root, no mounts at all (not even procfs), and the host network.
     { "type": "tmpfs", "path": "/tmp", "perms": "1777" }
   ] },
   "net": { "isolated": true, "allow": ["example.com:443"] },
-  "env": { "PATH": "${PATH}", "HOME": "${HOME}" },
+  "env": { "values": { "PATH": "${PATH}", "HOME": "${HOME}" } },
   "cwd": "/work"
 }
 ```
@@ -31,10 +31,14 @@ root, no mounts at all (not even procfs), and the host network.
 - `env` — the sandbox's **isolated environment**: the *complete* set of
   environment variables the command sees. Nothing is inherited from the
   host; a missing (or empty) `env` section means the command runs with an
-  empty environment. Values may reference host variables as `${VAR}`, so
-  the variables the sandbox needs are copied over explicitly, one by one
-  (e.g. `"PATH": "${PATH}"`). Referencing an unset host variable is an
-  error
+  empty environment. `values` maps variable names to values, which may
+  reference host variables as `${VAR}`, so the variables the sandbox
+  needs are copied over explicitly, one by one (e.g.
+  `"PATH": "${PATH}"`). Referencing an unset host variable is an error.
+  Optionally, `env_file` names a dotenv-style file (relative to the spec
+  directory) whose `KEY=VALUE` lines (comments, quotes and an optional
+  `export` prefix are supported) are loaded as well; entries already
+  present in `values` win over the file
 
 - `cwd` — the command's **working directory inside the sandbox**
   (default: `/`). An absolute sandbox path without `..` components; it

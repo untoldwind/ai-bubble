@@ -19,7 +19,10 @@
 //!     { "type": "project-cache", "path": "/home/me/.local" }
 //!   ] },
 //!   "net": { "isolated": true, "allow": ["example.com:443"] },
-//!   "env": { "PATH": "${PATH}", "HOME": "${HOME}" },
+//!   "env": {
+//!     "values": { "PATH": "${PATH}", "HOME": "${HOME}" },
+//!     "env_file": ".env"
+//!   },
 //!   "cwd": "/work"
 //! }
 //! ```
@@ -53,9 +56,11 @@
 //! The environment: the sandboxed command does *not* inherit the host's
 //! environment — like the filesystem, the environment is isolated, and
 //! the `env` section decides what exists inside it (see
-//! [`super::env`]). Values may use `${VAR}` to copy host variables in
-//! explicitly. Without an `env` section (or with an empty one) the
-//! command runs with an empty environment.
+//! [`super::env`]). Its `values` map may use `${VAR}` to copy host
+//! variables in explicitly, and its optional `env_file` loads
+//! dotenv-style entries from a file next to the spec. Without an `env`
+//! section (or with an empty one) the command runs with an empty
+//! environment.
 //!
 //! The working directory: `cwd` sets the directory the command starts
 //! in *inside* the sandbox (default: `/`). Like the path-like mapping
@@ -95,7 +100,8 @@ pub struct Spec {
     /// The isolated environment: the *complete* set of environment
     /// variables the sandboxed command sees. Nothing is inherited from
     /// the host; use `${VAR}` in the values to copy host variables in
-    /// explicitly (see [`super::env`]).
+    /// explicitly, and `env_file` to load dotenv-style entries from a
+    /// file (see [`super::env`]).
     pub env: EnvConfig,
     /// The working directory of the sandboxed command, *inside* the
     /// sandbox (default: `/`). Like the path-like mapping fields the
@@ -150,6 +156,12 @@ impl Spec {
                 // relative to the directory the spec file lives in.
                 if let Some(dir) = path.parent() {
                     spec.hostfs.resolve_relative_sources(dir);
+                    // Same for the env file: it is resolved against the
+                    // spec directory and its entries merged into
+                    // `env.values` right away.
+                    if let Err(e) = spec.env.load_env_file(dir) {
+                        crate::sandbox::die(&e);
+                    }
                 }
                 spec
             }

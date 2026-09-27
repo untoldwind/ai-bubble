@@ -89,10 +89,11 @@
     ]
   },
   "env": {
-    "PATH": "${PATH}",
-    "HOME": "${HOME}",
-    "TERM": "${TERM}",
-    "NEBIUS_TOKEN": "${NEBIUS_TOKEN}",
-    "TOGETHER_AI_TOKEN": "${TOGETHER_AI_TOKEN}"
+    "env_file": "${HOME}/workspaces/o1/ai-sandbox/.env",
+    "values": {
+      "PATH": "${PATH}",
+      "HOME": "${HOME}",
+      "TERM": "${TERM}"
+    }
   }
 }

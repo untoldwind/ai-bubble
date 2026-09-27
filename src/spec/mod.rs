@@ -55,15 +55,15 @@ pub(crate) mod tests {
         // values are ${VAR}-expanded from the host, like the path-like
         // mapping fields.
         let spec = parse(
-            r#"{ "env": {
+            r#"{ "env": { "values": {
                     "PATH": "${PATH}",
                     "HOME": "${RS_BUBBLE_TEST_ENV_HOME}/sandbox",
                     "EMPTY": ""
-                } }"#,
+                } } }"#,
         );
         let env: std::collections::BTreeMap<_, _> = spec
             .env
-            .0
+            .values
             .iter()
             .map(|(k, v)| (k.clone(), v.0.clone()))
             .collect();
@@ -86,11 +86,80 @@ pub(crate) mod tests {
         // Referencing an unset host variable is an error, so a typo in
         // the env section doesn't silently drop the variable.
         assert!(
-            serde_json::from_str::<Spec>(r#"{ "env": { "PATH": "${RS_BUBBLE_TEST_UNSET}" } }"#)
-                .is_err()
+            serde_json::from_str::<Spec>(
+                r#"{ "env": { "values": { "PATH": "${RS_BUBBLE_TEST_UNSET}" } } }"#
+            )
+            .is_err()
         );
         // But a plain, non-referencing value is always fine.
-        assert!(serde_json::from_str::<Spec>(r#"{ "env": { "FOO": "bar" } }"#).is_ok());
+        assert!(
+            serde_json::from_str::<Spec>(r#"{ "env": { "values": { "FOO": "bar" } } }"#).is_ok()
+        );
+        // Unknown fields inside the env section are rejected.
+        assert!(serde_json::from_str::<Spec>(r#"{ "env": { "nope": true } }"#).is_err());
+    }
+
+    #[test]
+    fn env_file_entries_are_merged_into_values() {
+        unsafe { std::env::set_var("RS_BUBBLE_TEST_ENV_FILE_HOME", "/home/me") };
+        let dir =
+            std::env::temp_dir().join(format!("rs-bubble-spec-envfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::spec::file::SPEC_FILE),
+            r#"{ "env": {
+                "values": { "FROM_SPEC": "spec value", "HOME": "${RS_BUBBLE_TEST_ENV_FILE_HOME}/sandbox" },
+                "env_file": "secrets.env"
+            } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("secrets.env"),
+            r#"
+# a comment
+FILE_ONLY=file value
+FROM_SPEC=file value (overridden)
+QUOTED="quoted file value"
+        "#,
+        )
+        .unwrap();
+        let spec = Spec::load(Some(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_ENV_FILE_HOME") };
+        let env: std::collections::BTreeMap<_, _> = spec
+            .env
+            .values
+            .iter()
+            .map(|(k, v)| (k.clone(), v.0.clone()))
+            .collect();
+        // File-only entries are loaded, and `${VAR}` in them is expanded
+        // like in the spec values...
+        assert_eq!(env.get("FILE_ONLY").map(String::as_str), Some("file value"));
+        assert_eq!(
+            env.get("QUOTED").map(String::as_str),
+            Some("quoted file value")
+        );
+        // ...spec values win over file entries, including an expanded one.
+        assert_eq!(env.get("FROM_SPEC").map(String::as_str), Some("spec value"));
+        assert_eq!(
+            env.get("HOME").map(String::as_str),
+            Some("/home/me/sandbox")
+        );
+        let compiled = SandboxConfig::compile(&spec);
+        assert_eq!(compiled.env, env);
+    }
+
+    #[test]
+    fn missing_env_file_is_an_error() {
+        use super::env::EnvConfig;
+        let mut env = EnvConfig {
+            env_file: Some("does-not-exist.env".to_string()),
+            values: Default::default(),
+        };
+        assert!(
+            env.load_env_file(std::path::Path::new("/nonexistent-spec-dir"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -389,7 +458,9 @@ pub(crate) mod tests {
             other => panic!("expected an rw mapping, got {other:?}"),
         }
         match &spec.hostfs.mappings[1] {
-            Mapping::Bind { src, dest: None, .. } => assert_eq!(src, "/home/me/etc"),
+            Mapping::Bind {
+                src, dest: None, ..
+            } => assert_eq!(src, "/home/me/etc"),
             other => panic!("expected a bind mapping, got {other:?}"),
         }
     }

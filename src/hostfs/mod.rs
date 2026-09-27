@@ -175,7 +175,9 @@ pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
 /// Whether any pattern grants write access: the FUSE mount is mounted
 /// read-only unless it does.
 fn has_writable_patterns(patterns: &Patterns) -> bool {
-    patterns.iter().any(|(_, permission)| permission.is_writable())
+    patterns
+        .iter()
+        .any(|(_, permission)| permission.is_writable())
 }
 
 /// The sandbox-absolute path the host filesystem is mounted at.
@@ -1833,13 +1835,18 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
         let mp = mountpoint.clone();
         fuselog::event(&format!("SERVER start mountpoint={}", mountpoint.display()));
         runtime.block_on(async move {
-            let handle =
-                match mount_with_fallback(&mp, uid, gid, &patterns, !has_writable_patterns(&patterns))
-                    .await
-                {
-                    Ok(handle) => handle,
-                    Err(e) => return Err(e),
-                };
+            let handle = match mount_with_fallback(
+                &mp,
+                uid,
+                gid,
+                &patterns,
+                !has_writable_patterns(&patterns),
+            )
+            .await
+            {
+                Ok(handle) => handle,
+                Err(e) => return Err(e),
+            };
 
             fuselog::event("SERVER mounted");
 

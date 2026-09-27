@@ -47,9 +47,10 @@ pub struct SandboxConfig {
     /// The hostfs pattern → permission list backing the FUSE filesystem.
     pub patterns: Patterns,
     /// The environment of the sandboxed command: exactly what the spec's
-    /// `env` section lists, with the `${VAR}` references already expanded
-    /// (expansion happens while the spec is parsed, so the values are
-    /// fixed here). The command inherits nothing else from the host.
+    /// `env.values` lists, with the `env_file` entries (if any) merged
+    /// in and the `${VAR}` references already expanded (expansion happens
+    /// while the spec is parsed, so the values are fixed here). The
+    /// command inherits nothing else from the host.
     pub env: BTreeMap<String, String>,
     /// The working directory of the sandboxed command *inside* the
     /// sandbox, from the spec's `cwd` field (default: none, meaning `/`).
@@ -77,7 +78,7 @@ impl SandboxConfig {
             patterns: spec.hostfs.patterns(),
             env: spec
                 .env
-                .0
+                .values
                 .iter()
                 .map(|(name, value)| (name.clone(), value.0.clone()))
                 .collect(),
