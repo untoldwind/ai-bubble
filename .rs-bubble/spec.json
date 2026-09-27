@@ -55,8 +55,12 @@
         "type": "dev"
       },
       {
-        "type": "bind",
-        "path": "/etc"
+        "type": "ro",
+        "glob": "/etc/ssl"
+      },
+      {
+        "type": "ro",
+        "glob": "/etc/ca-certificates"
       },
       {
         "type": "proc"

@@ -70,7 +70,7 @@
 //! path without `..` components, and must exist inside the sandbox (be
 //! it through a hostfs mapping or as a mount point).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -86,6 +86,22 @@ pub const DEFAULT_SPEC_DIR: &str = ".rs-bubble";
 
 /// The name of the spec file inside the spec directory.
 pub const SPEC_FILE: &str = "spec.json";
+
+/// The host path of the spec directory as an absolute glob pattern:
+/// canonicalized when possible, otherwise resolved against the current
+/// directory — so the auto-hide pattern (see [`Spec::hide_spec_dir`])
+/// always matches host-absolute mirrored paths.
+fn absolute_dir(dir: &Path) -> PathBuf {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if dir.is_absolute() {
+        dir
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(dir),
+            Err(_) => dir,
+        }
+    }
+}
 
 /// The whole sandbox specification, as written by the user. Parsing
 /// only — no side effects beyond reading the file. The sandbox machinery
@@ -164,11 +180,36 @@ impl Spec {
                     if let Err(e) = spec.env.load_env_file(dir) {
                         crate::sandbox::die(&e);
                     }
+                    // The spec directory itself is always hidden from the
+                    // sandboxed command — no matter what the spec maps:
+                    // `spec.json`, the env file, and the project cache
+                    // must never be visible inside the sandbox, even when
+                    // a mapping mirrors the directory containing them.
+                    spec.hide_spec_dir(dir);
                 }
                 spec
             }
             Err(e) => crate::sandbox::die(&format!("Invalid spec file {}: {e}", path.display())),
         }
+    }
+
+    /// Append a `hide` mapping for `spec_dir` (the directory containing
+    /// the spec file) to the hostfs mappings. Hide patterns always win —
+    /// a hidden directory hides its whole subtree — so this keeps the
+    /// spec directory (and everything in it, like `spec.json` and the
+    /// project cache) invisible inside the sandbox even when another
+    /// mapping mirrors the directory containing it. Redirect sources are
+    /// unaffected: they resolve the host path directly, without consulting
+    /// the pattern list, so `project-cache` mappings keep working.
+    ///
+    /// The pattern is the spec directory's absolute host path, matched
+    /// literally by every ordinary component (a glob metacharacter in a
+    /// directory name would be interpreted as a wildcard — which can only
+    /// ever hide *more*, never expose the spec directory).
+    pub fn hide_spec_dir(&mut self, spec_dir: &Path) {
+        self.hostfs.mappings.push(super::hostfs::Mapping::Hide {
+            glob: absolute_dir(spec_dir).to_string_lossy().into_owned(),
+        });
     }
 }
 

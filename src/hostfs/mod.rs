@@ -114,8 +114,12 @@ use pattern::{Pattern, Walk};
 ///
 /// * a strict ancestor exposed `empty` shadows everything below it —
 ///   nothing below an empty path is visible (`None`),
+/// * a `hide` pattern naming the path itself or a strict ancestor wins
+///   over everything else — a hidden path is not visible, no matter which
+///   pattern comes last (`hide`; see `HostFs::hidden` for the mirror's
+///   side of this),
 /// * otherwise the **last** pattern naming the path itself decides —
-///   including `hide` (a hidden path is not visible) and `empty`,
+///   including `empty`,
 /// * otherwise a `hide` pattern naming a strict ancestor hides the
 ///   whole subtree (`hide`),
 /// * otherwise the permission of the **nearest** mirrored (`ro`/`rw`)
@@ -152,17 +156,21 @@ pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
         return None;
     }
 
+    // A hidden path is never visible — the mirror enforces this
+    // unconditionally (`HostFs::hidden` checks every `hide` pattern,
+    // naming the path itself or a strict ancestor, before any direct
+    // permission), so the last-match rule below only applies among the
+    // non-`hide` patterns.
+    if compiled
+        .iter()
+        .any(|(p, permission)| *permission == Permission::Hide && (p.matches(path) || p.walk(path) == Walk::Ancestor))
+    {
+        return Some(Permission::Hide);
+    }
+
     // The last pattern naming the path itself decides.
     if let Some(permission) = direct(path) {
         return Some(permission);
-    }
-
-    // A hidden directory hides its whole subtree.
-    if compiled
-        .iter()
-        .any(|(p, permission)| *permission == Permission::Hide && p.walk(path) == Walk::Ancestor)
-    {
-        return Some(Permission::Hide);
     }
 
     // Otherwise the nearest mirrored ancestor governs: the mirror is

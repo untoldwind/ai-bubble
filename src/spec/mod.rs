@@ -408,6 +408,72 @@ QUOTED="quoted file value"
     }
 
     #[test]
+    fn spec_dir_is_always_hidden() {
+        use crate::hostfs::permission_of;
+        use crate::spec::hostfs::Mapping;
+        use crate::spec::internal::Permission;
+        use std::path::Path;
+
+        // A spec that mirrors everything — including the directory the
+        // spec file lives in.
+        let parent =
+            std::env::temp_dir().join(format!("rs-bubble-spec-hide-{}", std::process::id()));
+        let dir = parent.join(".rs-bubble");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::spec::file::SPEC_FILE),
+            r#"{ "hostfs": { "mappings": [ { "type": "rw", "glob": "/**" } ] } }"#,
+        )
+        .unwrap();
+        let spec = Spec::load(Some(&dir));
+
+        // Loading appends a hide mapping for the spec directory.
+        match spec.hostfs.mappings.last() {
+            Some(Mapping::Hide { glob }) => {
+                assert_eq!(Path::new(glob), std::fs::canonicalize(&dir).unwrap())
+            }
+            other => panic!("expected a trailing hide mapping, got {other:?}"),
+        }
+        // The hide wins over the earlier rw mapping: the directory and
+        // everything below it are invisible — also in the compiled config
+        // the sandbox machinery runs with.
+        let spec_path = std::fs::canonicalize(&dir).unwrap();
+        let compiled = SandboxConfig::compile(&spec);
+        for patterns in [&spec.hostfs.patterns(), &compiled.patterns] {
+            assert_eq!(permission_of(patterns, &spec_path), Some(Permission::Hide));
+            assert_eq!(
+                permission_of(patterns, &spec_path.join("spec.json")),
+                Some(Permission::Hide)
+            );
+            assert_eq!(
+                permission_of(patterns, &spec_path.join("cache/deep/file")),
+                Some(Permission::Hide)
+            );
+        }
+        // But paths outside the spec directory stay visible.
+        assert_eq!(
+            permission_of(&compiled.patterns, Path::new("/etc/passwd")),
+            Some(Permission::Rw)
+        );
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn no_spec_dir_no_hide() {
+        // Without a spec file (and thus without a spec directory) nothing
+        // is hidden: the spec stays empty.
+        let dir = std::env::temp_dir().join(format!("rs-bubble-spec-nohide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let spec = Spec::load(None);
+        std::env::set_current_dir(saved).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(spec, Spec::default());
+        assert!(spec.hostfs.patterns().is_empty());
+    }
+
+    #[test]
     fn missing_default_file_is_an_empty_spec() {
         let dir = std::env::temp_dir().join(format!("rs-bubble-spec-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

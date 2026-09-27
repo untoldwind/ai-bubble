@@ -7,7 +7,10 @@ simple CLI on top of [clap](https://docs.rs/clap).
 The sandbox is configured through a **spec file** (JSON), not through
 command-line options. By default rs-bubble looks for `.rs-bubble/spec.json`
 in the current directory; `--spec-dir DIR` points it at a different spec
-directory.
+directory. The spec directory itself (and everything in it — `spec.json`,
+the env file, the project cache) is **always hidden** from the sandboxed
+command: rs-bubble appends an internal `hide` mapping for it, so even a
+mapping that mirrors the directory containing it cannot expose it.
 
 ## Spec file format
 
