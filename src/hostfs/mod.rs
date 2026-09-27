@@ -445,6 +445,13 @@ impl HostFs {
     /// still deny the operation (the server acts with the real host
     /// credentials, so the underlying file or directory permissions apply).
     fn write_permission(&self, mirrored: &Path) -> Option<Permission> {
+        // Fail closed: a non-UTF-8 component can never match a pattern, so
+        // its write permission could never be derived from the spec — a
+        // hidden name spelled with invalid UTF-8 bytes must not become
+        // writable (or creatable) through the mirror.
+        if Pattern::has_non_utf8_component(mirrored) {
+            return None;
+        }
         if self.is_empty(mirrored) || self.under_empty(mirrored) || self.hidden(mirrored) {
             return None;
         }
@@ -639,6 +646,14 @@ impl HostFs {
                     let mut names = Vec::new();
                     while let Ok(Some(entry)) = entries.next_entry().await {
                         let name = entry.file_name();
+                        // Fail closed for names that can never match a
+                        // pattern: they are not creatable through the
+                        // mirror, so they must not be listed either —
+                        // otherwise readdir would advertise entries lookup
+                        // can never resolve (undeletable "ghost" entries).
+                        if name.to_str().is_none() {
+                            continue;
+                        }
                         let child = mirrored.join(&name);
                         // Empty-path precedence: nothing below an empty path is
                         // visible, not even a mirror match. Denied entries (and
@@ -1607,6 +1622,15 @@ impl Filesystem for HostFs {
     /// are decided per path, and a hard-linked name is an independent path
     /// (the source nodeid keeps its mapping; renaming one name must not
     /// affect the other's).
+    ///
+    /// **Both** names must be writable. Checking only the new name would
+    /// let the sandbox link a *read-only* mapped file (say, from
+    /// `~/.rustup`) into a writable path and then write through the link —
+    /// the write follows the host inode, bypassing the source path's
+    /// `ro` permission. Rejecting cross-policy links also avoids the
+    /// residual risk of a linked file living under two paths that disagree
+    /// on the write policy (a hard link is one host file; the per-path
+    /// model cannot express that).
     async fn link(
         &self,
         _req: Request,
@@ -1629,6 +1653,18 @@ impl Filesystem for HostFs {
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
             );
             return Err(libc::ENOENT.into());
+        }
+        // The source must be writable, too: a read-only source must not be
+        // linked into a writable path (the write would follow the host
+        // inode and bypass the source path's `ro` permission).
+        if !self.writable(&old) {
+            log_op_err(
+                "link",
+                &old,
+                Some(&self.redirect(&old)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            );
+            return Err(libc::EACCES.into());
         }
         if !self.writable(&new) {
             log_op_err(
@@ -2580,5 +2616,20 @@ mod tests {
             ("/tmp/x".to_string(), Permission::Rw),
         ])));
         assert!(!has_writable_patterns(&Patterns(vec![])));
+    }
+
+    #[test]
+    fn non_utf8_components_fail_closed_for_writes() {
+        use std::os::unix::ffi::OsStrExt;
+        // A non-UTF-8 component can never match a pattern, so its write
+        // permission could never be derived from the spec: deny even
+        // under a `**`-covered `rw` mirror that would allow a UTF-8 name.
+        let f = fs(&[("/work/**", Permission::Rw), ("/work/*secret*", Permission::Hide)]);
+        assert!(f.writable(Path::new("/work/plain")));
+        let weird = Path::new("/work").join(OsStr::from_bytes(b"\xffsecret\xff"));
+        assert!(!f.writable(&weird));
+        assert!(!f.exists(&weird));
+        // The UTF-8 spelling of the same name stays hidden.
+        assert!(!f.writable(Path::new("/work/secret")));
     }
 }

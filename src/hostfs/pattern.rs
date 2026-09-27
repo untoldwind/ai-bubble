@@ -9,7 +9,14 @@
 //!   `!` or `^`; to match a literal `]` put it first),
 //! - `**` as a **whole component** matches across directory boundaries,
 //!   including zero directories (`/usr/share/**/*.rs` matches
-//!   `/usr/share/x.rs`).
+//!   `/usr/share/x.rs`),
+//! - `**` **inside** a longer component (`a**b`) degrades to `*` (like in
+//!   the shell) — it never spans directories; spell `dir/**/part` when
+//!   spanning is intended,
+//! - matching is **case-sensitive** and operates on UTF-8 text: a path
+//!   component that is not valid UTF-8 can never match, so every
+//!   pattern-derived decision about it fails closed (not visible, not
+//!   writable — see [`Pattern::has_non_utf8_component`]).
 //!
 //! Everything else matches literally. A single compiled `Pattern` serves
 //! both full matches (does this path name the pattern?) and the partial
@@ -102,6 +109,18 @@ impl Pattern {
             .collect()
     }
 
+    /// Whether any *normal* component of the path is not valid UTF-8.
+    /// Such components can never match a pattern, so every decision a
+    /// pattern could inform must **fail closed**: the path is treated as
+    /// not matching (lookups/listings) and as not writable (writes) —
+    /// otherwise a non-UTF-8 spelling of a hidden name would bypass the
+    /// spec entirely. Used by the mirror's write checks.
+    pub fn has_non_utf8_component(path: &Path) -> bool {
+        path.components().any(|c| {
+            matches!(c, Component::Normal(name) if name.to_str().is_none())
+        })
+    }
+
     /// Whether the pattern names the path exactly (a `**` may span any
     /// number of directories). `*` never crosses `/`, like in a shell.
     pub fn matches(&self, path: &Path) -> bool {
@@ -139,14 +158,20 @@ impl Pattern {
             let Component::Normal(name) = c else {
                 continue;
             };
+            if pi >= self.comps.len() {
+                // The pattern ran out: it names a strict ancestor. This is
+                // checked *before* the UTF-8 check below so that a
+                // non-UTF-8 tail still reports "ancestor": a mirrored
+                // directory is a recursive mirror, and hiding its
+                // non-UTF-8-named children from the ancestor check would
+                // make lookup fail while readdir keeps listing them (see
+                // `dir_entries`, which fails closed for such names).
+                return Walk::Ancestor;
+            }
             // Non-UTF-8 components can never match a pattern.
             let Some(name) = name.to_str() else {
                 return Walk::Fail;
             };
-            if pi >= self.comps.len() {
-                // The pattern ran out: it names a strict ancestor.
-                return Walk::Ancestor;
-            }
             match &self.comps[pi] {
                 Comp::DoubleStar => {
                     // The pattern covers this directory and everything
@@ -429,5 +454,11 @@ mod tests {
         let p = Pattern::new("/etc/*").unwrap();
         assert!(!p.matches(&weird));
         assert_eq!(p.walk(&weird), Walk::Fail);
+        // But when the pattern runs out before the path, the path names a
+        // strict ancestor even with a non-UTF-8 tail: an exactly-named
+        // directory is a recursive mirror, so the ancestor check must hold
+        // (readdir fails closed for such names separately).
+        let deep = Path::new("/etc").join(std::ffi::OsStr::from_bytes(b"\xff")).join("x");
+        assert_eq!(Pattern::new("/etc").unwrap().walk(&deep), Walk::Ancestor);
     }
 }

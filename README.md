@@ -351,6 +351,18 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
   mappings are tried in the order they are
   written and the **last** match wins — put more specific mappings after
   broader ones, e.g. mirror `/etc` and then hide `/etc/ssh`.
+- Glob semantics: `**` spans directory levels only as a **whole**
+  component — inside a longer component (`**secret**`) it degrades to `*`
+  and matches only direct children of the named directory (use
+  `dir/**/*secret*` for "any entry whose name contains `secret` anywhere
+  below `dir`"). Matching is **case-sensitive** (`*secret*` does not match
+  `My-Secret.txt`). A path component that is not valid UTF-8 can never
+  match a pattern, so such paths are simply not visible and not writable
+  through the mirror.
+- Hard links (`ln`) require **both** names to be writable, so a read-only
+  mapped file cannot be linked into a writable path and written through
+  the link (the write would follow the host inode and bypass the source's
+  `ro` permission).
 - The host tree is **not** crawled at startup: every FUSE operation
   matches the requested path against the patterns on the fly, so a large
   host tree costs nothing and only the accessed paths are touched.

@@ -55,6 +55,12 @@ pub enum Mapping {
     },
     /// The matched paths are hidden (a hidden directory hides its whole
     /// subtree).
+    ///
+    /// Glob semantics: `**` spans directory levels only as a **whole**
+    /// component; inside a longer component (`**secret**`) it degrades to
+    /// `*` and matches only direct children of the named directory. Use
+    /// `dir/**/*secret*` to hide every entry named `*secret*` anywhere
+    /// below `dir`. Matching is case-sensitive.
     Hide {
         /// A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`).
         glob: String,
@@ -295,6 +301,27 @@ fn env_opt_string<'de, D: serde::Deserializer<'de>>(
     env_string(deserializer).map(Some)
 }
 
+/// Warn when a glob uses `**` *inside* a path component (e.g.
+/// `${PWD}/**secret**`): the matcher collapses it to a single `*`, which
+/// never crosses `/`, so such a rule only matches **direct children** of
+/// the named directory — everything deeper is unprotected. Spanning
+/// directory levels requires `**` as a whole component:
+/// `dir/**/*secret*` matches any path below `dir` whose name contains
+/// `secret`. (Matching is also case-sensitive; spell alternatives like
+/// `*[Ss]ecret*` explicitly.)
+fn warn_embedded_double_star(kind: &str, glob: &str) {
+    if glob
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .any(|c| c.contains("**") && c != "**")
+    {
+        eprintln!(
+            "rs-bubble: hostfs {kind} mapping: glob {glob:?} has `**` inside a path component, \
+             where it acts like `*` (it does not cross `/`); use `dir/**/part` to span levels"
+        );
+    }
+}
+
 impl TryFrom<UncheckedMapping> for Mapping {
     type Error = String;
 
@@ -344,9 +371,12 @@ impl TryFrom<UncheckedMapping> for Mapping {
             UncheckedMapping::Rw { glob } => Mapping::Rw {
                 glob: absolute("rw", "glob", glob)?,
             },
-            UncheckedMapping::Hide { glob } => Mapping::Hide {
-                glob: absolute("hide", "glob", glob)?,
-            },
+            UncheckedMapping::Hide { glob } => {
+                warn_embedded_double_star("hide", &glob);
+                Mapping::Hide {
+                    glob: absolute("hide", "glob", glob)?,
+                }
+            }
             UncheckedMapping::Empty { path } => Mapping::Empty {
                 path: absolute("empty", "path", path)?,
             },
