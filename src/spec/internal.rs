@@ -20,7 +20,8 @@ use super::tmpfs::TmpfsPerms;
 pub struct Net {
     /// Run the command in a fresh network namespace behind a proxy.
     pub isolated: bool,
-    /// The proxy allow-list; empty means: allow everything.
+    /// The proxy allow-list; empty means: allow everything. Entries may
+    /// use a `*.` subdomain wildcard.
     pub allow: Vec<String>,
 }
 

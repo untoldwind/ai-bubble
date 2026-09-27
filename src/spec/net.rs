@@ -11,7 +11,9 @@ pub struct NetConfig {
     /// Run the command in a fresh network namespace and proxy its
     /// connections from the host side.
     pub isolated: bool,
-    /// Allow-list of `host` or `host:port` targets for the proxy.
+    /// Allow-list of `host`, `host:port`, or `*.domain[:port]` targets for
+    /// the proxy. A `*.domain` entry matches subdomains of `domain` at any
+    /// depth, but not `domain` itself.
     /// Empty means: allow everything.
     pub allow: Vec<String>,
 }

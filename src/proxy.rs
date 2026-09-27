@@ -24,7 +24,10 @@ pub const PROXY_ADDR: &str = "127.0.0.2:3128";
 pub const PROXY_URL: &str = "http://127.0.0.2:3128";
 
 /// Check a `host:port` target against the allow-list. An empty list allows
-/// everything. List entries are `host` (any port) or `host:port`.
+/// everything. List entries are `host` (any port) or `host:port`. An entry
+/// host may start with `*.` for a simple subdomain wildcard: `*.github.com`
+/// matches `api.github.com` (any suffix ending in `.github.com`), but not
+/// `github.com` itself. Matching is case-insensitive.
 pub fn target_allowed(target: &str, allow: &[String]) -> bool {
     if allow.is_empty() {
         return true;
@@ -35,11 +38,34 @@ pub fn target_allowed(target: &str, allow: &[String]) -> bool {
     };
     allow.iter().any(|entry| match entry.rsplit_once(':') {
         Some((ehost, eport)) => match eport.parse::<u16>() {
-            Ok(eport) => ehost.eq_ignore_ascii_case(host) && Some(eport) == port,
-            Err(_) => entry.eq_ignore_ascii_case(host),
+            Ok(eport) => host_matches(ehost, host) && Some(eport) == port,
+            Err(_) => host_matches(entry, host),
         },
-        None => entry.eq_ignore_ascii_case(host),
+        None => host_matches(entry, host),
     })
+}
+
+/// Match an allow-list host pattern against a target host. A leading `*.`
+/// matches any host whose remainder is a non-empty dot-separated suffix, so
+/// `*.example.com` matches `api.example.com` and `a.b.example.com` but not
+/// `example.com`.
+fn host_matches(pattern: &str, host: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        !suffix.is_empty()
+            && !suffix.contains('*')
+            && ends_with_ignore_ascii_case(host, suffix)
+            && host[..host.len() - suffix.len()]
+                .ends_with('.')
+            && !host.contains('*')
+    } else {
+        pattern.eq_ignore_ascii_case(host)
+    }
+}
+
+/// Case-insensitive `str::ends_with`.
+fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
+    haystack.len() >= suffix.len()
+        && haystack[haystack.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 /// Accept loop on the host side: every connection becomes a raw pipe to the
@@ -223,6 +249,32 @@ mod tests {
         assert!(target_allowed("localhost:1234", &allow));
         // Empty list allows everything.
         assert!(target_allowed("anything.example:9999", &[]));
+    }
+
+    #[test]
+    fn allow_list_subdomain_wildcards() {
+        let allow: Vec<String> = ["github.com:443", "*.github.com", "*.example.com:443"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Exact entry still matches exactly, not subdomains.
+        assert!(target_allowed("github.com:443", &allow));
+        assert!(!target_allowed("evil.com:443", &allow));
+        // Wildcard matches subdomains at any depth, on any port when the
+        // entry carries none.
+        assert!(target_allowed("api.github.com:80", &allow));
+        assert!(target_allowed("a.b.github.com:80", &allow));
+        // The wildcard alone does not match the bare domain.
+        let bare: Vec<String> = ["*.github.com"].iter().map(|s| s.to_string()).collect();
+        assert!(!target_allowed("github.com:443", &bare));
+        // Wildcard entries can carry a port.
+        assert!(target_allowed("api.example.com:443", &allow));
+        assert!(!target_allowed("api.example.com:80", &allow));
+        // No cross-domain tricks.
+        assert!(!target_allowed("notgithub.com:443", &allow));
+        assert!(!target_allowed("evil.com:443", &allow));
+        // Case-insensitive.
+        assert!(target_allowed("API.GitHub.com:443", &allow));
     }
 
     #[tokio::test]

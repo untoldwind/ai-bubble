@@ -18,7 +18,7 @@
 //!     { "type": "session-cache", "path": "/home/me/.cache" },
 //!     { "type": "project-cache", "path": "/home/me/.local" }
 //!   ] },
-//!   "net": { "isolated": true, "allow": ["example.com:443"] },
+//!   "net": { "isolated": true, "allow": ["example.com:443", "*.github.com"] },
 //!   "env": {
 //!     "values": { "PATH": "${PATH}", "HOME": "${HOME}" },
 //!     "env_file": ".env"
@@ -28,7 +28,9 @@
 //! ```
 //!
 //! All fields are optional: without `net.isolated` the command shares the
-//! host network. `allow` is the proxy allow-list; an empty list (or a
+//! host network. `allow` is the proxy allow-list; entries are
+//! `HOST[:PORT]`, and an entry host may start with `*.` to match any
+//! subdomains of that domain (but not the domain itself); an empty list (or a
 //! missing `allow`) allows every target. Nothing is mounted
 //! automatically: procfs only appears where the spec asks for it (a
 //! `proc` mapping). The `hostfs` mappings make the FUSE filesystem the

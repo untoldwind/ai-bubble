@@ -74,7 +74,9 @@ root, no mounts at all (not even procfs), and the host network.
 - `net.isolated` — run the command in a fresh **network namespace**
   (no interfaces besides loopback, which rs-bubble brings up) while the
   rs-bubble process stays on the host and acts as a **TCP proxy**
-- `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`.
+- `net.allow` — allow-list for the proxy; entries are `HOST[:PORT]`, and an
+  entry host may start with `*.` for a subdomain wildcard (`*.github.com`
+  matches `api.github.com` but not `github.com`).
   Empty or missing means every target is allowed
 - **Environment variables** — the path-like mapping fields (`glob`,
   `path`, `src`, `dest`, `source`) may reference environment variables
