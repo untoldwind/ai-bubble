@@ -49,6 +49,15 @@
 //! every blocking host operation (std::fs, raw libc calls) is pushed to
 //! tokio's blocking pool (`tokio::fs` / `spawn_blocking`), so a slow read
 //! or a hung network filesystem never stalls the mount's event loop.
+//!
+//! Symlinks: every access to the **real host filesystem** uses
+//! no-follow semantics — host paths are always opened with `O_NOFOLLOW`
+//! and stated with `symlink_metadata`. A mirrored symlink is therefore
+//! visible only *as a symlink* (its target can be read with `readlink`),
+//! never followed: opening one for reading or writing fails with `ELOOP`,
+//! and the target's content is not exposed unless the target itself
+//! matches a pattern. This keeps the "only mapped paths are visible"
+//! guarantee intact even when the host contains links pointing elsewhere.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::SeekFrom;
@@ -508,6 +517,16 @@ impl HostFs {
         attr
     }
 
+    /// Whether the given **host** path can act as a listable directory
+    /// without following symlinks: it must really be a directory (a
+    /// symlink to a directory is not followed).
+    async fn is_host_dir(&self, real: &Path) -> bool {
+        tokio_fs::symlink_metadata(real)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+    }
+
     /// The `lstat`-style attribute of a mirrored path, or ENOENT. Async: it
     /// stats the real host filesystem (`tokio::fs` runs the syscall on
     /// tokio's blocking pool) and must never run on the FUSE event loop.
@@ -536,17 +555,15 @@ impl HostFs {
         }
     }
 
-    /// Whether the mirrored path is a listable directory: a real one, an empty
+    /// Whether the mirrored path is a listable directory: a real one (a
+    /// host symlink to a directory is not followed), an empty
     /// path, or a purely virtual ancestor of an empty path. Async: it
     /// stats the real host filesystem (`tokio::fs`).
     async fn is_listable_dir(&self, mirrored: &Path) -> bool {
         if self.is_empty(mirrored) || self.is_empty_prefix(mirrored) {
             return true;
         }
-        tokio_fs::metadata(self.redirect(mirrored))
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
+        self.is_host_dir(&self.redirect(mirrored)).await
     }
 
     /// The visible entries of a mirrored directory, sorted by name: every
@@ -554,8 +571,9 @@ impl HostFs {
     /// match) — and, when the directory is itself matched by a pattern, all
     /// of its real entries. Everything below an empty path is shadowed by
     /// its precedence; empty paths that live directly under the directory
-    /// are always shown. Async: it reads and stats the real host
-    /// directory (`tokio::fs`).
+    /// are always shown. Symlinks are never followed: a host symlink
+    /// standing for the directory is not listed through. Async: it reads
+    /// and stats the real host directory (`tokio::fs`).
     async fn dir_entries(
         &self,
         mirrored: &Path,
@@ -565,26 +583,30 @@ impl HostFs {
         // matches (still minus hidden ones).
         let unfiltered = self.matches(mirrored);
         let mut names: Vec<std::ffi::OsString> =
-            match tokio_fs::read_dir(self.redirect(mirrored)).await {
-                Ok(mut entries) => {
-                    let mut names = Vec::new();
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        let name = entry.file_name();
-                        let child = mirrored.join(&name);
-                        // Empty-path precedence: nothing below an empty path is
-                        // visible, not even a mirror match. Denied entries (and
-                        // everything below a hidden directory) are hidden even
-                        // inside a recursively mirrored directory.
-                        if self.under_empty(&child) || self.hidden(&child) {
-                            continue;
+            if self.is_host_dir(&self.redirect(mirrored)).await {
+                match tokio_fs::read_dir(self.redirect(mirrored)).await {
+                    Ok(mut entries) => {
+                        let mut names = Vec::new();
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            let name = entry.file_name();
+                            let child = mirrored.join(&name);
+                            // Empty-path precedence: nothing below an empty path is
+                            // visible, not even a mirror match. Denied entries (and
+                            // everything below a hidden directory) are hidden even
+                            // inside a recursively mirrored directory.
+                            if self.under_empty(&child) || self.hidden(&child) {
+                                continue;
+                            }
+                            if unfiltered || self.exists(&child) {
+                                names.push(name);
+                            }
                         }
-                        if unfiltered || self.exists(&child) {
-                            names.push(name);
-                        }
+                        names
                     }
-                    names
+                    Err(_) => Vec::new(),
                 }
-                Err(_) => Vec::new(),
+            } else {
+                Vec::new()
             };
         // Empty-path entries living directly under this directory (also
         // when the real directory itself cannot be listed): every `empty`
@@ -742,13 +764,14 @@ impl PathFilesystem for HostFs {
             return Err(libc::ENOENT.into());
         }
         // The path is visible through the mirror; only real files are
-        // openable (a directory that merely leads to a match is not).
-        if tokio_fs::metadata(self.redirect(&mirrored))
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(true)
-        {
-            return Err(libc::EISDIR.into());
+        // openable (a directory that merely leads to a match is not), and
+        // symlinks are never followed: a host symlink cannot be opened
+        // through the mirror (its target may not be mirrored at all).
+        match tokio_fs::symlink_metadata(self.redirect(&mirrored)).await {
+            Ok(md) if md.file_type().is_symlink() => return Err(libc::ELOOP.into()),
+            Ok(md) if md.is_dir() => return Err(libc::EISDIR.into()),
+            Ok(_) => {}
+            Err(_) => return Err(libc::EISDIR.into()),
         }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
         if write_flags && !self.writable(&mirrored) {
@@ -781,8 +804,14 @@ impl PathFilesystem for HostFs {
         if self.is_empty(&mirrored) {
             return Ok(ReplyData::from(Bytes::new()));
         }
-        // Stateless IO: reopen the host file for every read.
-        let mut file = tokio_fs::File::open(self.redirect(&mirrored)).await?;
+        // Stateless IO: reopen the host file for every read — never
+        // following symlinks (a host symlink is visible only as a link,
+        // and its target may not be mirrored at all).
+        let mut file = tokio_fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.redirect(&mirrored))
+            .await?;
         file.seek(SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; size as usize];
         let n = file.read(&mut buf).await?;
@@ -812,11 +841,14 @@ impl PathFilesystem for HostFs {
             // enforced by the host filesystem on the open below.
             return Err(libc::EACCES.into());
         }
-        // Stateless IO: reopen the host file for every write.
+        // Stateless IO: reopen the host file for every write — never
+        // following symlinks (a host symlink is never written through;
+        // its target may not be mirrored at all).
         let append = flags & libc::O_APPEND as u32 != 0;
         let mut file = tokio_fs::OpenOptions::new()
             .write(true)
             .append(append)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(self.redirect(&mirrored))
             .await?;
         if !append {
@@ -827,7 +859,9 @@ impl PathFilesystem for HostFs {
     }
     async fn statfs(&self, _req: fuse3::raw::Request, path: &OsStr) -> Result<ReplyStatFs> {
         // Report the real filesystem holding the mirrored path (or "/" for
-        // the root), so tools like `df` behave sensibly.
+        // the root), so tools like `df` behave sensibly. The path is opened
+        // with `O_NOFOLLOW` and `fstatvfs` runs on the descriptor: symlinks
+        // are never followed to a filesystem outside the mirror.
         let mirrored = if is_root(path) {
             PathBuf::from("/")
         } else {
@@ -837,9 +871,18 @@ impl PathFilesystem for HostFs {
             CString::new(mirrored.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
         // errno is per-thread: capture the error on the blocking thread.
         blocking(move || {
+            // O_PATH works on any file type (including directories) and
+            // O_NOFOLLOW keeps symlinked paths from being followed.
+            let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
-            if unsafe { libc::statvfs(cpath.as_ptr(), &mut vfs) } != 0 {
-                Err(std::io::Error::last_os_error())
+            let rc = unsafe { libc::fstatvfs(fd, &mut vfs) };
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            if rc != 0 {
+                Err(err)
             } else {
                 Ok(vfs)
             }
@@ -976,8 +1019,18 @@ impl PathFilesystem for HostFs {
         let real = self.redirect(&mirrored);
         let cpath = CString::new(real.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
         // errno is per-thread: capture the error on the blocking thread.
+        // `faccessat` with `AT_SYMLINK_NOFOLLOW` — never follow symlinks
+        // when deciding access on the real host filesystem.
         blocking(move || {
-            if unsafe { libc::access(cpath.as_ptr(), non_write as libc::c_int) } != 0 {
+            if unsafe {
+                libc::faccessat(
+                    libc::AT_FDCWD,
+                    cpath.as_ptr(),
+                    non_write as libc::c_int,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
                 Err(std::io::Error::last_os_error())
             } else {
                 Ok(())
@@ -1011,7 +1064,13 @@ impl PathFilesystem for HostFs {
         }
         let real = self.redirect(&mirrored);
         if let Some(size) = set_attr.size {
-            let f = tokio_fs::OpenOptions::new().write(true).open(&real).await?;
+            // Never follow symlinks: a host symlink is not truncated
+            // through (its target may not be mirrored at all).
+            let f = tokio_fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&real)
+                .await?;
             f.set_len(size).await?;
         }
         if let Some(mode) = set_attr.mode {

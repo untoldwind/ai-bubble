@@ -341,6 +341,11 @@ the mirror exposes appears at its absolute host path, and the ops (`dev`,
 - The host tree is **not** crawled at startup: every FUSE operation
   matches the requested path against the patterns on the fly, so a large
   host tree costs nothing and only the accessed paths are touched.
+- Host **symlinks are never followed**: a mirrored symlink is visible only
+  as a symlink (`readlink` shows its target); opening it for reading or
+  writing fails with `ELOOP`, so a mirrored symlink can never expose the
+  content of a path the mappings do not select. The same holds for
+  directory listings, `statfs` and access checks.
 - Writes only go through where a mapping says `rw`: the last mapping
   naming the path (or its nearest mirrored ancestor — an exactly-named or
   `**`-covered directory is a recursive mirror, so its permission governs
