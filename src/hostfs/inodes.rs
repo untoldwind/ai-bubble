@@ -137,6 +137,7 @@ impl InodeMap {
                     self.inode_to_parent.insert(source, new_parent);
                     self.path_to_inode.remove(old);
                     self.path_to_inode.insert(new.to_path_buf(), source);
+                    self.repoint_descendants(old, new);
                 }
             }
 
@@ -147,6 +148,51 @@ impl InodeMap {
                 ));
                 self.get_or_insert(new, new_parent);
             }
+        }
+    }
+
+    /// Re-point every mapped path below `old` at `new`. A renamed directory
+    /// keeps every child dentry in the kernel's dcache, rehashed under the
+    /// new parent with their nodeids unchanged — the kernel does *not*
+    /// re-lookup them, so operations arriving directly on those cached
+    /// dentries (e.g. `cat new_dir/file` right after `mv old_dir new_dir`)
+    /// resolve the child nodeid to a path that must already be the new one.
+    fn repoint_descendants(&mut self, old: &Path, new: &Path) {
+        // Collect first: the keys borrow the maps being mutated.
+        let moved: Vec<(Inode, PathBuf)> = self
+            .inode_to_path
+            .iter()
+            .filter(|(_, path)| **path != *old && path.starts_with(old))
+            .map(|(inode, path)| (*inode, path.clone()))
+            .collect();
+        for (inode, path) in moved {
+            let moved_path = new.join(path.strip_prefix(old).expect("prefix checked"));
+            self.path_to_inode.remove(&path);
+
+            // A stale mapping at the child's new name (the rename target
+            // already had content) belongs to a dentry the kernel is
+            // dropping; releasing it keeps a zombie while handles remain.
+            if let Some(&prev) = self.path_to_inode.get(&moved_path) {
+                if prev != inode {
+                    self.release(prev);
+                }
+            }
+            self.inode_to_path.insert(inode, moved_path.clone());
+            self.path_to_inode.insert(moved_path, inode);
+        }
+
+        // Zombies under the renamed directory keep their handles open; their
+        // remembered paths move with the directory too, so stateless (`fh =
+        // 0`) IO still resolves after the rename.
+        let zombies: Vec<(Inode, PathBuf)> = self
+            .zombies
+            .iter()
+            .filter(|(_, path)| **path != *old && path.starts_with(old))
+            .map(|(inode, path)| (*inode, path.clone()))
+            .collect();
+        for (inode, path) in zombies {
+            let moved_path = new.join(path.strip_prefix(old).expect("prefix checked"));
+            self.zombies.insert(inode, moved_path);
         }
     }
 
@@ -269,6 +315,65 @@ mod tests {
 
         assert_eq!(map.path_of(src).as_deref(), Some(Path::new("/moved")));
         assert_eq!(map.inode_of(Path::new("/old")), None);
+    }
+
+    #[test]
+    fn renaming_a_directory_repoints_descendant_paths() {
+        let mut map = InodeMap::new();
+        let dir = map.get_or_insert(Path::new("/d-working"), ROOT_INODE);
+        let file = map.get_or_insert(Path::new("/d-working/f"), dir);
+        let sub = map.get_or_insert(Path::new("/d-working/sub"), dir);
+        let deep = map.get_or_insert(Path::new("/d-working/sub/deep"), sub);
+
+        map.rename(Path::new("/d-working"), Path::new("/d-final"), ROOT_INODE);
+
+        // The kernel keeps the child dentries (with their nodeids) and
+        // rehashes them under the new parent without re-looking them up.
+        assert_eq!(map.path_of(dir).as_deref(), Some(Path::new("/d-final")));
+        assert_eq!(map.path_of(file).as_deref(), Some(Path::new("/d-final/f")));
+        assert_eq!(
+            map.path_of(deep).as_deref(),
+            Some(Path::new("/d-final/sub/deep"))
+        );
+        assert_eq!(map.inode_of(Path::new("/d-final/f")), Some(file));
+        assert_eq!(map.inode_of(Path::new("/d-final/sub/deep")), Some(deep));
+        assert_eq!(map.inode_of(Path::new("/d-working/f")), None);
+        // The child's parent pointer still resolves (the nodeids are kept).
+        assert_eq!(map.parent_of(file), Some(dir));
+    }
+
+    #[test]
+    fn renaming_a_directory_does_not_clobber_sibling_prefixed_paths() {
+        let mut map = InodeMap::new();
+        let dir = map.get_or_insert(Path::new("/d"), ROOT_INODE);
+        let file = map.get_or_insert(Path::new("/d/f"), dir);
+        let sibling = map.get_or_insert(Path::new("/d-other"), ROOT_INODE);
+        let sibling_file = map.get_or_insert(Path::new("/d-other/f"), sibling);
+
+        map.rename(Path::new("/d"), Path::new("/e"), ROOT_INODE);
+
+        assert_eq!(map.path_of(file).as_deref(), Some(Path::new("/e/f")));
+        assert_eq!(map.path_of(sibling_file).as_deref(), Some(Path::new("/d-other/f")));
+        assert_eq!(map.inode_of(Path::new("/e/f")), Some(file));
+        assert_eq!(map.inode_of(Path::new("/d-other/f")), Some(sibling_file));
+    }
+
+    #[test]
+    fn renaming_a_directory_moves_open_handle_zombies_too() {
+        let mut map = InodeMap::new();
+        let dir = map.get_or_insert(Path::new("/d-working"), ROOT_INODE);
+        let file = map.get_or_insert(Path::new("/d-working/f"), dir);
+        map.open_handle(file);
+
+        // The file's name is dropped (its dentry forgotten) but the handle
+        // keeps a zombie — then the directory is renamed.
+        map.release_path(Path::new("/d-working/f"));
+        map.rename(Path::new("/d-working"), Path::new("/d-final"), ROOT_INODE);
+
+        assert_eq!(map.path_of(file).as_deref(), Some(Path::new("/d-final/f")));
+
+        map.close_handle(file);
+        assert_eq!(map.path_of(file), None);
     }
 
     #[test]
