@@ -13,8 +13,9 @@ Key differences:
   `spec.json`, the env file, the project cache) is **always hidden** from the
   sandboxed command: ai-bubble appends an internal `hide` mapping for it, so
   even a mapping that mirrors the directory containing it cannot expose it.
-* Network access can be restricted through an embedded HTTP proxy (not
-  exposing the host network).
+* Network access can be restricted through an embedded HTTP proxy, or —
+  as an alternative — through a DNS/HTTP/HTTPS "waf" server triple
+  inside the sandbox (not exposing the host network).
 * Filesystem access is served by a FUSE filesystem that is configured via
   glob patterns. It also acts as a uid/gid translation layer so that the
   agent can run with its own uid (within its own user namespace).
@@ -95,6 +96,8 @@ All fields are optional. A complete example:
     { "type": "symlink", "src": "usr/bin", "dest": "/bin" }
   ] },
   "net": { "mode": "proxy", "allow": ["example.com:443", "*.github.com"] },
+  // ... or the alternative "waf" mode (see below):
+  // "net": { "mode": "waf", "allow": ["example.com"] },
   "env": {
     "values": { "PATH": "${PATH}", "HOME": "${HOME}" },
     "env_file": "env"
@@ -236,9 +239,10 @@ is the network namespace, which corresponds to bwrap's `--share-net`:
 - without `net` (i.e. `"mode": "host"`) → like
   `bwrap --unshare-all --share-net` (everything unshared, but the command
   keeps the host network)
-- with `"net": { "mode": "proxy" }` → like plain
-  `bwrap --unshare-all` (a fresh network namespace with only a brought-up
-  loopback interface — bwrap's `loopback_setup()` — plus ai-bubble's proxy)
+- with `"net": { "mode": "proxy" }` or `"net": { "mode": "waf" }` → like
+  plain `bwrap --unshare-all` (a fresh network namespace with only a
+  brought-up loopback interface — bwrap's `loopback_setup()` — plus
+  ai-bubble's proxy or waf servers)
 
 Not covered by that equivalence (see "Notes" below): ai-bubble's
 `/proc` mounts are always fresh procfs instances and the command always
@@ -321,11 +325,12 @@ Notes:
 
 ## Isolated networking
 
-With `"net": { "mode": "proxy" }` the sandboxed command gets a network namespace that
+With `"net": { "mode": "proxy" }` or `"net": { "mode": "waf" }` the sandboxed command gets a network namespace that
 is completely isolated from the host (only a freshly brought-up loopback
 interface; the sandbox also gets its own UTS namespace) — while the
-ai-bubble process tree provides a proxy **inside** that namespace, so the
-command can reach the outside world transparently.
+ai-bubble process tree provides network access **inside** that namespace,
+so the command can reach the outside world transparently. The two modes
+differ in how the in-sandbox side presents itself (see below).
 
 This mode is the network part of `bwrap --unshare-all`: it unshares the
 network namespace like `bwrap --unshare-net` (loopback up, nothing else).
@@ -423,6 +428,76 @@ case a hostile command could kill `P` (cutting its own network access —
 it gains nothing else). Fully separating them would require an additional
 namespace split.
 
+### The alternative: waf mode
+
+`"net": { "mode": "waf", "allow": [...] }` runs the same isolated
+network namespace, but instead of a CONNECT proxy on a fixed port it
+places three servers on **`127.0.0.2`** inside the sandbox — and resolves
+every allow-listed name to that very address, so normal clients (which
+just resolve a name and connect) are redirected transparently:
+
+* **DNS** on `127.0.0.2:53` (UDP and TCP): every host on the allow-list
+  resolves to `127.0.0.2`; anything else gets NXDOMAIN.
+* **HTTPS** on `127.0.0.2:443`: reads the TLS ClientHello, extracts the
+  SNI and terminates the TLS session itself with a certificate forged
+  for exactly that SNI (see below). The decrypted plaintext is tunneled
+  to `<sni>:443` on the host, where the host performs the *real* TLS
+  handshake — with the genuine endpoint and proper certificate
+  verification, since the sandbox has no real trust anchors by design.
+  Connections without a SNI are dropped.
+* **HTTP** on `127.0.0.2:80`: a plain forwarder for absolute-form
+  (`GET http://host/path`) and Host-header requests — for **testing**
+  this mode only, and likely to be removed later.
+
+The HTTPS interception is the TLS-MITM pattern: ai-bubble generates a
+fresh self-signed CA per run (its private key never leaves the host
+process) and injects that CA as the sandbox's trust anchor — as
+`/etc/ssl/certs/ca-certificates.crt` (the default bundle path on
+Debian/Ubuntu/Alpine), as `/etc/pki/tls/certs/ca-bundle.crt` (the
+Fedora/RHEL equivalent), and via `SSL_CERT_FILE` in the sandbox's
+environment. For every SNI the in-sandbox HTTPS server sees, the host
+signs a short-lived leaf certificate (`tls-cert` command) and the
+sandbox serves it with rustls; clients then see a chain that verifies
+against the injected CA. No fake `openssl.cnf` is needed — OpenSSL only
+reads its configuration file for creating certificates or config-driven
+features, not for plain certificate verification.
+
+The allow-list (`net.allow`) is enforced on the host side, exactly like
+in proxy mode; a bare `host` entry is both resolvable (DNS) and
+connectable, and a `host:port` entry resolves the host too (the port
+restriction is applied again on every `connect`).
+
+The same namespace/process tree is used as in proxy mode; only the
+in-sandbox listeners differ. No proxy variables are set in the
+environment (there is no proxy to configure).
+
+One caveat: for the sandbox's *resolver* to actually use the in-sandbox
+DNS server, it must be pointed at `127.0.0.2` — typically via an
+`/etc/resolv.conf` that says `nameserver 127.0.0.2` (provide one through
+your mappings, or pass tools their resolver explicitly, e.g.
+`unshare --dns`-style options, `dig @127.0.0.2`, ...). Making this
+automatic is future work.
+
+#### The command protocol on /net/sock
+
+The Unix socket carries a simple line-based command protocol, executed
+by the host-side process (the sandbox servers are its only clients):
+
+```sh
+exec 3<>/net/sock
+printf 'resolve-dns example.com\n' >&3
+head -1 <&3        # "OK 127.0.0.2" (allowed) or "ERR ..." (denied)
+
+printf 'connect example.com:443\n' >&3
+head -1 <&3        # "OK" (then this connection IS the pipe to the
+                   #  real target) or "ERR ..." (denied or failed)
+```
+
+Commands currently understood: `resolve-dns <name>`, `connect
+<host>:<port>`, `tls-cert <name>` and `tls-connect <host>:<port>`; more
+can be added (e.g. a `make-http-request` command that performs the
+request on the host and returns the response).
+
 ## The host filesystem as the sandbox root
 
 With `hostfs` mappings, the FUSE filesystem itself becomes the sandbox
@@ -480,8 +555,8 @@ shows the effective permission for a host path under the current spec.
 
 Starter project — the spec file's `hostfs.mappings` (ro, rw, hide, empty,
 dev, tmpfs, proc, bind, symlink, redirect-ro, redirect-rw, session-cache,
-project-cache), `net.mode` and `net.allow` are implemented, along with the
-`run` and `ls` sub-commands and `--print-schema`. Namespace-wise ai-bubble
+project-cache), `net.mode` (`host`, `proxy`, `waf`) and `net.allow` are implemented, along
+with the `run` and `ls` sub-commands and `--print-schema`. Namespace-wise ai-bubble
 always unshares user, cgroup, ipc, pid, uts and mount namespaces (see
 "Equivalence with bwrap's namespace flags" above); the network namespace is
 unshared with `"net": { "mode": "proxy" }`.

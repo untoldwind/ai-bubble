@@ -1,8 +1,9 @@
-//! The proxy allow-list, shared by both sides of the proxy.
+//! The allow-list, shared by the proxy and the waf mode.
 //!
-//! The list is built on the host from the spec's `net` section and handed
-//! to both the connector (which re-checks every request) and the sandbox
-//! proxy (which answers CONNECT requests early with 403).
+//! The list is built on the host from the spec's `net` section. The
+//! proxy's connector and the waf host (`crate::waf::host`) re-check every
+//! request; the sandbox-side HTTP CONNECT proxy answers CONNECT requests
+//! early with 403.
 
 /// Check a `host:port` target against the allow-list. An empty list allows
 /// nothing: every target must be listed explicitly. List entries are `host`
@@ -25,6 +26,19 @@ pub fn target_allowed(target: &str, allow: &[String]) -> bool {
         },
         None => host_matches(entry, host),
     })
+}
+
+/// Check a bare host name against the allow-list, ignoring entry ports.
+/// Used for name resolution (DNS): a listed `host:port` entry also
+/// permits resolving `host`, since the port restriction is enforced
+/// again on every `connect`. An empty list allows nothing.
+pub fn host_allowed(host: &str, allow: &[String]) -> bool {
+    if allow.is_empty() {
+        return false;
+    }
+    allow
+        .iter()
+        .any(|entry| host_matches(entry.rsplit_once(':').map_or(entry, |(h, _)| h), host))
 }
 
 /// Match an allow-list host pattern against a target host. A leading `*.`
@@ -67,6 +81,21 @@ mod tests {
         // Empty list allows nothing: every target must be listed
         // explicitly.
         assert!(!target_allowed("anything.example:9999", &[]));
+    }
+
+    #[test]
+    fn allow_list_host_only_check() {
+        // For DNS resolution, port restrictions are not the question: a
+        // listed host is resolvable, with or without a port on the entry.
+        let allow: Vec<String> = ["example.com:443", "*.github.com"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(host_allowed("example.com", &allow));
+        assert!(host_allowed("api.github.com", &allow));
+        assert!(!host_allowed("evil.com", &allow));
+        assert!(!host_allowed("github.com", &allow));
+        assert!(!host_allowed("example.com", &[]));
     }
 
     #[test]

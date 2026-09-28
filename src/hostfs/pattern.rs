@@ -116,9 +116,8 @@ impl Pattern {
     /// otherwise a non-UTF-8 spelling of a hidden name would bypass the
     /// spec entirely. Used by the mirror's write checks.
     pub fn has_non_utf8_component(path: &Path) -> bool {
-        path.components().any(|c| {
-            matches!(c, Component::Normal(name) if name.to_str().is_none())
-        })
+        path.components()
+            .any(|c| matches!(c, Component::Normal(name) if name.to_str().is_none()))
     }
 
     /// Whether the pattern names the path exactly (a `**` may span any
@@ -505,7 +504,9 @@ mod tests {
         // strict ancestor even with a non-UTF-8 tail: an exactly-named
         // directory is a recursive mirror, so the ancestor check must hold
         // (readdir fails closed for such names separately).
-        let deep = Path::new("/etc").join(std::ffi::OsStr::from_bytes(b"\xff")).join("x");
+        let deep = Path::new("/etc")
+            .join(std::ffi::OsStr::from_bytes(b"\xff"))
+            .join("x");
         assert_eq!(Pattern::new("/etc").unwrap().walk(&deep), Walk::Ancestor);
     }
 }

@@ -500,7 +500,10 @@ QUOTED="quoted file value"
         std::fs::write(&path, r#"{ "net": { "mode": "proxy", "allow": [] } }"#).unwrap();
         let spec = Spec::load(Some(&dir));
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(spec.net, crate::spec::net::NetConfig::Proxy { allow: vec![] });
+        assert_eq!(
+            spec.net,
+            crate::spec::net::NetConfig::Proxy { allow: vec![] }
+        );
     }
 
     #[test]
@@ -613,7 +616,8 @@ QUOTED="quoted file value"
         // ...while other string fields are left untouched: an ${VAR}
         // reference in net.allow or $schema is a literal (and here just
         // an odd, but legal, allow entry).
-        let spec = parse(r#"{ "net": { "mode": "proxy", "allow": ["${RS_BUBBLE_TEST_HOME}:443"] } }"#);
+        let spec =
+            parse(r#"{ "net": { "mode": "proxy", "allow": ["${RS_BUBBLE_TEST_HOME}:443"] } }"#);
         assert_eq!(
             spec.net,
             crate::spec::net::NetConfig::Proxy {

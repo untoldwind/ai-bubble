@@ -1,24 +1,28 @@
 //! The `--isolated-net` orchestration: process tree, namespaces and
-//! lifecycle. The byte-shuffling itself lives in `proxy`.
+//! lifecycle. The network serving itself lives in `proxy` (HTTP CONNECT
+//! mode) and `waf` (DNS/HTTP/HTTPS mode).
 //!
-//! Process tree with --isolated-net:
+//! Process tree with isolated networking:
 //!
-//!   original (host netns) — the "connector": answers proxy requests with
-//!                           real TCP connections, waits for P, reports P's
-//!                           exit status.
-//!     └─ P — unshares user+network+cgroup+UTS namespaces, brings up loopback,
-//!            listens on 127.0.0.2:3128 (HTTP CONNECT) and forwards the
-//!            child's exit status.
+//!   original (host netns) — the "connector": answers proxy/waf requests
+//!                           with real TCP connections, waits for P, reports
+//!                           P's exit status.
+//!     └─ P — unshares user+network+cgroup+UTS namespaces, brings up
+//!            loopback and serves the mode's in-sandbox network frontends
+//!            on 127.0.0.2 (proxy: HTTP CONNECT on 3128; waf: DNS on 53,
+//!            HTTP on 80, HTTPS on 443 — see `crate::waf`). It forks the
+//!            actual sandboxed command.
 //!         └─ C — unshares the mount namespace, builds the tmpfs sandbox
 //!                and execs COMMAND in its own PID and IPC namespaces (see
 //!                sandbox::pidns_and_exec).
 //!
-//! The network namespace is shared by P and C, so COMMAND can reach the
-//! proxy transparently at 127.0.0.2, while it stays fully isolated from
-//! the host network (the namespace has no interfaces besides loopback).
-//! P's outbound connections to real targets are made by the original
-//! process over Unix-domain sockets, which cross network namespaces via
-//! the filesystem (the socket directory is bind-mounted at /net).
+//! The network namespace is shared by P and C, so COMMAND reaches P's
+//! frontends transparently at 127.0.0.2, while it stays fully isolated
+//! from the host network (the namespace has no interfaces besides
+//! loopback). P's outbound connections to real targets are made by the
+//! original process over Unix-domain sockets, which cross network
+//! namespaces via the filesystem (the socket directory is bind-mounted
+//! at /net inside the sandbox).
 //!
 //! Tokio runtimes are created strictly *after* every fork, in the process
 //! that actually runs async code — a forked child must never share a
@@ -36,7 +40,8 @@ use crate::sandbox::{
     die, die_with_error, exit_with_status, handle_die_with_parent, pidns_and_exec, userns_id,
     write_id_map,
 };
-use crate::spec::internal::{Net, Op};
+use crate::spec::internal::{Net, NetMode, Op};
+use crate::waf;
 
 /// Temporary host directory holding the proxy socket. It is bind-mounted
 /// at /net inside the sandbox so that the (network-isolated) child can
@@ -77,15 +82,20 @@ pub unsafe fn run(
             isolated_parent(&netdir, net, ops, command, env, cwd, die_with_parent);
         }
 
-        // Connector: serve proxy connections from the host side and watch
-        // for P's exit.
+        // Connector: serve proxy/waf requests from the host side and
+        // watch for P's exit.
         let allow = net.allow.clone();
         let status = block_on(async move {
             let _ = listener.set_nonblocking(true);
             let l = tokio::net::UnixListener::from_std(listener)
                 .unwrap_or_else(|e| die(&format!("Can't register proxy socket: {e}")));
             tokio::select! {
-                _ = crate::proxy::serve_connector(l, allow) => {
+                _ = async {
+                    match net.mode {
+                        NetMode::Proxy => crate::proxy::serve_connector(l, allow).await,
+                        NetMode::Waf => waf::host::serve_host(l, allow).await,
+                    }
+                } => {
                     unreachable!("connector accept loop never ends")
                 }
                 st = wait_status(pid) => st,
@@ -152,34 +162,77 @@ unsafe fn isolated_parent(
             &format!("{} {real_gid} 1\n", crate::sandbox::SANDBOX_ID),
         );
 
-        // The loopback interface starts DOWN; bring it up so the proxy at
-        // 127.0.0.2 (and any local servers) are reachable.
+        // The loopback interface starts DOWN; bring it up so the servers
+        // at 127.0.0.2 are reachable.
         bring_up_loopback();
 
-        let proxy_listener = match std::net::TcpListener::bind(PROXY_ADDR) {
-            Ok(l) => l,
-            Err(e) => die(&format!("Can't bind proxy listener on {PROXY_ADDR}: {e}")),
-        };
-        let _ = libc::fcntl(proxy_listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        // Bind the mode's in-sandbox listeners before forking the child
+        // (all on 127.0.0.2, the address the waf DNS server resolves to).
+        let mut proxy_listener = None;
+        let mut waf_listeners = None;
+        match net.mode {
+            NetMode::Proxy => {
+                let listener = match std::net::TcpListener::bind(PROXY_ADDR) {
+                    Ok(l) => l,
+                    Err(e) => die(&format!("Can't bind proxy listener on {PROXY_ADDR}: {e}")),
+                };
+                let _ = libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                proxy_listener = Some(listener);
+            }
+            NetMode::Waf => {
+                let (tcp53, tcp80, tcp443) = (
+                    std::net::TcpListener::bind("127.0.0.2:53"),
+                    std::net::TcpListener::bind("127.0.0.2:80"),
+                    std::net::TcpListener::bind("127.0.0.2:443"),
+                );
+                let udp53 = std::net::UdpSocket::bind("127.0.0.2:53");
+                let (tcp53, tcp80, tcp443, udp53) = match (tcp53, tcp80, tcp443, udp53) {
+                    (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+                    _ => die("Can't bind the waf listeners on 127.0.0.2 (ports 53, 80, 443)"),
+                };
+                for fd in [&tcp53, &tcp80, &tcp443] {
+                    let _ = libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                let _ = libc::fcntl(udp53.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                waf_listeners = Some((tcp53, tcp80, tcp443, udp53));
+            }
+        }
 
-        // Make standard tools (curl, wget, git, ...) use the proxy by
-        // adding the proxy variables to the sandbox's isolated
-        // environment. Entries from the spec's `env` section are applied
-        // afterwards and so win over these: an explicit spec value is the
-        // user's authoritative choice.
-        let mut child_env: BTreeMap<String, String> = [
-            ("http_proxy", PROXY_URL),
-            ("HTTP_PROXY", PROXY_URL),
-            ("https_proxy", PROXY_URL),
-            ("HTTPS_PROXY", PROXY_URL),
-            ("all_proxy", PROXY_URL),
-            ("ALL_PROXY", PROXY_URL),
-            ("NO_PROXY", "localhost,127.0.0.1,::1"),
-            ("RS_BUBBLE_PROXY", "/net/sock"),
-        ]
-        .into_iter()
-        .map(|(key, val)| (key.to_string(), val.to_string()))
-        .collect();
+        // Environment: in proxy mode, make standard tools (curl, wget,
+        // git, ...) use the proxy by adding the proxy variables to the
+        // sandbox's isolated environment. In waf mode nothing is needed —
+        // the DNS server and the 127.0.0.2 servers take care of the
+        // redirection — so the command starts without proxy variables.
+        // Entries from the spec's `env` section are applied afterwards and
+        // so win over these: an explicit spec value is the user's
+        // authoritative choice.
+        let mut child_env: BTreeMap<String, String> = BTreeMap::new();
+        if net.mode == NetMode::Proxy {
+            child_env.extend(
+                [
+                    ("http_proxy", PROXY_URL),
+                    ("HTTP_PROXY", PROXY_URL),
+                    ("https_proxy", PROXY_URL),
+                    ("HTTPS_PROXY", PROXY_URL),
+                    ("all_proxy", PROXY_URL),
+                    ("ALL_PROXY", PROXY_URL),
+                    ("NO_PROXY", "localhost,127.0.0.1,::1"),
+                    ("RS_BUBBLE_PROXY", "/net/sock"),
+                ]
+                .into_iter()
+                .map(|(key, val)| (key.to_string(), val.to_string())),
+            );
+        }
+        if net.mode == NetMode::Waf {
+            // The waf mode injects its MITM CA as the sandbox's trust
+            // anchor (see `main`); point OpenSSL-based clients at it
+            // explicitly so a distro with a different default bundle path
+            // still finds it.
+            child_env.insert(
+                "SSL_CERT_FILE".to_string(),
+                "/etc/ssl/certs/ca-certificates.crt".to_string(),
+            );
+        }
         child_env.extend(env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
         let child_ops: Vec<Op> = std::iter::once(Op::Bind {
@@ -201,18 +254,48 @@ unsafe fn isolated_parent(
             pidns_and_exec(&child_ops, command, &child_env, cwd, die_with_parent);
         }
 
-        // Serve CONNECT requests while the command runs.
+        // Serve the mode's network frontends while the command runs.
         let allow = net.allow.clone();
         let sock = netdir.join("sock");
         let status = block_on(async move {
-            let _ = proxy_listener.set_nonblocking(true);
-            let l = tokio::net::TcpListener::from_std(proxy_listener)
-                .unwrap_or_else(|e| die(&format!("Can't register proxy listener: {e}")));
-            tokio::select! {
-                _ = crate::proxy::serve_sandbox_proxy(l, sock, allow) => {
-                    unreachable!("proxy accept loop never ends")
+            match (net.mode, proxy_listener, waf_listeners) {
+                (NetMode::Proxy, Some(listener), _) => {
+                    let _ = listener.set_nonblocking(true);
+                    let l = tokio::net::TcpListener::from_std(listener)
+                        .unwrap_or_else(|e| die(&format!("Can't register proxy listener: {e}")));
+                    tokio::select! {
+                        _ = crate::proxy::serve_sandbox_proxy(l, sock, allow) => {
+                            unreachable!("proxy accept loop never ends")
+                        }
+                        st = wait_status(child_pid) => st,
+                    }
                 }
-                st = wait_status(child_pid) => st,
+                (NetMode::Waf, _, Some((tcp53, tcp80, tcp443, udp53))) => {
+                    let _ = tcp53.set_nonblocking(true);
+                    let _ = tcp80.set_nonblocking(true);
+                    let _ = tcp443.set_nonblocking(true);
+                    let _ = udp53.set_nonblocking(true);
+                    let tcp53 = tokio::net::TcpListener::from_std(tcp53)
+                        .unwrap_or_else(|e| die(&format!("Can't register DNS TCP listener: {e}")));
+                    let tcp80 = tokio::net::TcpListener::from_std(tcp80)
+                        .unwrap_or_else(|e| die(&format!("Can't register HTTP listener: {e}")));
+                    let tcp443 = tokio::net::TcpListener::from_std(tcp443)
+                        .unwrap_or_else(|e| die(&format!("Can't register HTTPS listener: {e}")));
+                    let udp53 = tokio::net::UdpSocket::from_std(udp53)
+                        .unwrap_or_else(|e| die(&format!("Can't register DNS UDP socket: {e}")));
+                    tokio::spawn(waf::dns::serve_tcp(tcp53, sock.clone()));
+                    tokio::spawn(waf::http::serve_http(tcp80, sock.clone()));
+                    tokio::spawn(waf::https::serve_https(tcp443, sock.clone()));
+                    tokio::select! {
+                        // The UDP DNS loop never ends; it keeps the runtime
+                        // busy while wait_status delivers the exit status.
+                        _ = waf::dns::serve_udp(udp53, sock) => {
+                            unreachable!("DNS accept loop never ends")
+                        }
+                        st = wait_status(child_pid) => st,
+                    }
+                }
+                _ => unreachable!("mode and listeners agree"),
             }
         });
 

@@ -18,6 +18,10 @@
 //! * `proxy`   — pure async networking (tokio): the host-side connector on
 //!   a Unix socket and the in-sandbox HTTP CONNECT proxy. No namespace or
 //!   process management.
+//! * `waf`     — the alternative isolated-network mode: DNS/HTTP/HTTPS
+//!   servers inside the sandbox on 127.0.0.2 that redirect allow-listed
+//!   traffic to the host side over the same style of Unix socket, using a
+//!   simple command protocol (`resolve-dns`, `connect`).
 
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -28,6 +32,7 @@ mod netns;
 mod proxy;
 mod sandbox;
 mod spec;
+mod waf;
 
 use cli::Command;
 
@@ -56,6 +61,39 @@ fn main() {
                 );
             }
             let mut spec = spec::Spec::load(cli.spec.as_deref());
+
+            // In waf mode the sandbox has no real resolver configuration:
+            // inject a virtual, in-memory `/etc/resolv.conf` pointing at
+            // the in-sandbox DNS server (127.0.0.2, see `crate::waf`). The
+            // mapping is appended last, so it wins over earlier mappings of
+            // the same path (`hide` still wins over it — a hidden path is
+            // invisible no matter what).
+            if matches!(spec.net, spec::net::NetConfig::Waf { .. }) {
+                spec.hostfs.mappings.push(spec::hostfs::Mapping::Inject {
+                    path: "/etc/resolv.conf".to_string(),
+                    content: "nameserver 127.0.0.2\noptions timeout:1 attempts:1\n".to_string(),
+                });
+
+                // The waf mode MITMs HTTPS: generate (once per run) the
+                // self-signed CA the in-sandbox HTTPS server signs its
+                // certificates with, and inject it as the sandbox's trust
+                // anchor. /etc/ssl/certs/ca-certificates.crt is the
+                // bundle path of Debian/Ubuntu/Alpine (what curl and
+                // OpenSSL-based clients use by default); /etc/pki/... is
+                // the Fedora/RHEL equivalent. Only *verification* needs
+                // these files — a fake openssl.cnf is not necessary.
+                // Appended last, the mappings win over earlier ones, but
+                // not over an explicit `hide` of the same path.
+                let ca = waf::host::ca_certificate_pem();
+                spec.hostfs.mappings.push(spec::hostfs::Mapping::Inject {
+                    path: "/etc/ssl/certs/ca-certificates.crt".to_string(),
+                    content: ca.clone(),
+                });
+                spec.hostfs.mappings.push(spec::hostfs::Mapping::Inject {
+                    path: "/etc/pki/tls/certs/ca-bundle.crt".to_string(),
+                    content: ca,
+                });
+            }
 
             // Resolve the cache mappings (`session-cache`,
             // `project-cache`) against their backing directories before

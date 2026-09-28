@@ -55,14 +55,6 @@
         "type": "dev"
       },
       {
-        "type": "ro",
-        "glob": "/etc/ssl"
-      },
-      {
-        "type": "ro",
-        "glob": "/etc/ca-certificates"
-      },
-      {
         "type": "proc"
       },
       {
@@ -81,8 +73,10 @@
   },
   "cwd": "${PWD}",
   "net": {
-    "mode": "proxy",
+    "mode": "waf",
     "allow": [
+      "registry.cube.home:80",
+      "registry.cube.home:443",
       "google.com:443",
       "*.crates.io:443",
       "opencode.ai:443",

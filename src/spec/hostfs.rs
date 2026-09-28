@@ -194,6 +194,20 @@ pub enum Mapping {
         /// An absolute sandbox path for the new symlink.
         dest: String,
     },
+    /// Show a **purely virtual, in-memory file** at the path: `content`
+    /// (a small file, e.g. an `/etc/resolv.conf`) is served from the
+    /// mirror's memory — the host filesystem is not consulted at all,
+    /// and the file leaves no trace on the host. The injected file is
+    /// read-only and nothing below its path is visible. Like the
+    /// redirects, this is purely a FUSE feature (see
+    /// [`Mapping::pattern`]): it produces no op.
+    Inject {
+        /// An absolute sandbox path for the injected file (named
+        /// exactly, no wildcards).
+        path: String,
+        /// The content of the injected file (text, served as UTF-8).
+        content: String,
+    },
 }
 
 /// The default path of the `dev` mapping's mount point.
@@ -280,6 +294,11 @@ enum UncheckedMapping {
         src: String,
         #[serde(deserialize_with = "env_string")]
         dest: String,
+    },
+    Inject {
+        #[serde(deserialize_with = "env_string")]
+        path: String,
+        content: String,
     },
 }
 
@@ -417,6 +436,10 @@ impl TryFrom<UncheckedMapping> for Mapping {
                 src: nonempty("symlink", "src", src)?,
                 dest: absolute("symlink", "dest", dest)?,
             },
+            UncheckedMapping::Inject { path, content } => Mapping::Inject {
+                path: redirect_dest("inject", path)?,
+                content: nonempty("inject", "content", content)?,
+            },
         })
     }
 }
@@ -445,6 +468,7 @@ impl Mapping {
             Mapping::Bind { src, dest, .. } => Some(dest.as_deref().unwrap_or(src)),
             Mapping::RedirectRo { dest, .. } | Mapping::RedirectRw { dest, .. } => Some(dest),
             Mapping::SessionCache { path } | Mapping::ProjectCache { path } => Some(path),
+            Mapping::Inject { path, .. } => Some(path),
             Mapping::Symlink { .. } => None,
         }
     }
@@ -475,6 +499,7 @@ impl Mapping {
             Mapping::SessionCache { path } => format!("session-cache {path}"),
             Mapping::ProjectCache { path } => format!("project-cache {path}"),
             Mapping::Symlink { src, dest } => format!("symlink {dest} -> {src}"),
+            Mapping::Inject { path, content } => format!("inject {path} ({} bytes)", content.len()),
         }
     }
 
@@ -495,6 +520,9 @@ impl Mapping {
                 source: PathBuf::from(source),
                 writable: true,
             },
+            Mapping::Inject { content, .. } => Permission::Inject {
+                content: content.clone(),
+            },
             Mapping::SessionCache { .. } | Mapping::ProjectCache { .. } => {
                 // A cache mapping *is* a redirect-rw — to its backing
                 // directory. The real source is filled in by
@@ -510,7 +538,6 @@ impl Mapping {
             _ => Permission::Empty,
         }
     }
-
     /// The op the mapping stands for, if any. The mount-point mappings
     /// (`dev`, `tmpfs`, `proc`, `bind`) produce the op that is stacked on
     /// top of the empty path they expose, and `symlink` produces the
@@ -920,6 +947,52 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn inject_mapping_parses_and_is_read_only_virtual_fuse() {
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "inject", "path": "/etc/resolv.conf", "content": "nameserver 127.0.0.2\n" }
+            ] } }"#,
+        );
+        assert_eq!(
+            spec.hostfs.patterns(),
+            Patterns(vec![(
+                "/etc/resolv.conf".to_string(),
+                Permission::Inject {
+                    content: "nameserver 127.0.0.2\n".to_string()
+                }
+            )])
+        );
+        // Inject is pure FUSE: no mount op, not writable.
+        assert!(spec.hostfs.ops().is_empty());
+        assert!(!spec.hostfs.mappings[0].permission().is_writable());
+        assert_eq!(
+            spec.hostfs.mappings[0].describe(),
+            "inject /etc/resolv.conf (21 bytes)"
+        );
+    }
+
+    #[test]
+    fn inject_mapping_rejects_bad_paths_and_empty_content() {
+        for mapping in [
+            r#"{ "type": "inject", "path": "etc/resolv.conf", "content": "x" }"#,
+            r#"{ "type": "inject", "path": "/etc/*", "content": "x" }"#,
+            r#"{ "type": "inject", "path": "/../etc/x", "content": "x" }"#,
+            r#"{ "type": "inject", "path": "/etc/x" }"#,
+            r#"{ "type": "inject", "path": "/etc/x", "content": "" }"#,
+            r#"{ "type": "inject", "content": "x" }"#,
+            r#"{ "type": "inject", "path": "/etc/x", "content": "x", "glob": "/etc" }"#,
+        ] {
+            assert!(
+                serde_json::from_str::<crate::spec::Spec>(&format!(
+                    r#"{{ "hostfs": {{ "mappings": [ {mapping} ] }} }}"#
+                ))
+                .is_err(),
+                "should reject {mapping}"
+            );
+        }
     }
 
     #[test]

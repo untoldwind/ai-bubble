@@ -12,6 +12,10 @@ use schemars::JsonSchema;
 /// - `{"mode": "proxy", "allow": [...]}`: the command runs in a fresh
 ///   network namespace and its connections are proxied from the host
 ///   side, gated by `allow`.
+/// - `{"mode": "waf", "allow": [...]}`: like proxy, but the sandbox
+///   gets DNS/HTTP/HTTPS servers on 127.0.0.2 (ports 53, 80, 443) that
+///   resolve allow-listed names to 127.0.0.2 and forward the traffic
+///   from the host side over a Unix socket.
 #[derive(Debug, Default, PartialEq, Deserialize, Clone, JsonSchema)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum NetConfig {
@@ -28,6 +32,14 @@ pub enum NetConfig {
         /// target must be listed explicitly.
         allow: Vec<String>,
     },
+    /// Run the command in a fresh network namespace behind the in-sandbox
+    /// DNS/HTTP/HTTPS servers on 127.0.0.2 (see `crate::waf`).
+    Waf {
+        /// Allow-list of `host`, `host:port`, or `*.domain[:port]` targets.
+        /// A bare `host` entry (no port) is both resolved by the DNS server
+        /// (to 127.0.0.2) and connectable. Empty means: nothing is allowed.
+        allow: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -37,9 +49,8 @@ mod tests {
 
     #[test]
     fn net_options() {
-        let spec = parse(
-            r#"{ "net": { "mode": "proxy", "allow": ["example.com:443", "localhost"] } }"#,
-        );
+        let spec =
+            parse(r#"{ "net": { "mode": "proxy", "allow": ["example.com:443", "localhost"] } }"#);
         assert_eq!(
             spec.net,
             NetConfig::Proxy {
@@ -66,12 +77,43 @@ mod tests {
     }
 
     #[test]
+    fn waf_mode() {
+        let spec =
+            parse(r#"{ "net": { "mode": "waf", "allow": ["example.com:443", "*.example.com"] } }"#);
+        assert_eq!(
+            spec.net,
+            NetConfig::Waf {
+                allow: vec!["example.com:443".to_string(), "*.example.com".to_string()]
+            }
+        );
+        // `allow` is mandatory here, too.
+        assert!(super::super::tests::parse_err(r#"{ "net": { "mode": "waf" } }"#).is_some());
+        // Unknown fields are rejected.
+        assert!(
+            super::super::tests::parse_err(
+                r#"{ "net": { "mode": "waf", "allow": ["x"], "nope": 1 } }"#
+            )
+            .is_some()
+        );
+        // And it compiles down to the isolated waf configuration.
+        let compiled = super::super::internal::SandboxConfig::compile(&spec);
+        assert!(compiled.net.isolated);
+        assert_eq!(compiled.net.mode, super::super::internal::NetMode::Waf);
+        assert_eq!(
+            compiled.net.allow,
+            vec!["example.com:443".to_string(), "*.example.com".to_string()]
+        );
+    }
+
+    #[test]
     fn net_rejects_unknown_fields() {
         // Unknown fields are rejected in proxy mode...
-        assert!(super::super::tests::parse_err(
-            r#"{ "net": { "mode": "proxy", "allow": ["x"], "nope": true } }"#
-        )
-        .is_some());
+        assert!(
+            super::super::tests::parse_err(
+                r#"{ "net": { "mode": "proxy", "allow": ["x"], "nope": true } }"#
+            )
+            .is_some()
+        );
         // ...but a unit variant like host has no fields to deny (serde's
         // internally-tagged enums cannot deny unknown fields for unit
         // variants).

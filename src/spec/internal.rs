@@ -14,14 +14,27 @@ use super::Spec;
 use super::net::NetConfig;
 use super::tmpfs::TmpfsPerms;
 
+/// Which kind of in-sandbox servers an isolated network namespace runs:
+/// the mode selected in the spec's `net` section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetMode {
+    /// An HTTP CONNECT proxy on 127.0.0.2:3128 (see [`crate::proxy`]).
+    Proxy,
+    /// DNS on 53, HTTP on 80 and HTTPS on 443 on 127.0.0.2 (see
+    /// [`crate::waf`]).
+    Waf,
+}
+
 /// The sandbox's internal network configuration: what [`crate::netns`]
 /// runs with, compiled down from the spec file's [`NetConfig`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Net {
-    /// Run the command in a fresh network namespace behind a proxy.
+    /// Run the command in a fresh network namespace (proxy or waf mode).
     pub isolated: bool,
-    /// The proxy allow-list; empty means: allow nothing. Entries may
-    /// use a `*.` subdomain wildcard.
+    /// Which in-sandbox servers to run in an isolated namespace.
+    pub mode: NetMode,
+    /// The allow-list; empty means: allow nothing. Entries may use a
+    /// `*.` subdomain wildcard.
     pub allow: Vec<String>,
 }
 
@@ -30,10 +43,17 @@ impl From<&NetConfig> for Net {
         match net {
             NetConfig::Host => Net {
                 isolated: false,
+                mode: NetMode::Proxy,
                 allow: vec![],
             },
             NetConfig::Proxy { allow } => Net {
                 isolated: true,
+                mode: NetMode::Proxy,
+                allow: allow.clone(),
+            },
+            NetConfig::Waf { allow } => Net {
+                isolated: true,
+                mode: NetMode::Waf,
                 allow: allow.clone(),
             },
         }
@@ -204,6 +224,14 @@ pub enum Permission {
     /// plain mirrors, writes additionally require the real host
     /// permissions to allow them.
     Redirect { source: PathBuf, writable: bool },
+    /// The matched path is a **purely virtual, in-memory file**: it has no
+    /// counterpart on the host at all — its content (`content`) is served
+    /// from the mirror's memory. Read-only by definition (a write to it
+    /// would have nowhere to go), and nothing below it is visible: an
+    /// injected path is always a regular file. Used to plant small
+    /// configuration files (e.g. `/etc/resolv.conf` in waf mode) into the
+    /// sandbox without any host-side trace.
+    Inject { content: String },
 }
 
 impl Permission {
@@ -212,7 +240,10 @@ impl Permission {
     pub fn is_mirrored(&self) -> bool {
         matches!(
             self,
-            Permission::Ro | Permission::Rw | Permission::Redirect { .. }
+            Permission::Ro
+                | Permission::Rw
+                | Permission::Redirect { .. }
+                | Permission::Inject { .. }
         )
     }
 
@@ -244,6 +275,7 @@ impl std::fmt::Display for Permission {
             Permission::Empty => "empty",
             Permission::Redirect { writable, .. } if *writable => "redirect-rw",
             Permission::Redirect { .. } => "redirect-ro",
+            Permission::Inject { .. } => "inject",
         })
     }
 }

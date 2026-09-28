@@ -423,7 +423,7 @@
       ]
     },
     "NetConfig": {
-      "description": "Network-related configuration for the sandboxed command: how it reaches the network.\n\n- `{\"mode\": \"host\"}` (the default): the command shares the host network. - `{\"mode\": \"proxy\", \"allow\": [...]}`: the command runs in a fresh network namespace and its connections are proxied from the host side, gated by `allow`.",
+      "description": "Network-related configuration for the sandboxed command: how it reaches the network.\n\n- `{\"mode\": \"host\"}` (the default): the command shares the host network. - `{\"mode\": \"proxy\", \"allow\": [...]}`: the command runs in a fresh network namespace and its connections are proxied from the host side, gated by `allow`. - `{\"mode\": \"waf\", \"allow\": [...]}`: like proxy, but the sandbox gets DNS/HTTP/HTTPS servers on 127.0.0.2 (ports 53, 80, 443) that resolve allow-listed names to 127.0.0.2 and forward the traffic from the host side over a Unix socket.",
       "oneOf": [
         {
           "description": "Share the host network (the default).",
@@ -460,6 +460,30 @@
               "type": "string",
               "enum": [
                 "proxy"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Run the command in a fresh network namespace behind the in-sandbox DNS/HTTP/HTTPS servers on 127.0.0.2 (see `crate::waf`).",
+          "type": "object",
+          "required": [
+            "allow",
+            "mode"
+          ],
+          "properties": {
+            "allow": {
+              "description": "Allow-list of `host`, `host:port`, or `*.domain[:port]` targets. A bare `host` entry (no port) is both resolved by the DNS server (to 127.0.0.2) and connectable. Empty means: nothing is allowed.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "waf"
               ]
             }
           },

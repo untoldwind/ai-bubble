@@ -398,7 +398,10 @@ mod tests {
         map.rename(Path::new("/d"), Path::new("/e"), ROOT_INODE);
 
         assert_eq!(map.path_of(file).as_deref(), Some(Path::new("/e/f")));
-        assert_eq!(map.path_of(sibling_file).as_deref(), Some(Path::new("/d-other/f")));
+        assert_eq!(
+            map.path_of(sibling_file).as_deref(),
+            Some(Path::new("/d-other/f"))
+        );
         assert_eq!(map.inode_of(Path::new("/e/f")), Some(file));
         assert_eq!(map.inode_of(Path::new("/d-other/f")), Some(sibling_file));
     }

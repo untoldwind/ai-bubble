@@ -156,6 +156,16 @@ pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
         return None;
     }
 
+    // Everything strictly below an injected path is invisible, too: an
+    // injected path is a virtual file, it has no content below it.
+    if path
+        .ancestors()
+        .skip(1)
+        .any(|a| matches!(direct(a), Some(Permission::Inject { .. })))
+    {
+        return None;
+    }
+
     // A hidden path is never visible — the mirror enforces this
     // unconditionally (`HostFs::hidden` checks every `hide` pattern,
     // naming the path itself or a strict ancestor, before any direct
@@ -360,6 +370,29 @@ impl HostFs {
         self.permission_of(mirrored) == Some(Permission::Empty)
     }
 
+    /// The in-memory content of the mirrored path when it is matched with
+    /// the `inject` permission (by the last pattern naming it): the path
+    /// is a purely virtual file served from the mirror's memory, with no
+    /// host counterpart at all.
+    fn is_inject(&self, mirrored: &Path) -> Option<String> {
+        match self.permission_of(mirrored) {
+            Some(Permission::Inject { content }) => Some(content),
+            _ => None,
+        }
+    }
+
+    /// Whether some `inject` pattern could still match something *strictly
+    /// below* the given mirrored path — i.e. the path acts as a (possibly
+    /// purely virtual) directory leading to injected files, and must stay
+    /// navigable (and listable) even when the mirror knows nothing about
+    /// it otherwise.
+    fn is_inject_prefix(&self, mirrored: &Path) -> bool {
+        self.patterns.iter().any(|p| {
+            matches!(p.permission, Permission::Inject { .. })
+                && p.pattern.walk(mirrored) == Walk::CouldReach
+        })
+    }
+
     /// Whether the mirrored path lies strictly *below* an empty path (so it is
     /// shadowed by the empty path's precedence and never visible).
     fn under_empty(&self, mirrored: &Path) -> bool {
@@ -374,6 +407,21 @@ impl HostFs {
         self.patterns
             .iter()
             .any(|p| p.permission == Permission::Empty && self.pattern_reaches(p, mirrored))
+    }
+
+    /// Whether the path is purely virtual, so its access is answered
+    /// directly instead of by the real filesystem: empty paths, injected
+    /// paths, and purely virtual ancestors of empty or injected paths
+    /// whose real host path does not exist. Such paths are readable
+    /// directories (mode 0555) — or injected files — that are never
+    /// writable. Async: it stats the real host filesystem.
+    async fn virtual_only(&self, mirrored: &Path) -> bool {
+        self.is_empty(mirrored)
+            || self.is_inject(mirrored).is_some()
+            || (self.is_empty_prefix(mirrored) || self.is_inject_prefix(mirrored))
+                && tokio_fs::symlink_metadata(self.redirect(mirrored))
+                    .await
+                    .is_err()
     }
 
     /// Map a sandbox-relative path (as passed by the FUSE bridge, without a
@@ -514,6 +562,9 @@ impl HostFs {
         if self.is_empty(mirrored) {
             return true;
         }
+        if self.is_inject(mirrored).is_some() {
+            return true;
+        }
         if self.hidden(mirrored) {
             return false;
         }
@@ -529,14 +580,19 @@ impl HostFs {
             return self.patterns.iter().any(|p| {
                 matches!(
                     p.permission,
-                    Permission::Ro | Permission::Rw | Permission::Empty
+                    Permission::Ro | Permission::Rw | Permission::Empty | Permission::Inject { .. }
                 )
             });
         }
-        self.patterns
-            .iter()
-            .any(|p| p.permission.is_mirrored() && self.pattern_reaches(p, mirrored))
-            || self.is_empty_prefix(mirrored)
+        self.patterns.iter().any(|p| match p.permission {
+            // An injected pattern is an exact file: only paths
+            // *strictly above* it (CouldReach) are navigable as its
+            // virtual parent directories — a path below the injected
+            // file (Ancestor) exists just as little as the file's
+            // non-existent children.
+            Permission::Inject { .. } => p.pattern.walk(mirrored) == Walk::CouldReach,
+            _ => p.permission.is_mirrored() && self.pattern_reaches(p, mirrored),
+        }) || self.is_empty_prefix(mirrored)
     }
 
     /// Whether the pattern could make the path visible as a directory
@@ -652,6 +708,27 @@ impl HostFs {
         attr
     }
 
+    /// The attributes of an injected file: a read-only regular file whose
+    /// size is the in-memory content's length (the content itself is
+    /// served by `read`).
+    fn inject_file_attr(&self, content: &[u8]) -> FileAttr {
+        FileAttr {
+            ino: 0,
+            size: content.len() as u64,
+            blocks: (content.len() as u64).div_ceil(512),
+            atime: SystemTime::UNIX_EPOCH.into(),
+            mtime: SystemTime::UNIX_EPOCH.into(),
+            ctime: SystemTime::UNIX_EPOCH.into(),
+            kind: FileType::RegularFile,
+            perm: 0o444,
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
+        }
+    }
+
     /// Whether the given **host** path can act as a listable directory
     /// without following symlinks: it must really be a directory (a
     /// symlink to a directory is not followed).
@@ -666,6 +743,11 @@ impl HostFs {
     /// stats the real host filesystem (`tokio::fs` runs the syscall on
     /// tokio's blocking pool) and must never run on the FUSE event loop.
     async fn attr(&self, mirrored: &Path) -> std::io::Result<FileAttr> {
+        // Injected paths take precedence over everything: they are purely
+        // virtual files served from memory.
+        if let Some(content) = self.is_inject(mirrored) {
+            return Ok(self.inject_file_attr(content.as_bytes()));
+        }
         // Empty paths take precedence: they appear even when the real host
         // path exists (with different attributes) — as an empty directory
         // when the path is (or would be) a directory, as an empty file
@@ -680,9 +762,16 @@ impl HostFs {
         match tokio_fs::symlink_metadata(&real).await {
             Ok(md) => Ok(attr_from_metadata(&md)),
             // A purely virtual ancestor of an empty path has no real
-            // counterpart; present it as a directory.
+            // counterpart; present it as a directory. The same holds for
+            // purely virtual ancestors of injected files: `exists`/`readdir`
+            // advertise them (they lead to the injected file), so their
+            // attributes must not fail — a single failing entry attribute
+            // turns the whole `readdir` reply into an error (which glibc's
+            // `readdir` then silently reports as end-of-directory: an empty
+            // listing despite the entries being lookable).
             Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound && self.is_empty_prefix(mirrored) =>
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && (self.is_empty_prefix(mirrored) || self.is_inject_prefix(mirrored)) =>
             {
                 Ok(self.empty_dir_attr())
             }
@@ -695,7 +784,10 @@ impl HostFs {
     /// path, or a purely virtual ancestor of an empty path. Async: it
     /// stats the real host filesystem (`tokio::fs`).
     async fn is_listable_dir(&self, mirrored: &Path) -> bool {
-        if self.is_empty(mirrored) || self.is_empty_prefix(mirrored) {
+        if self.is_empty(mirrored)
+            || self.is_empty_prefix(mirrored)
+            || self.is_inject_prefix(mirrored)
+        {
             return true;
         }
         self.is_host_dir(&self.redirect(mirrored)).await
@@ -756,6 +848,21 @@ impl HostFs {
         // pattern with a purely literal next component contributes one.
         for p in &self.patterns {
             if p.permission != Permission::Empty {
+                continue;
+            }
+            if let Some(name) = p.pattern.next_literal(mirrored) {
+                let child = mirrored.join(&name);
+                if !names.iter().any(|n| n.as_os_str() == OsStr::new(&name)) && self.exists(&child)
+                {
+                    names.push(OsString::from(name));
+                }
+            }
+        }
+        // Injected files living directly under this directory (also when
+        // the real directory itself cannot be listed): every `inject`
+        // pattern with a purely literal next component contributes one.
+        for p in &self.patterns {
+            if !matches!(p.permission, Permission::Inject { .. }) {
                 continue;
             }
             if let Some(name) = p.pattern.next_literal(mirrored) {
@@ -992,6 +1099,22 @@ impl Filesystem for HostFs {
             );
             return Err(libc::ENOENT.into());
         }
+        // An injected path is a purely virtual file: served from memory,
+        // never writable, the host is not consulted at all.
+        if let Some(_content) = self.is_inject(&mirrored) {
+            let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
+            if write_flags {
+                log_op_err(
+                    "open",
+                    &mirrored,
+                    None,
+                    &std::io::Error::from_raw_os_error(libc::EACCES),
+                );
+                return Err(libc::EACCES.into());
+            }
+            self.inodes.write().await.open_handle(inode);
+            return Ok(ReplyOpen { fh: 0, flags: 0 });
+        }
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not), and
         // symlinks are never followed: a host symlink cannot be opened
@@ -1000,6 +1123,16 @@ impl Filesystem for HostFs {
             Ok(md) => md,
             Err(e) => {
                 log_op_err("open", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                // A purely virtual directory (ancestor of an empty or
+                // injected path with no real counterpart) is not openable,
+                // exactly like a real one that `open` refuses: report it as
+                // a directory rather than as missing (the kernel only asks
+                // to open directories it has already resolved).
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && (self.is_empty_prefix(&mirrored) || self.is_inject_prefix(&mirrored))
+                {
+                    return Err(libc::EISDIR.into());
+                }
                 return Err(libc::ENOENT.into());
             }
         };
@@ -1084,6 +1217,14 @@ impl Filesystem for HostFs {
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
             );
             return Err(libc::ENOENT.into());
+        }
+        // An injected path is served from memory: slice the content at
+        // the requested offset (nothing is read from the host).
+        if let Some(content) = self.is_inject(&mirrored) {
+            let bytes = content.as_bytes();
+            let offset = offset.min(bytes.len() as u64) as usize;
+            let end = (offset + size as usize).min(bytes.len());
+            return Ok(ReplyData::from(Bytes::copy_from_slice(&bytes[offset..end])));
         }
         // An empty path has no content: an empty file reads as empty (the
         // host file is never opened).
@@ -1196,6 +1337,29 @@ impl Filesystem for HostFs {
         // with `O_NOFOLLOW` and `fstatvfs` runs on the descriptor: symlinks
         // are never followed to a filesystem outside the mirror.
         let p = self.resolve(inode).await?;
+        let mirrored = self.mirror_path(p.as_os_str());
+        // An injected path has no host counterpart: report a minimal,
+        // self-consistent statfs instead of opening anything. The same
+        // holds for a purely virtual ancestor of an injected (or empty)
+        // path with no real counterpart: it is a virtual directory, and
+        // there is nothing to open on the host.
+        if self.is_inject(&mirrored).is_some()
+            || (self.is_empty_prefix(&mirrored) || self.is_inject_prefix(&mirrored))
+                && tokio_fs::symlink_metadata(self.redirect(&mirrored))
+                    .await
+                    .is_err()
+        {
+            return Ok(ReplyStatFs {
+                blocks: 1,
+                bfree: 0,
+                bavail: 0,
+                files: 1,
+                ffree: 0,
+                bsize: 512,
+                namelen: 255,
+                frsize: 512,
+            });
+        }
         let mirrored = if is_root(p.as_os_str()) {
             PathBuf::from("/")
         } else {
@@ -1366,12 +1530,12 @@ impl Filesystem for HostFs {
         }
         // Empty paths (and purely virtual ancestors) are unwritable by
         // definition; answer directly instead of asking the real filesystem.
-        if self.is_empty(&mirrored)
-            || self.is_empty_prefix(&mirrored)
-                && tokio_fs::symlink_metadata(self.redirect(&mirrored))
-                    .await
-                    .is_err()
-        {
+        // Injected paths are virtual, too: readable, never writable. The
+        // same holds for purely virtual ancestors of injected files: the
+        // kernel consults `access` for `chdir` (MAY_CHDIR), so an
+        // unanswered ENOENT here would make a directory that `ls` lists
+        // and `stat` resolves impossible to `cd` into.
+        if self.virtual_only(&mirrored).await {
             if mask & libc::W_OK as u32 != 0 {
                 return Err(libc::EACCES.into());
             }
@@ -2291,6 +2455,87 @@ mod tests {
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["etc"]);
+    }
+
+    #[test]
+    fn injected_paths_are_virtual_read_only_files() {
+        let f = fs(&[(
+            "/etc/resolv.conf",
+            Permission::Inject {
+                content: "nameserver 127.0.0.2\n".to_string(),
+            },
+        )]);
+
+        // The injected path exists and is a visible mirror match.
+        assert!(f.exists(Path::new("/etc/resolv.conf")));
+        assert!(f.matches(Path::new("/etc/resolv.conf")));
+
+        // Its attributes: a read-only regular file sized like the content.
+        let attr = block(f.attr(Path::new("/etc/resolv.conf"))).unwrap();
+        assert_eq!(attr.kind, FileType::RegularFile);
+        assert_eq!(attr.perm, 0o444);
+        assert_eq!(attr.size, "nameserver 127.0.0.2\n".len() as u64);
+
+        // Ancestors stay navigable (even without any host mapping for
+        // /etc), and the file shows up in its (virtual) directory.
+        assert!(f.exists(Path::new("/etc")));
+        assert!(f.dir_prefix(Path::new("/etc")));
+        assert!(block(f.is_listable_dir(Path::new("/etc"))));
+        let names: Vec<_> = block(f.dir_entries(Path::new("/etc")))
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["resolv.conf"]);
+
+        // Read-only: nothing can be written to it (or created below it —
+        // the injected path is a file).
+        assert!(!f.writable(Path::new("/etc/resolv.conf")));
+        assert!(!f.writable(Path::new("/etc/resolv.conf/sub")));
+
+        // Nothing below the injected path is visible at all.
+        assert!(!f.exists(Path::new("/etc/resolv.conf/x")));
+        assert_eq!(
+            permission_of(
+                &Patterns(vec![(
+                    "/etc/resolv.conf".to_string(),
+                    Permission::Inject {
+                        content: "x".to_string()
+                    }
+                )]),
+                Path::new("/etc/resolv.conf/x"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn injected_path_ancestors_are_virtual_directories_for_access() {
+        let f = fs(&[(
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            Permission::Inject {
+                content: "x".to_string(),
+            },
+        )]);
+
+        // The purely virtual ancestors of an injected file are answered
+        // directly by `access` (the kernel consults it for `chdir`), as
+        // long as the real host path does not exist; where a real host
+        // directory exists, the real filesystem decides.
+        for p in ["/etc", "/etc/pki", "/etc/pki/tls", "/etc/pki/tls/certs"] {
+            let p = Path::new(p);
+            assert_eq!(
+                block(f.virtual_only(p)),
+                !f.redirect(p).exists(),
+                "virtual_only({p:?})"
+            );
+        }
+        // An injected file itself is always purely virtual.
+        assert!(block(
+            f.virtual_only(Path::new("/etc/pki/tls/certs/ca-bundle.crt"))
+        ));
+
+        // A real mirror path is not: the real filesystem decides.
+        assert!(!block(f.virtual_only(Path::new("/usr/bin"))));
     }
 
     #[test]
