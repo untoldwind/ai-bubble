@@ -31,6 +31,7 @@ mod spec;
 fn main() {
     println!("cargo:rerun-if-changed=src/spec/mod.rs");
     println!("cargo:rerun-if-changed=src/spec/file.rs");
+    println!("cargo:rerun-if-changed=src/spec/audit.rs");
     println!("cargo:rerun-if-changed=src/spec/env.rs");
     println!("cargo:rerun-if-changed=src/spec/internal.rs");
     println!("cargo:rerun-if-changed=src/spec/tmpfs.rs");

@@ -84,6 +84,10 @@ pub struct SandboxConfig {
     /// Already `${VAR}`-expanded and validated as an absolute, `..`-free
     /// path at parse time (see `crate::spec::file::cwd_string`).
     pub cwd: Option<PathBuf>,
+    /// The audit log path from the spec's `audit` section (with `${VAR}`
+    /// references already expanded at parse time), or `None` when
+    /// auditing is disabled.
+    pub audit_log: Option<PathBuf>,
 }
 
 impl SandboxConfig {
@@ -110,6 +114,7 @@ impl SandboxConfig {
                 .map(|(name, value)| (name.clone(), value.0.clone()))
                 .collect(),
             cwd: spec.cwd.as_deref().map(PathBuf::from),
+            audit_log: spec.audit.log.as_deref().map(PathBuf::from),
         }
     }
 }

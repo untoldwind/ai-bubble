@@ -38,6 +38,7 @@ async fn handle_connect_proxy(mut tcp: TcpStream, sock: &Path, allow: &[String])
     };
     if !target_allowed(&target, allow) {
         eprintln!("ai-bubble proxy: CONNECT to {target} denied");
+        crate::audit::record("proxy", "CONNECT", Some(&target), Some("denied"), None).await;
         let _ = tcp.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
         return;
     }
@@ -58,9 +59,11 @@ async fn handle_connect_proxy(mut tcp: TcpStream, sock: &Path, allow: &[String])
     // Wait for the connector's status byte before answering the client.
     let mut status = [0u8; 1];
     if unix.read_exact(&mut status).await.is_err() || status[0] != b'K' {
+        crate::audit::record("proxy", "CONNECT", Some(&target), Some("err"), None).await;
         let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
         return;
     }
+    crate::audit::record("proxy", "CONNECT", Some(&target), Some("ok"), None).await;
     let _ = tcp
         .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
         .await;

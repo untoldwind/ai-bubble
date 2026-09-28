@@ -22,6 +22,7 @@
 //! `crate::SPEC_SCHEMA` and prints it via `--print-schema`, so editors
 //! can validate and auto-complete spec files against it.
 
+pub mod audit;
 pub mod env;
 pub mod file;
 pub mod hostfs;
@@ -517,16 +518,16 @@ QUOTED="quoted file value"
         std::fs::write(
             &path,
             r#"{ "hostfs": { "mappings": [
-                { "type": "rw", "glob": "${RS_BUBBLE_TEST_HOME}/project" },
-                { "type": "bind", "src": "${RS_BUBBLE_TEST_HOME}/etc" }
+                { "type": "rw", "glob": "${RS_BUBBLE_TEST_SPEC_HOME}/project" },
+                { "type": "bind", "src": "${RS_BUBBLE_TEST_SPEC_HOME}/etc" }
             ] } }"#,
         )
         .unwrap();
-        // SAFETY: tests are single-threaded per process here and the
-        // variable name is unique to this test.
-        unsafe { std::env::set_var("RS_BUBBLE_TEST_HOME", "/home/me") };
+        // SAFETY: the variable name is unique to this test, so parallel
+        // tests never race on it.
+        unsafe { std::env::set_var("RS_BUBBLE_TEST_SPEC_HOME", "/home/me") };
         let spec = Spec::load(Some(&dir));
-        unsafe { std::env::remove_var("RS_BUBBLE_TEST_HOME") };
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_SPEC_HOME") };
         std::fs::remove_dir_all(&dir).ok();
         use crate::spec::hostfs::Mapping;
         match &spec.hostfs.mappings[0] {

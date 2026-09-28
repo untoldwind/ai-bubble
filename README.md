@@ -139,6 +139,16 @@ All fields are optional. A complete example:
 - `net` — how the command reaches the network; see
   [Isolated networking](#isolated-networking).
 
+- `audit` — optional audit logging: `"audit": { "log": "/path/audit.jsonl" }`
+  appends every security-relevant event (filesystem operations through
+  the hostfs mirror, waf allow/deny decisions, proxy CONNECT attempts)
+  to the file as one JSON object per line. Without a `log` path the
+  audit subsystem is disabled entirely. The path may use `${VAR}`
+  references to host environment variables. Events are buffered in
+  memory (generously) and written in batches by a dedicated writer; if
+  the buffer ever fills, producers briefly stall rather than drop
+  events.
+
 ### The mapping types
 
 | `type` | fields | effect |

@@ -36,6 +36,7 @@ async fn handle_connector_conn(mut stream: UnixStream, allow: &[String]) {
     };
     if !target_allowed(&target, allow) {
         eprintln!("ai-bubble proxy: connection to {target} denied");
+        crate::audit::record("proxy", "connect", Some(&target), Some("denied"), None).await;
         let _ = stream.write_all(b"E").await;
         return;
     }
@@ -43,10 +44,18 @@ async fn handle_connector_conn(mut stream: UnixStream, allow: &[String]) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("ai-bubble proxy: can't connect to {target}: {e}");
+            crate::audit::record(
+                "proxy",
+                "connect",
+                Some(&target),
+                Some("err"),
+                Some(format!("{e}")),
+            ).await;
             let _ = stream.write_all(b"E").await;
             return;
         }
     };
+    crate::audit::record("proxy", "connect", Some(&target), Some("ok"), None).await;
     if stream.write_all(b"K").await.is_err() {
         return;
     }

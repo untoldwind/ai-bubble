@@ -26,6 +26,7 @@
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
+mod audit;
 mod cli;
 mod hostfs;
 mod netns;
@@ -112,6 +113,11 @@ fn main() {
             // configuration (ops, hostfs patterns, net settings) the
             // sandbox machinery runs with.
             let sandbox_config = spec::internal::SandboxConfig::compile(&spec);
+
+            // Store the audit log path (if any) before any fork: every
+            // forked process (FUSE server, network frontends) sets up its
+            // own audit writer against the same file.
+            audit::configure(sandbox_config.audit_log.clone());
 
             // Start the host FUSE filesystem server (in its own child
             // process) before any namespace setup: its filesystem becomes

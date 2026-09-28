@@ -12,6 +12,14 @@
         "null"
       ]
     },
+    "audit": {
+      "description": "Audit logging: where the audit event stream (filesystem access through the hostfs mirror, waf allow/deny decisions, proxy CONNECT attempts) is written. Without a `log` path the audit subsystem is disabled (see [`super::audit::AuditConfig`]).",
+      "allOf": [
+        {
+          "$ref": "#/definitions/AuditConfig"
+        }
+      ]
+    },
     "cwd": {
       "description": "The working directory of the sandboxed command, *inside* the sandbox (default: `/`). Like the path-like mapping fields the value may reference host environment variables as `${VAR}`; it must be an absolute sandbox path without `..` components. The directory must exist inside the sandbox — in hostfs-root mode through a mapping, on the tmpfs root because a mount or symlink created it. Nothing is created automatically: a missing directory is a hard error right before exec.",
       "type": [
@@ -46,6 +54,21 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "AuditConfig": {
+      "description": "Audit logging configuration. Without a `log` path (the default) the audit subsystem is disabled entirely: no events are collected and no file is written.",
+      "type": "object",
+      "properties": {
+        "log": {
+          "description": "The audit log file, as a host path. Audit events (filesystem operations through the hostfs mirror, waf allow/deny decisions, proxy CONNECT attempts) are appended as JSON lines; the file is created if it does not exist. The value may reference host environment variables as `${VAR}`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "EnvConfig": {
       "description": "The `env` section: the variables of the sandbox's isolated environment.",
       "type": "object",
@@ -415,6 +438,32 @@
               "type": "string",
               "enum": [
                 "symlink"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Show a **purely virtual, in-memory file** at the path: `content` (a small file, e.g. an `/etc/resolv.conf`) is served from the mirror's memory — the host filesystem is not consulted at all, and the file leaves no trace on the host. The injected file is read-only and nothing below its path is visible. Like the redirects, this is purely a FUSE feature (see [`Mapping::pattern`]): it produces no op.",
+          "type": "object",
+          "required": [
+            "content",
+            "path",
+            "type"
+          ],
+          "properties": {
+            "content": {
+              "description": "The content of the injected file (text, served as UTF-8).",
+              "type": "string"
+            },
+            "path": {
+              "description": "An absolute sandbox path for the injected file (named exactly, no wildcards).",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "inject"
               ]
             }
           },

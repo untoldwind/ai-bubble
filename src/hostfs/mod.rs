@@ -87,23 +87,41 @@ mod inodes;
 use inodes::InodeMap;
 
 /// Log a failed FUSE op with the mirrored and the real host path (debug
-/// helper, only active with `RS_BUBBLE_FUSE_LOG` set).
-fn log_op_err(op: &str, mirrored: &Path, real: Option<&Path>, err: &std::io::Error) {
+/// helper, only active with `RS_BUBBLE_FUSE_LOG` set) and turn it into an
+/// audit event.
+async fn log_op_err(op: &str, mirrored: &Path, real: Option<&Path>, err: &std::io::Error) {
     fuselog::event(&format!(
         "FS {op} err={err} mirrored={} real={}",
         mirrored.display(),
         real.map(|p| p.display().to_string())
             .unwrap_or_else(|| "-".into()),
     ));
+    crate::audit::record(
+        "hostfs",
+        op,
+        Some(&mirrored.to_string_lossy()),
+        Some(&format!("err: {err}")),
+        real.map(|p| p.to_string_lossy().into_owned()),
+    )
+    .await;
 }
 
-/// Log a successful structural op (create/mkdir/…) with its paths.
-fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
+/// Log a successful structural op (create/mkdir/…) with its paths, and
+/// turn it into an audit event.
+async fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
     fuselog::event(&format!(
         "FS {op} ok mirrored={} real={}",
         mirrored.display(),
         real.display()
     ));
+    crate::audit::record(
+        "hostfs",
+        op,
+        Some(&mirrored.to_string_lossy()),
+        Some("ok"),
+        Some(real.to_string_lossy().into_owned()),
+    )
+    .await;
 }
 
 pub(crate) mod pattern;
@@ -1011,7 +1029,7 @@ impl Filesystem for HostFs {
                     });
                 }
                 Err(e) => {
-                    log_op_err("lookup", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                    log_op_err("lookup", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                     if e.kind() == std::io::ErrorKind::NotFound {
                         // The kernel dentry is stale: drop the mapping so the
                         // next lookup re-maps the path (a zombie stays while
@@ -1027,7 +1045,7 @@ impl Filesystem for HostFs {
             &mirrored,
             None,
             &std::io::Error::from_raw_os_error(libc::ENOENT),
-        );
+        ).await;
         self.inodes.write().await.release_path(&mirrored);
         Err(libc::ENOENT.into())
     }
@@ -1059,7 +1077,7 @@ impl Filesystem for HostFs {
                     return Ok(ReplyAttr { ttl: TTL, attr });
                 }
                 Err(e) => {
-                    log_op_err("getattr", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                    log_op_err("getattr", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                     return Err(e.into());
                 }
             }
@@ -1069,7 +1087,7 @@ impl Filesystem for HostFs {
             &mirrored,
             None,
             &std::io::Error::from_raw_os_error(libc::ENOENT),
-        );
+        ).await;
         Err(libc::ENOENT.into())
     }
 
@@ -1096,7 +1114,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            );
+            ).await;
             return Err(libc::ENOENT.into());
         }
         // An injected path is a purely virtual file: served from memory,
@@ -1109,7 +1127,7 @@ impl Filesystem for HostFs {
                     &mirrored,
                     None,
                     &std::io::Error::from_raw_os_error(libc::EACCES),
-                );
+                ).await;
                 return Err(libc::EACCES.into());
             }
             self.inodes.write().await.open_handle(inode);
@@ -1122,7 +1140,7 @@ impl Filesystem for HostFs {
         let md = match tokio_fs::symlink_metadata(self.redirect(&mirrored)).await {
             Ok(md) => md,
             Err(e) => {
-                log_op_err("open", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                log_op_err("open", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                 // A purely virtual directory (ancestor of an empty or
                 // injected path with no real counterpart) is not openable,
                 // exactly like a real one that `open` refuses: report it as
@@ -1142,7 +1160,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::ELOOP),
-            );
+            ).await;
             return Err(libc::ELOOP.into());
         }
         if md.is_dir() {
@@ -1151,7 +1169,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EISDIR),
-            );
+            ).await;
             return Err(libc::EISDIR.into());
         }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
@@ -1164,7 +1182,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         // The kernel passes O_TRUNC through to the server: the server must
@@ -1179,7 +1197,7 @@ impl Filesystem for HostFs {
                 .open(self.redirect(&mirrored))
                 .await
             {
-                log_op_err("open-trunc", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                log_op_err("open-trunc", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                 return Err(e.into());
             }
         }
@@ -1204,7 +1222,7 @@ impl Filesystem for HostFs {
                     Path::new("<none>"),
                     None,
                     &std::io::Error::from_raw_os_error(libc::ENOENT),
-                );
+                ).await;
                 return Err(e.into());
             }
         };
@@ -1215,7 +1233,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            );
+            ).await;
             return Err(libc::ENOENT.into());
         }
         // An injected path is served from memory: slice the content at
@@ -1242,7 +1260,7 @@ impl Filesystem for HostFs {
         {
             Ok(f) => f,
             Err(e) => {
-                log_op_err("read", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                log_op_err("read", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                 return Err(e.into());
             }
         };
@@ -1251,7 +1269,7 @@ impl Filesystem for HostFs {
         let n = match file.read(&mut buf).await {
             Ok(n) => n,
             Err(e) => {
-                log_op_err("read-io", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                log_op_err("read-io", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                 return Err(e.into());
             }
         };
@@ -1277,7 +1295,7 @@ impl Filesystem for HostFs {
                     Path::new("<none>"),
                     None,
                     &std::io::Error::from_raw_os_error(libc::ENOENT),
-                );
+                ).await;
                 return Err(e.into());
             }
         };
@@ -1288,7 +1306,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            );
+            ).await;
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&mirrored) {
@@ -1299,7 +1317,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         // Stateless IO: reopen the host file for every write — never
@@ -1315,7 +1333,7 @@ impl Filesystem for HostFs {
         {
             Ok(f) => f,
             Err(e) => {
-                log_op_err("write", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                log_op_err("write", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                 return Err(e.into());
             }
         };
@@ -1325,10 +1343,18 @@ impl Filesystem for HostFs {
         let n = match file.write(data).await {
             Ok(n) => n,
             Err(e) => {
-                log_op_err("write-io", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                log_op_err("write-io", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                 return Err(e.into());
             }
         };
+        crate::audit::record(
+            "hostfs",
+            "write",
+            Some(&mirrored.to_string_lossy()),
+            Some("ok"),
+            Some(format!("{} bytes at offset {}", n, offset)),
+        )
+        .await;
         Ok(ReplyWrite { written: n as u32 })
     }
     async fn statfs(&self, _req: Request, inode: Inode) -> Result<ReplyStatFs> {
@@ -1670,7 +1696,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         // Only a *real* entry at the target means EEXIST; a path merely
@@ -1684,12 +1710,12 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EEXIST),
-            );
+            ).await;
             return Err(libc::EEXIST.into());
         }
         // errno is per-thread: capture the error on the blocking thread.
         let cpath = cstring_of(&self.redirect(&mirrored))?;
-        blocking(move || {
+        if let Err(e) = blocking(move || {
             if unsafe { libc::mkdir(cpath.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
                 Err(std::io::Error::last_os_error())
             } else {
@@ -1697,11 +1723,11 @@ impl Filesystem for HostFs {
             }
         })
         .await
-        .map_err(|e| {
-            log_op_err("mkdir", &mirrored, Some(&self.redirect(&mirrored)), &e);
-            fuse3::Errno::from(e)
-        })?;
-        log_op_ok("mkdir", &mirrored, &self.redirect(&mirrored));
+        {
+            log_op_err("mkdir", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
+            return Err(fuse3::Errno::from(e));
+        }
+        log_op_ok("mkdir", &mirrored, &self.redirect(&mirrored)).await;
         let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
         let mut attr = self.attr(&mirrored).await?;
         attr.ino = inode;
@@ -1725,7 +1751,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            );
+            ).await;
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&mirrored) {
@@ -1734,11 +1760,11 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         if let Err(e) = tokio_fs::remove_file(self.redirect(&mirrored)).await {
-            log_op_err("unlink", &mirrored, Some(&self.redirect(&mirrored)), &e);
+            log_op_err("unlink", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
             if e.kind() == std::io::ErrorKind::NotFound {
                 // A stale kernel dentry: drop the mapping.
                 self.inodes.write().await.release_path(&mirrored);
@@ -1749,7 +1775,7 @@ impl Filesystem for HostFs {
             }
             return Err(e.into());
         }
-        log_op_ok("unlink", &mirrored, &self.redirect(&mirrored));
+        log_op_ok("unlink", &mirrored, &self.redirect(&mirrored)).await;
         self.inodes.write().await.release_path(&mirrored);
         Ok(())
     }
@@ -1765,7 +1791,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            );
+            ).await;
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&mirrored) {
@@ -1774,11 +1800,11 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         if let Err(e) = tokio_fs::remove_dir(self.redirect(&mirrored)).await {
-            log_op_err("rmdir", &mirrored, Some(&self.redirect(&mirrored)), &e);
+            log_op_err("rmdir", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
             if e.kind() == std::io::ErrorKind::NotFound {
                 // A stale kernel dentry: drop the mapping.
                 self.inodes.write().await.release_path(&mirrored);
@@ -1789,7 +1815,7 @@ impl Filesystem for HostFs {
             }
             return Err(e.into());
         }
-        log_op_ok("rmdir", &mirrored, &self.redirect(&mirrored));
+        log_op_ok("rmdir", &mirrored, &self.redirect(&mirrored)).await;
         self.inodes.write().await.release_path(&mirrored);
         Ok(())
     }
@@ -1817,7 +1843,7 @@ impl Filesystem for HostFs {
                 &old,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            );
+            ).await;
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&old) || !self.writable(&new) {
@@ -1826,7 +1852,7 @@ impl Filesystem for HostFs {
                 &old,
                 Some(&self.redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         // A *directory* rename carries every child from one pattern
@@ -1846,14 +1872,14 @@ impl Filesystem for HostFs {
                 &old,
                 Some(&self.redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         if let Err(e) = tokio_fs::rename(self.redirect(&old), self.redirect(&new)).await {
-            log_op_err("rename", &old, Some(&self.redirect(&new)), &e);
+            log_op_err("rename", &old, Some(&self.redirect(&new)), &e).await;
             return Err(e.into());
         }
-        log_op_ok("rename", &old, &self.redirect(&new));
+        log_op_ok("rename", &old, &self.redirect(&new)).await;
 
         // The kernel moves the dentry on rename, re-hashing `old` as `new`
         // *keeping the source's nodeid*. Re-point the new path at the source
@@ -1897,7 +1923,7 @@ impl Filesystem for HostFs {
             &mirrored,
             Some(&self.redirect(&mirrored)),
             &std::io::Error::from_raw_os_error(libc::EACCES),
-        );
+        ).await;
         Err(libc::EACCES.into())
     }
 
@@ -1937,7 +1963,7 @@ impl Filesystem for HostFs {
                 &old,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            );
+            ).await;
             return Err(libc::ENOENT.into());
         }
         // The source must be writable, too: a read-only source must not be
@@ -1949,7 +1975,7 @@ impl Filesystem for HostFs {
                 &old,
                 Some(&self.redirect(&old)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         if !self.writable(&new) {
@@ -1958,14 +1984,14 @@ impl Filesystem for HostFs {
                 &new,
                 Some(&self.redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         if let Err(e) = tokio_fs::hard_link(self.redirect(&old), self.redirect(&new)).await {
-            log_op_err("link", &new, Some(&self.redirect(&new)), &e);
+            log_op_err("link", &new, Some(&self.redirect(&new)), &e).await;
             return Err(e.into());
         }
-        log_op_ok("link", &new, &self.redirect(&new));
+        log_op_ok("link", &new, &self.redirect(&new)).await;
         let inode = self.inodes.write().await.get_or_insert(&new, new_parent);
         let mut attr = self.attr(&new).await?;
         attr.ino = inode;
@@ -1992,7 +2018,7 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            );
+            ).await;
             return Err(libc::EACCES.into());
         }
         // Only with O_EXCL does a *real* entry at the target mean EEXIST;
@@ -2012,7 +2038,7 @@ impl Filesystem for HostFs {
                     &mirrored,
                     Some(&self.redirect(&mirrored)),
                     &std::io::Error::from_raw_os_error(libc::ELOOP),
-                );
+                ).await;
                 return Err(libc::ELOOP.into());
             }
             if excl {
@@ -2021,7 +2047,7 @@ impl Filesystem for HostFs {
                     &mirrored,
                     Some(&self.redirect(&mirrored)),
                     &std::io::Error::from_raw_os_error(libc::EEXIST),
-                );
+                ).await;
                 return Err(libc::EEXIST.into());
             }
             if md.is_dir() {
@@ -2030,7 +2056,7 @@ impl Filesystem for HostFs {
                     &mirrored,
                     Some(&self.redirect(&mirrored)),
                     &std::io::Error::from_raw_os_error(libc::EISDIR),
-                );
+                ).await;
                 return Err(libc::EISDIR.into());
             }
             let mut opts = tokio_fs::OpenOptions::new();
@@ -2041,12 +2067,12 @@ impl Filesystem for HostFs {
             let file = match opts.open(self.redirect(&mirrored)).await {
                 Ok(f) => f,
                 Err(e) => {
-                    log_op_err("create", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                    log_op_err("create", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                     return Err(e.into());
                 }
             };
             let md = file.metadata().await?;
-            log_op_ok("create", &mirrored, &self.redirect(&mirrored));
+            log_op_ok("create", &mirrored, &self.redirect(&mirrored)).await;
             let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
             self.inodes.write().await.open_handle(inode);
             let mut attr = attr_from_metadata(&md);
@@ -2074,13 +2100,13 @@ impl Filesystem for HostFs {
         {
             Ok(f) => f,
             Err(e) => {
-                log_op_err("create-new", &mirrored, Some(&self.redirect(&mirrored)), &e);
+                log_op_err("create-new", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
                 return Err(e.into());
             }
         };
         let md = file.metadata().await?;
         let mut attr = attr_from_metadata(&md);
-        log_op_ok("create-new", &mirrored, &self.redirect(&mirrored));
+        log_op_ok("create-new", &mirrored, &self.redirect(&mirrored)).await;
         let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
         self.inodes.write().await.open_handle(inode);
         attr.ino = inode;
@@ -2249,6 +2275,9 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
             fuselog::event("SERVER parent-gone, unmounting");
             let outcome = handle.unmount().await;
             fuselog::event(&format!("SERVER unmount outcome={outcome:?}"));
+            // Give the audit writer a chance to flush the last batch
+            // before this process exits.
+            crate::audit::drain().await;
             outcome
         })
     };

@@ -56,15 +56,18 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
     if let Some(name) = cmd.strip_prefix("resolve-dns ") {
         if !valid_name(name) || !host_allowed(name, allow) {
             eprintln!("ai-bubble waf: DNS lookup of {name} denied");
+            crate::audit::record("waf", "resolve-dns", Some(name), Some("denied"), None).await;
             let _ = stream.write_all(b"ERR name not on the allow list\n").await;
             return;
         }
+        crate::audit::record("waf", "resolve-dns", Some(name), Some("ok"), None).await;
         let _ = stream
             .write_all(format!("OK {REDIRECT_ADDR}\n").as_bytes())
             .await;
     } else if let Some(target) = cmd.strip_prefix("connect ") {
         if !valid_target(target) || !target_allowed(target, allow) {
             eprintln!("ai-bubble waf: connection to {target} denied");
+            crate::audit::record("waf", "connect", Some(target), Some("denied"), None).await;
             let _ = stream
                 .write_all(b"ERR target not on the allow list\n")
                 .await;
@@ -74,12 +77,20 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("ai-bubble waf: can't connect to {target}: {e}");
+                crate::audit::record(
+                    "waf",
+                    "connect",
+                    Some(target),
+                    Some("err"),
+                    Some(format!("{e}")),
+                ).await;
                 let _ = stream
                     .write_all(format!("ERR can't connect: {e}\n").as_bytes())
                     .await;
                 return;
             }
         };
+        crate::audit::record("waf", "connect", Some(target), Some("ok"), None).await;
         if stream.write_all(b"OK\n").await.is_err() {
             return;
         }
@@ -89,6 +100,7 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
         // waf CA, valid for exactly the SNI the client connected to.
         if !valid_name(name) || !host_allowed(name, allow) {
             eprintln!("ai-bubble waf: TLS certificate for {name} denied");
+            crate::audit::record("waf", "tls-cert", Some(name), Some("denied"), None).await;
             let _ = stream.write_all(b"ERR name not on the allow list\n").await;
             return;
         }
@@ -96,10 +108,12 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("ai-bubble waf: can't sign a certificate for {name}: {e}");
+                crate::audit::record("waf", "tls-cert", Some(name), Some("err"), Some(format!("{e}"))).await;
                 let _ = stream.write_all(b"ERR can't sign certificate\n").await;
                 return;
             }
         };
+        crate::audit::record("waf", "tls-cert", Some(name), Some("ok"), None).await;
         // One line: base64(DER cert) SP base64(DER PKCS#8 key).
         let reply = format!(
             "OK {} {}\n",
@@ -116,6 +130,7 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
         // server certificate is verified where the trust anchors live.
         if !valid_target(target) || !target_allowed(target, allow) {
             eprintln!("ai-bubble waf: connection to {target} denied");
+            crate::audit::record("waf", "tls-connect", Some(target), Some("denied"), None).await;
             let _ = stream
                 .write_all(b"ERR target not on the allow list\n")
                 .await;
@@ -128,6 +143,13 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("ai-bubble waf: can't connect to {target}: {e}");
+                crate::audit::record(
+                    "waf",
+                    "tls-connect",
+                    Some(target),
+                    Some("err"),
+                    Some(format!("{e}")),
+                ).await;
                 let _ = stream
                     .write_all(format!("ERR can't connect: {e}\n").as_bytes())
                     .await;
@@ -142,12 +164,20 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("ai-bubble waf: TLS handshake with {target} failed: {e}");
+                crate::audit::record(
+                    "waf",
+                    "tls-connect",
+                    Some(target),
+                    Some("err"),
+                    Some(format!("{e}")),
+                ).await;
                 let _ = stream
                     .write_all(format!("ERR TLS handshake failed: {e}\n").as_bytes())
                     .await;
                 return;
             }
         };
+        crate::audit::record("waf", "tls-connect", Some(target), Some("ok"), None).await;
         if stream.write_all(b"OK\n").await.is_err() {
             return;
         }

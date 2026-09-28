@@ -89,7 +89,7 @@ pub unsafe fn run(
             let _ = listener.set_nonblocking(true);
             let l = tokio::net::UnixListener::from_std(listener)
                 .unwrap_or_else(|e| die(&format!("Can't register proxy socket: {e}")));
-            tokio::select! {
+            let status = tokio::select! {
                 _ = async {
                     match net.mode {
                         NetMode::Proxy => crate::proxy::serve_connector(l, allow).await,
@@ -99,7 +99,11 @@ pub unsafe fn run(
                     unreachable!("connector accept loop never ends")
                 }
                 st = wait_status(pid) => st,
-            }
+            };
+            // Give the audit writer a chance to flush the last batch
+            // before this process exits.
+            crate::audit::drain().await;
+            status
         });
 
         let _ = std::fs::remove_dir_all(&netdir);
@@ -258,7 +262,7 @@ unsafe fn isolated_parent(
         let allow = net.allow.clone();
         let sock = netdir.join("sock");
         let status = block_on(async move {
-            match (net.mode, proxy_listener, waf_listeners) {
+            let status = match (net.mode, proxy_listener, waf_listeners) {
                 (NetMode::Proxy, Some(listener), _) => {
                     let _ = listener.set_nonblocking(true);
                     let l = tokio::net::TcpListener::from_std(listener)
@@ -296,7 +300,11 @@ unsafe fn isolated_parent(
                     }
                 }
                 _ => unreachable!("mode and listeners agree"),
-            }
+            };
+            // Give the audit writer a chance to flush the last batch
+            // before this process exits.
+            crate::audit::drain().await;
+            status
         });
 
         exit_with_status(status);

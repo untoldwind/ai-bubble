@@ -19,6 +19,7 @@
 //!     { "type": "project-cache", "path": "/home/me/.local" }
 //!   ] },
 //!   "net": { "mode": "proxy", "allow": ["example.com:443", "*.github.com"] },
+//!   "audit": { "log": "${HOME}/.cache/ai-bubble/audit.jsonl" },
 //!   "env": {
 //!     "values": { "PATH": "${PATH}", "HOME": "${HOME}" },
 //!     "env_file": ".env"
@@ -117,6 +118,12 @@ pub struct Spec {
     /// The host filesystem: it is always the sandbox root, exposing the
     /// paths selected by its mappings.
     pub hostfs: HostFsConfig,
+    /// Audit logging: where the audit event stream (filesystem access
+    /// through the hostfs mirror, waf allow/deny decisions, proxy
+    /// CONNECT attempts) is written. Without a `log` path the audit
+    /// subsystem is disabled (see [`super::audit::AuditConfig`]).
+    #[serde(default)]
+    pub audit: super::audit::AuditConfig,
     /// The isolated environment: the *complete* set of environment
     /// variables the sandboxed command sees. Nothing is inherited from
     /// the host; use `${VAR}` in the values to copy host variables in
@@ -188,6 +195,15 @@ impl Spec {
                     // must never be visible inside the sandbox, even when
                     // a mapping mirrors the directory containing them.
                     spec.hide_spec_dir(dir);
+                }
+                // The audit log path is host path-like, too: expand its
+                // `${VAR}` references here, so downstream code only ever
+                // sees the fully expanded path.
+                if let Some(log) = &spec.audit.log {
+                    match expand_str(log) {
+                        Ok(expanded) => spec.audit.log = Some(expanded),
+                        Err(e) => crate::sandbox::die(&format!("Invalid audit log path: {e}")),
+                    }
                 }
                 spec
             }
