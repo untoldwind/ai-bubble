@@ -50,7 +50,8 @@ async fn handle_connector_conn(mut stream: UnixStream, allow: &[String]) {
                 Some(&target),
                 Some("err"),
                 Some(format!("{e}")),
-            ).await;
+            )
+            .await;
             let _ = stream.write_all(b"E").await;
             return;
         }

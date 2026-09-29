@@ -170,10 +170,7 @@ async fn writer(path: PathBuf, mut rx: mpsc::Receiver<Event>) {
     .await
     {
         Ok(Ok(file)) => Arc::new(Mutex::new(file)),
-        Ok(Err(e)) => crate::sandbox::die(&format!(
-            "Can't open audit log {}: {e}",
-            path.display()
-        )),
+        Ok(Err(e)) => crate::sandbox::die(&format!("Can't open audit log {}: {e}", path.display())),
         Err(_) => crate::sandbox::die("The audit writer panicked while opening the log"),
     };
 

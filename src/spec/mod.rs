@@ -28,6 +28,7 @@ pub mod file;
 pub mod hostfs;
 pub mod internal;
 pub mod net;
+pub mod seccomp;
 pub mod tmpfs;
 
 pub use self::file::Spec;

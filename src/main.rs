@@ -143,6 +143,7 @@ fn main() {
                         &sandbox_config.env,
                         sandbox_config.cwd.as_deref(),
                         die_with_parent,
+                        sandbox_config.seccomp.as_ref(),
                     );
                 } else {
                     sandbox::setup_and_exec(
@@ -151,6 +152,7 @@ fn main() {
                         &sandbox_config.env,
                         sandbox_config.cwd.as_deref(),
                         die_with_parent,
+                        sandbox_config.seccomp.as_ref(),
                     );
                 }
             }

@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use crate::spec::internal::Op;
+use crate::spec::internal::{Op, SeccompPolicy, SeccompViolation};
 use crate::spec::tmpfs::TmpfsPerms;
 
 pub(crate) fn die(msg: &str) -> ! {
@@ -188,6 +188,7 @@ pub unsafe fn setup_and_exec(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
     die_with_parent: bool,
+    seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
         // Optionally bind our lifecycle to that of the caller: when ai-bubble's
@@ -248,7 +249,7 @@ pub unsafe fn setup_and_exec(
 
         // The command must also run in its own PID namespace (and get a
         // fresh /proc), like bwrap's --unshare-pid + --proc.
-        pidns_and_exec(ops, command, env, cwd, die_with_parent);
+        pidns_and_exec(ops, command, env, cwd, die_with_parent, seccomp);
     }
 }
 
@@ -282,6 +283,7 @@ pub(crate) unsafe fn pidns_and_exec(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
     die_with_parent: bool,
+    seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
         if libc::unshare(libc::CLONE_NEWIPC) != 0 {
@@ -299,7 +301,7 @@ pub(crate) unsafe fn pidns_and_exec(
             // the sandboxed process must bind its own lifecycle to the
             // launcher before doing anything else.
             handle_die_with_parent(die_with_parent);
-            mount_and_exec(ops, command, env, cwd);
+            mount_and_exec(ops, command, env, cwd, seccomp);
         }
 
         // Parent: supervise the PID-1 child and forward its exit status.
@@ -444,6 +446,7 @@ pub(crate) unsafe fn mount_and_exec(
     command: &[String],
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
+    seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
         if libc::unshare(libc::CLONE_NEWNS) != 0 {
@@ -843,6 +846,20 @@ pub(crate) unsafe fn mount_and_exec(
             std::env::set_var(key, value);
         }
 
+        // The seccomp filter, installed last so that everything above
+        // (mounts, chroot, the uid change) still uses the full syscall
+        // surface. `PR_SET_NO_NEW_PRIVS` is already set (it survives
+        // fork and exec and is required for an unprivileged filter
+        // load). Once the filter is live, only the allowed syscalls are
+        // available to the code below — which is why it is applied
+        // immediately before exec, when nothing but `execvp` itself (and
+        // the exec-failure message) is left to do. An allowlist that
+        // omits `execve` denies exactly that exec, so the command cannot
+        // start at all.
+        if let Some(policy) = seccomp {
+            apply_seccomp(policy);
+        }
+
         let argv: Vec<CString> = command
             .iter()
             .map(|a| {
@@ -855,6 +872,61 @@ pub(crate) unsafe fn mount_and_exec(
         let _ = io::Write::flush(&mut io::stdout());
         libc::execvp(argv[0].as_ptr(), argv_ptrs.as_ptr());
         die_with_error(&format!("Can't exec {}", command[0]));
+    }
+}
+
+/// Compile the internal seccomp policy into a BPF program with
+/// [seccompiler](https://docs.rs/seccompiler) and install it for this
+/// process (and, after exec, the sandboxed command).
+///
+/// The policy is syscall-number based only (seccomp filters see no
+/// arguments here): an allowlist permits exactly the listed syscalls and
+/// denies everything else; a blocklist denies exactly the listed ones.
+/// A denied syscall either fails with `EPERM` or kills the process with
+/// `SIGSYS`, per the spec's `on_violation`.
+///
+/// Requires `PR_SET_NO_NEW_PRIVS` to be set (it is, on both exec paths)
+/// — without it, an unprivileged process could not load a filter.
+fn apply_seccomp(policy: &SeccompPolicy) {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+    use std::collections::BTreeMap;
+
+    // One unconditional rule per syscall: the syscall maps to an empty
+    // rule vector, which seccompiler treats as "matches regardless of
+    // the arguments".
+    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = policy
+        .syscalls()
+        .iter()
+        .map(|&nr| (nr, Vec::new()))
+        .collect();
+    let deny = match policy.on_violation() {
+        SeccompViolation::Errno => SeccompAction::Errno(libc::EPERM as u32),
+        SeccompViolation::Kill => SeccompAction::KillProcess,
+    };
+    // Allowlist: listed syscalls are allowed, everything else denied.
+    // Blocklist: listed syscalls denied, everything else allowed.
+    let (mismatch, m) = if policy.is_allowlist() {
+        (deny, SeccompAction::Allow)
+    } else {
+        (SeccompAction::Allow, deny)
+    };
+    let arch: TargetArch = match std::env::consts::ARCH.try_into() {
+        Ok(arch) => arch,
+        Err(_) => die(&format!(
+            "seccomp is not supported on this architecture ({})",
+            std::env::consts::ARCH
+        )),
+    };
+    let filter = match SeccompFilter::new(rules, mismatch, m, arch) {
+        Ok(filter) => filter,
+        Err(e) => die(&format!("Can't compile the seccomp filter: {e}")),
+    };
+    let bpf: BpfProgram = match filter.try_into() {
+        Ok(bpf) => bpf,
+        Err(e) => die(&format!("Can't compile the seccomp filter: {e}")),
+    };
+    if let Err(e) = seccompiler::apply_filter(&bpf) {
+        die_with_error(&format!("Can't install the seccomp filter: {e}"));
     }
 }
 
@@ -892,7 +964,99 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         mkdir_p(&base, Path::new("/usr/lib"));
         assert!(base.join("usr/lib").is_dir());
-        assert!(base.is_dir());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Run `body` in a forked child (so the filter cannot leak into the
+    /// test process) and return its exit status.
+    unsafe fn run_in_child<F: FnOnce()>(body: F) -> i32 {
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                // A seccomp filter without NO_NEW_PRIVS requires
+                // CAP_SYS_ADMIN; set it like every exec path does.
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                body();
+                libc::_exit(1);
+            }
+            let mut status: libc::c_int = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -1
+            }
+        }
+    }
+
+    #[test]
+    fn seccomp_blocklist_denies_listed_syscalls() {
+        // A blocklist denies exactly the listed syscalls: getpid fails
+        // with EPERM, an unlisted one (getuid) still succeeds.
+        let code = unsafe {
+            run_in_child(|| {
+                let policy = SeccompPolicy::Block {
+                    syscalls: vec![syscalls::Sysno::getpid as i64],
+                    on_violation: SeccompViolation::Errno,
+                };
+                apply_seccomp(&policy);
+                // Raw syscalls: the seccomp ERRNO action makes the raw
+                // syscall return -1 with errno EPERM (glibc's wrappers
+                // for "always successful" calls don't expose that).
+                if libc::syscall(libc::SYS_getpid) == -1 && libc::syscall(libc::SYS_getuid) != -1 {
+                    libc::_exit(0);
+                }
+            })
+        };
+        assert_eq!(code, 0, "blocklist did not deny getpid as expected");
+    }
+
+    #[test]
+    fn seccomp_allowlist_permits_only_listed_syscalls() {
+        // An allowlist permits exactly the listed syscalls: getpid works,
+        // the unlisted getuid fails with EPERM.
+        let code = unsafe {
+            run_in_child(|| {
+                let policy = SeccompPolicy::Allow {
+                    syscalls: vec![
+                        syscalls::Sysno::getpid as i64,
+                        syscalls::Sysno::exit_group as i64,
+                    ],
+                    on_violation: SeccompViolation::Errno,
+                };
+                apply_seccomp(&policy);
+                if libc::syscall(libc::SYS_getpid) >= 0 && libc::syscall(libc::SYS_getuid) == -1 {
+                    libc::_exit(0);
+                }
+            })
+        };
+        assert_eq!(code, 0, "allowlist did not gate syscalls as expected");
+    }
+
+    #[test]
+    fn seccomp_kill_on_violation_kills_the_process() {
+        // With on_violation=kill the denied syscall raises SIGSYS: the
+        // child dies by signal instead of observing an error.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                let policy = SeccompPolicy::Block {
+                    syscalls: vec![syscalls::Sysno::getpid as i64],
+                    on_violation: SeccompViolation::Kill,
+                };
+                apply_seccomp(&policy);
+                let _ = libc::getpid();
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(
+                libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+                "expected the child to die from SIGSYS, status {status:#x}"
+            );
+        }
     }
 }

@@ -24,7 +24,8 @@
 //!     "values": { "PATH": "${PATH}", "HOME": "${HOME}" },
 //!     "env_file": ".env"
 //!   },
-//!   "cwd": "/work"
+//!   "cwd": "/work",
+//!   "seccomp": { "block": ["ptrace", "mount"], "on_violation": "errno" }
 //! }
 //! ```
 //!
@@ -72,6 +73,13 @@
 //! fields it may use `${VAR}` references, must be an absolute sandbox
 //! path without `..` components, and must exist inside the sandbox (be
 //! it through a hostfs mapping or as a mount point).
+//!
+//! The syscall filter: the `seccomp` section installs a seccomp-bpf
+//! filter for the sandboxed command right before exec (see
+//! [`super::seccomp`]). Either `allow` (only these syscalls may be
+//! issued) or `block` (exactly these are denied) — giving both is a
+//! parse error, giving neither installs no filter. `on_violation`
+//! selects between `EPERM` (default) and `SIGSYS` for denied syscalls.
 
 use std::path::{Path, PathBuf};
 
@@ -82,6 +90,7 @@ use schemars::JsonSchema;
 use super::env::EnvConfig;
 use super::hostfs::HostFsConfig;
 use super::net::NetConfig;
+use super::seccomp::SeccompConfig;
 
 /// The default spec directory, looked up relative to the current
 /// directory.
@@ -144,6 +153,12 @@ pub struct Spec {
         deserialize_with = "cwd_string"
     )]
     pub cwd: Option<String>,
+    /// The syscall filter installed for the sandboxed command right
+    /// before exec (see [`super::seccomp`]). Either an `allow` or a
+    /// `block` list of syscall names (mutually exclusive, enforced at
+    /// parse time); without either no filter is installed.
+    #[serde(default)]
+    pub seccomp: SeccompConfig,
     /// Accepted for editor tooling only: it names the JSON schema
     /// (`--print-schema`) so the spec file can get completion and
     /// validation. Never serialized back out.

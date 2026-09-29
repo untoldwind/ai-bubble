@@ -102,7 +102,8 @@ All fields are optional. A complete example:
     "values": { "PATH": "${PATH}", "HOME": "${HOME}" },
     "env_file": "env"
   },
-  "cwd": "/work"
+  "cwd": "/work",
+  "seccomp": { "block": ["ptrace", "mount"], "on_violation": "errno" }
 }
 ```
 
@@ -148,6 +149,30 @@ All fields are optional. A complete example:
   memory (generously) and written in batches by a dedicated writer; if
   the buffer ever fills, producers briefly stall rather than drop
   events.
+
+- `seccomp` — an optional **syscall filter** installed for the sandboxed
+  command right before exec (the filter is loaded into the kernel after
+  all privileged sandbox setup, so it cannot interfere with it).
+  Exactly one of:
+
+  - `"allow": [...]` — an **allowlist**: only the listed syscalls may be
+    executed; everything else is denied. The list must be complete
+    (include at least `execve`, `exit_group`, `mmap`, ...) or the
+    command cannot run at all.
+  - `"block": [...]` — a **blocklist**: exactly the listed syscalls are
+    denied; everything else stays allowed. Useful to forbid dangerous
+    entry points like `ptrace`, `mount`, `keyctl` or `bpf` without
+    enumerating the whole syscall surface.
+
+  Syscalls are named as in the kernel's syscall table (`execve`,
+  `openat`, `clone3`, ...). `"on_violation"` selects what a denied
+  syscall does: `"errno"` (the default — it fails with `EPERM`) or
+  `"kill"` (the process is killed with `SIGSYS`). Without a `seccomp`
+  section (or with neither `allow` nor `block`) no filter is installed.
+  Note that the filter applies to the whole process tree the command
+  spawns, and that it sees syscall numbers only — not arguments, paths
+  or network addresses (those are the domain of the `hostfs` mappings
+  and the `net` section).
 
 ### The mapping types
 

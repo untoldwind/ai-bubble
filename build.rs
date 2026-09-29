@@ -37,6 +37,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/spec/tmpfs.rs");
     println!("cargo:rerun-if-changed=src/spec/net.rs");
     println!("cargo:rerun-if-changed=src/spec/hostfs.rs");
+    println!("cargo:rerun-if-changed=src/spec/seccomp.rs");
 
     let mut schema = schemars::r#gen::SchemaSettings::draft07()
         .into_generator()

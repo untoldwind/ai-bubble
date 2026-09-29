@@ -12,7 +12,67 @@ use std::path::{Path, PathBuf};
 
 use super::Spec;
 use super::net::NetConfig;
+use super::seccomp::{SeccompConfig, Violation};
 use super::tmpfs::TmpfsPerms;
+
+/// What happens to a syscall the seccomp filter denies: the internal
+/// form of the spec's `seccomp.on_violation` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeccompViolation {
+    /// The denied syscall fails with `EPERM`.
+    Errno,
+    /// The process is killed with `SIGSYS`.
+    Kill,
+}
+
+impl From<Violation> for SeccompViolation {
+    fn from(v: Violation) -> SeccompViolation {
+        match v {
+            Violation::Errno => SeccompViolation::Errno,
+            Violation::Kill => SeccompViolation::Kill,
+        }
+    }
+}
+
+/// The seccomp filter to install for the sandboxed command: either an
+/// allowlist (only the listed syscalls are permitted) or a blocklist
+/// (exactly these are denied). Compiled down from the spec's `seccomp`
+/// section, with the syscall names already resolved to numbers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SeccompPolicy {
+    Allow {
+        syscalls: Vec<i64>,
+        on_violation: SeccompViolation,
+    },
+    Block {
+        syscalls: Vec<i64>,
+        on_violation: SeccompViolation,
+    },
+}
+
+impl SeccompPolicy {
+    /// The filter's syscall numbers (whatever the mode).
+    pub fn syscalls(&self) -> &[i64] {
+        match self {
+            SeccompPolicy::Allow { syscalls, .. } | SeccompPolicy::Block { syscalls, .. } => {
+                syscalls
+            }
+        }
+    }
+
+    /// The action for syscalls the filter denies.
+    pub fn on_violation(&self) -> SeccompViolation {
+        match self {
+            SeccompPolicy::Allow { on_violation, .. }
+            | SeccompPolicy::Block { on_violation, .. } => *on_violation,
+        }
+    }
+
+    /// Whether this is an allowlist (as opposed to a blocklist).
+    pub fn is_allowlist(&self) -> bool {
+        matches!(self, SeccompPolicy::Allow { .. })
+    }
+}
 
 /// Which kind of in-sandbox servers an isolated network namespace runs:
 /// the mode selected in the spec's `net` section.
@@ -88,6 +148,11 @@ pub struct SandboxConfig {
     /// references already expanded at parse time), or `None` when
     /// auditing is disabled.
     pub audit_log: Option<PathBuf>,
+    /// The seccomp policy to install for the sandboxed command, compiled
+    /// down from the spec's `seccomp` section (with syscall names
+    /// resolved to numbers), or `None` when the spec configures no
+    /// filter.
+    pub seccomp: Option<SeccompPolicy>,
 }
 
 impl SandboxConfig {
@@ -115,8 +180,45 @@ impl SandboxConfig {
                 .collect(),
             cwd: spec.cwd.as_deref().map(PathBuf::from),
             audit_log: spec.audit.log.as_deref().map(PathBuf::from),
+            seccomp: compile_seccomp(&spec.seccomp),
         }
     }
+}
+
+/// Compile the spec file's `seccomp` section into the internal policy:
+/// resolve the syscall names to numbers (an unknown name is a hard
+/// error, so a typo is reported like any other spec problem), dedupe
+/// and keep them sorted for deterministic BPF generation. A section
+/// that names neither `allow` nor `block` compiles to no filter.
+fn compile_seccomp(config: &SeccompConfig) -> Option<SeccompPolicy> {
+    use std::str::FromStr;
+    if !config.is_configured() {
+        return None;
+    }
+    let mut syscalls: Vec<i64> = config
+        .syscalls()
+        .iter()
+        .map(|name| match syscalls::Sysno::from_str(name) {
+            Ok(sysno) => sysno as i64,
+            Err(_) => {
+                crate::sandbox::die(&format!("Unknown syscall {name:?} in the seccomp section"))
+            }
+        })
+        .collect();
+    syscalls.sort_unstable();
+    syscalls.dedup();
+    let policy_mode = if config.allow.is_some() {
+        SeccompPolicy::Allow {
+            syscalls,
+            on_violation: config.on_violation.into(),
+        }
+    } else {
+        SeccompPolicy::Block {
+            syscalls,
+            on_violation: config.on_violation.into(),
+        }
+    };
+    Some(policy_mode)
 }
 
 impl Op {

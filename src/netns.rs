@@ -40,7 +40,7 @@ use crate::sandbox::{
     die, die_with_error, exit_with_status, handle_die_with_parent, pidns_and_exec, userns_id,
     write_id_map,
 };
-use crate::spec::internal::{Net, NetMode, Op};
+use crate::spec::internal::{Net, NetMode, Op, SeccompPolicy};
 use crate::waf;
 
 /// Temporary host directory holding the proxy socket. It is bind-mounted
@@ -57,6 +57,7 @@ pub unsafe fn run(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
     die_with_parent: bool,
+    seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
         // The connector binds its lifecycle to ai-bubble's caller (see
@@ -79,7 +80,16 @@ pub unsafe fn run(
         }
         if pid == 0 {
             drop(listener);
-            isolated_parent(&netdir, net, ops, command, env, cwd, die_with_parent);
+            isolated_parent(
+                &netdir,
+                net,
+                ops,
+                command,
+                env,
+                cwd,
+                die_with_parent,
+                seccomp,
+            );
         }
 
         // Connector: serve proxy/waf requests from the host side and
@@ -114,6 +124,10 @@ pub unsafe fn run(
 /// P: owns the sandbox network namespace and runs the HTTP CONNECT proxy on
 /// 127.0.0.2. Forks C for the filesystem sandbox and exec, then reports C's
 /// exit status.
+// The parameter list mirrors the sandbox setup pipeline (each function
+// forwards everything to the next one); one more parameter than clippy's
+// default limit is fine here.
+#[allow(clippy::too_many_arguments)]
 unsafe fn isolated_parent(
     netdir: &Path,
     net: &Net,
@@ -122,6 +136,7 @@ unsafe fn isolated_parent(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
     die_with_parent: bool,
+    seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
         // P binds its lifecycle to the connector (which itself set
@@ -255,7 +270,14 @@ unsafe fn isolated_parent(
         }
         if child_pid == 0 {
             // PID 1 of its own PID namespace (see pidns_and_exec).
-            pidns_and_exec(&child_ops, command, &child_env, cwd, die_with_parent);
+            pidns_and_exec(
+                &child_ops,
+                command,
+                &child_env,
+                cwd,
+                die_with_parent,
+                seccomp,
+            );
         }
 
         // Serve the mode's network frontends while the command runs.

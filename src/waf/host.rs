@@ -83,7 +83,8 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
                     Some(target),
                     Some("err"),
                     Some(format!("{e}")),
-                ).await;
+                )
+                .await;
                 let _ = stream
                     .write_all(format!("ERR can't connect: {e}\n").as_bytes())
                     .await;
@@ -108,7 +109,14 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("ai-bubble waf: can't sign a certificate for {name}: {e}");
-                crate::audit::record("waf", "tls-cert", Some(name), Some("err"), Some(format!("{e}"))).await;
+                crate::audit::record(
+                    "waf",
+                    "tls-cert",
+                    Some(name),
+                    Some("err"),
+                    Some(format!("{e}")),
+                )
+                .await;
                 let _ = stream.write_all(b"ERR can't sign certificate\n").await;
                 return;
             }
@@ -149,7 +157,8 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
                     Some(target),
                     Some("err"),
                     Some(format!("{e}")),
-                ).await;
+                )
+                .await;
                 let _ = stream
                     .write_all(format!("ERR can't connect: {e}\n").as_bytes())
                     .await;
@@ -170,7 +179,8 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
                     Some(target),
                     Some("err"),
                     Some(format!("{e}")),
-                ).await;
+                )
+                .await;
                 let _ = stream
                     .write_all(format!("ERR TLS handshake failed: {e}\n").as_bytes())
                     .await;

@@ -1045,7 +1045,8 @@ impl Filesystem for HostFs {
             &mirrored,
             None,
             &std::io::Error::from_raw_os_error(libc::ENOENT),
-        ).await;
+        )
+        .await;
         self.inodes.write().await.release_path(&mirrored);
         Err(libc::ENOENT.into())
     }
@@ -1087,7 +1088,8 @@ impl Filesystem for HostFs {
             &mirrored,
             None,
             &std::io::Error::from_raw_os_error(libc::ENOENT),
-        ).await;
+        )
+        .await;
         Err(libc::ENOENT.into())
     }
 
@@ -1114,7 +1116,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            ).await;
+            )
+            .await;
             return Err(libc::ENOENT.into());
         }
         // An injected path is a purely virtual file: served from memory,
@@ -1127,7 +1130,8 @@ impl Filesystem for HostFs {
                     &mirrored,
                     None,
                     &std::io::Error::from_raw_os_error(libc::EACCES),
-                ).await;
+                )
+                .await;
                 return Err(libc::EACCES.into());
             }
             self.inodes.write().await.open_handle(inode);
@@ -1160,7 +1164,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::ELOOP),
-            ).await;
+            )
+            .await;
             return Err(libc::ELOOP.into());
         }
         if md.is_dir() {
@@ -1169,7 +1174,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EISDIR),
-            ).await;
+            )
+            .await;
             return Err(libc::EISDIR.into());
         }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
@@ -1182,7 +1188,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         // The kernel passes O_TRUNC through to the server: the server must
@@ -1222,7 +1229,8 @@ impl Filesystem for HostFs {
                     Path::new("<none>"),
                     None,
                     &std::io::Error::from_raw_os_error(libc::ENOENT),
-                ).await;
+                )
+                .await;
                 return Err(e.into());
             }
         };
@@ -1233,7 +1241,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            ).await;
+            )
+            .await;
             return Err(libc::ENOENT.into());
         }
         // An injected path is served from memory: slice the content at
@@ -1295,7 +1304,8 @@ impl Filesystem for HostFs {
                     Path::new("<none>"),
                     None,
                     &std::io::Error::from_raw_os_error(libc::ENOENT),
-                ).await;
+                )
+                .await;
                 return Err(e.into());
             }
         };
@@ -1306,7 +1316,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            ).await;
+            )
+            .await;
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&mirrored) {
@@ -1317,7 +1328,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         // Stateless IO: reopen the host file for every write — never
@@ -1696,7 +1708,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         // Only a *real* entry at the target means EEXIST; a path merely
@@ -1710,7 +1723,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EEXIST),
-            ).await;
+            )
+            .await;
             return Err(libc::EEXIST.into());
         }
         // errno is per-thread: capture the error on the blocking thread.
@@ -1751,7 +1765,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            ).await;
+            )
+            .await;
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&mirrored) {
@@ -1760,7 +1775,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         if let Err(e) = tokio_fs::remove_file(self.redirect(&mirrored)).await {
@@ -1791,7 +1807,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            ).await;
+            )
+            .await;
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&mirrored) {
@@ -1800,7 +1817,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         if let Err(e) = tokio_fs::remove_dir(self.redirect(&mirrored)).await {
@@ -1843,7 +1861,8 @@ impl Filesystem for HostFs {
                 &old,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            ).await;
+            )
+            .await;
             return Err(libc::ENOENT.into());
         }
         if !self.writable(&old) || !self.writable(&new) {
@@ -1852,7 +1871,8 @@ impl Filesystem for HostFs {
                 &old,
                 Some(&self.redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         // A *directory* rename carries every child from one pattern
@@ -1872,7 +1892,8 @@ impl Filesystem for HostFs {
                 &old,
                 Some(&self.redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         if let Err(e) = tokio_fs::rename(self.redirect(&old), self.redirect(&new)).await {
@@ -1923,7 +1944,8 @@ impl Filesystem for HostFs {
             &mirrored,
             Some(&self.redirect(&mirrored)),
             &std::io::Error::from_raw_os_error(libc::EACCES),
-        ).await;
+        )
+        .await;
         Err(libc::EACCES.into())
     }
 
@@ -1963,7 +1985,8 @@ impl Filesystem for HostFs {
                 &old,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
-            ).await;
+            )
+            .await;
             return Err(libc::ENOENT.into());
         }
         // The source must be writable, too: a read-only source must not be
@@ -1975,7 +1998,8 @@ impl Filesystem for HostFs {
                 &old,
                 Some(&self.redirect(&old)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         if !self.writable(&new) {
@@ -1984,7 +2008,8 @@ impl Filesystem for HostFs {
                 &new,
                 Some(&self.redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         if let Err(e) = tokio_fs::hard_link(self.redirect(&old), self.redirect(&new)).await {
@@ -2018,7 +2043,8 @@ impl Filesystem for HostFs {
                 &mirrored,
                 Some(&self.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
-            ).await;
+            )
+            .await;
             return Err(libc::EACCES.into());
         }
         // Only with O_EXCL does a *real* entry at the target mean EEXIST;
@@ -2038,7 +2064,8 @@ impl Filesystem for HostFs {
                     &mirrored,
                     Some(&self.redirect(&mirrored)),
                     &std::io::Error::from_raw_os_error(libc::ELOOP),
-                ).await;
+                )
+                .await;
                 return Err(libc::ELOOP.into());
             }
             if excl {
@@ -2047,7 +2074,8 @@ impl Filesystem for HostFs {
                     &mirrored,
                     Some(&self.redirect(&mirrored)),
                     &std::io::Error::from_raw_os_error(libc::EEXIST),
-                ).await;
+                )
+                .await;
                 return Err(libc::EEXIST.into());
             }
             if md.is_dir() {
@@ -2056,7 +2084,8 @@ impl Filesystem for HostFs {
                     &mirrored,
                     Some(&self.redirect(&mirrored)),
                     &std::io::Error::from_raw_os_error(libc::EISDIR),
-                ).await;
+                )
+                .await;
                 return Err(libc::EISDIR.into());
             }
             let mut opts = tokio_fs::OpenOptions::new();
