@@ -78,8 +78,11 @@
 //! filter for the sandboxed command right before exec (see
 //! [`super::seccomp`]). Either `allow` (only these syscalls may be
 //! issued) or `block` (exactly these are denied) — giving both is a
-//! parse error, giving neither installs no filter. `on_violation`
-//! selects between `EPERM` (default) and `SIGSYS` for denied syscalls.
+//! parse error, giving neither installs no filter. A `preset` instead
+//! seeds a blocklist from one of the built-in blocklists (`none`,
+//! `default`, `strict`): `block` then adds to it and `allow` takes
+//! exceptions back out. `on_violation` selects between `EPERM` (default)
+//! and `SIGSYS` for denied syscalls.
 
 use std::path::{Path, PathBuf};
 
@@ -156,7 +159,9 @@ pub struct Spec {
     /// The syscall filter installed for the sandboxed command right
     /// before exec (see [`super::seccomp`]). Either an `allow` or a
     /// `block` list of syscall names (mutually exclusive, enforced at
-    /// parse time); without either no filter is installed.
+    /// parse time), a `preset` blocklist baseline (`block` adds to it,
+    /// `allow` takes exceptions back out); without any of these no
+    /// filter is installed.
     #[serde(default)]
     pub seccomp: SeccompConfig,
     /// Accepted for editor tooling only: it names the JSON schema

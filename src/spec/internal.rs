@@ -189,14 +189,17 @@ impl SandboxConfig {
 /// resolve the syscall names to numbers (an unknown name is a hard
 /// error, so a typo is reported like any other spec problem), dedupe
 /// and keep them sorted for deterministic BPF generation. A section
-/// that names neither `allow` nor `block` compiles to no filter.
+/// that names neither `allow`, `block` nor a `preset` compiles to no
+/// filter; a preset-based section always compiles to a blocklist (the
+/// preset baseline plus `block` entries minus `allow` exceptions, see
+/// [`SeccompConfig::resolved`]).
 fn compile_seccomp(config: &SeccompConfig) -> Option<SeccompPolicy> {
     use std::str::FromStr;
     if !config.is_configured() {
         return None;
     }
-    let mut syscalls: Vec<i64> = config
-        .syscalls()
+    let (names, allowlist) = config.resolved();
+    let mut syscalls: Vec<i64> = names
         .iter()
         .map(|name| match syscalls::Sysno::from_str(name) {
             Ok(sysno) => sysno as i64,
@@ -207,18 +210,18 @@ fn compile_seccomp(config: &SeccompConfig) -> Option<SeccompPolicy> {
         .collect();
     syscalls.sort_unstable();
     syscalls.dedup();
-    let policy_mode = if config.allow.is_some() {
+    let on_violation = config.on_violation.into();
+    Some(if allowlist {
         SeccompPolicy::Allow {
             syscalls,
-            on_violation: config.on_violation.into(),
+            on_violation,
         }
     } else {
         SeccompPolicy::Block {
             syscalls,
-            on_violation: config.on_violation.into(),
+            on_violation,
         }
-    };
-    Some(policy_mode)
+    })
 }
 
 impl Op {

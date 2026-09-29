@@ -152,8 +152,7 @@ All fields are optional. A complete example:
 
 - `seccomp` — an optional **syscall filter** installed for the sandboxed
   command right before exec (the filter is loaded into the kernel after
-  all privileged sandbox setup, so it cannot interfere with it).
-  Exactly one of:
+  all privileged sandbox setup, so it cannot interfere with it):
 
   - `"allow": [...]` — an **allowlist**: only the listed syscalls may be
     executed; everything else is denied. The list must be complete
@@ -163,12 +162,37 @@ All fields are optional. A complete example:
     denied; everything else stays allowed. Useful to forbid dangerous
     entry points like `ptrace`, `mount`, `keyctl` or `bpf` without
     enumerating the whole syscall surface.
+  - `"preset": "..."` — one of the built-in **blocklist presets**, for
+    when writing the syscall names yourself is too much: `"none"` (an
+    empty baseline), `"default"` (everything a sandboxed command has no
+    business calling: kernel-code loading via `init_module`/`finit_module`/
+    `delete_module`/`bpf`, kernel replacement via `kexec_load`/
+    `kexec_file_load`, host-wide toggles `reboot`/`acct`/`swapon`/
+    `swapoff`, mount-table manipulation `mount`/`umount2`/`pivot_root`/
+    `open_tree`/`move_mount`/`fsmount`/`fspick`/`mount_setattr`, the exploit-primitive
+    surfaces `userfaultfd`/`perf_event_open`/the `io_uring` family and
+    `open_by_handle_at`, the isolation escapes `unshare`/`setns`, host
+    state tampering via `personality`/`pidfd_getfd`/`settimeofday`/
+    `clock_settime`/`adjtimex`, keyring access `add_key`/`keyctl`/
+    `request_key`, and `quotactl`/`lookup_dcookie`) and `"strict"`
+    (everything in `default` plus the NUMA memory-policy syscalls
+    `mbind`/`set_mempolicy`/`move_pages` and the host identity syscalls
+    `sethostname`/`setdomainname`).
+
+  A preset turns the section into a blocklist seeded by the preset's
+  list; the two other fields then tweak it: `"block"` names *additional*
+  syscalls to deny (only ever stricter), and `"allow"` names
+  **exceptions** taken back out of the blocklist (only ever more
+  permissive). With a preset, `allow` and `block` may appear together —
+  a name in both is rejected as ambiguous. Without a preset, `allow`
+  and `block` are mutually exclusive as above.
 
   Syscalls are named as in the kernel's syscall table (`execve`,
   `openat`, `clone3`, ...). `"on_violation"` selects what a denied
   syscall does: `"errno"` (the default — it fails with `EPERM`) or
   `"kill"` (the process is killed with `SIGSYS`). Without a `seccomp`
-  section (or with neither `allow` nor `block`) no filter is installed.
+  section (or with none of `preset`, `allow` and `block`) no filter is
+  installed.
   Note that the filter applies to the whole process tree the command
   spawns, and that it sees syscall numbers only — not arguments, paths
   or network addresses (those are the domain of the `hostfs` mappings
