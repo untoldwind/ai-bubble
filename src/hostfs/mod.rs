@@ -891,6 +891,34 @@ impl HostFs {
                 }
             }
         }
+        // Redirected paths living directly under this directory (also when
+        // the real directory itself cannot be listed): every `redirect`
+        // pattern with a purely literal next component contributes one.
+        // Without this a redirected file inside, say, a redirected
+        // directory would be lookable (`stat`/`open` resolve it through
+        // its redirect) but never listed — readdir would advertise a
+        // directory without its visible entries.
+        for p in &self.patterns {
+            if p.permission.redirect_source().is_none() {
+                continue;
+            }
+            if let Some(name) = p.pattern.next_literal(mirrored) {
+                let child = mirrored.join(&name);
+                // Only listed when the redirect target really exists on
+                // the host — otherwise the entry would advertise a
+                // lookup that fails (an undeletable "ghost").
+                if !names.iter().any(|n| n.as_os_str() == OsStr::new(&name))
+                    && self.exists(&child)
+                    && tokio_fs::symlink_metadata(
+                        p.permission.redirect_source().expect("checked above"),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    names.push(OsString::from(name));
+                }
+            }
+        }
         names.sort();
         let mut entries = Vec::with_capacity(names.len());
         for name in names {
@@ -2777,6 +2805,56 @@ mod tests {
     }
 
     #[test]
+    fn redirected_files_are_listed_in_their_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "ai-bubble-hostfs-test-redirect-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("cfg.json"), b"redirected").unwrap();
+
+        // A redirected file inside a directory that is itself redirected
+        // to an empty (or otherwise non-matching) directory: the file is
+        // lookable, so it must be listed, too — even though the listing
+        // of its parent does not come from the host directory containing
+        // the redirect target.
+        let f = HostFs::collect(&Patterns(vec![
+            (
+                "/conf".to_string(),
+                Permission::Redirect {
+                    source: base.join("cache"),
+                    writable: false,
+                },
+            ),
+            (
+                "/conf/cfg.json".to_string(),
+                Permission::Redirect {
+                    source: base.join("cfg.json"),
+                    writable: false,
+                },
+            ),
+        ]));
+        let names: Vec<_> = block(f.dir_entries(Path::new("/conf")))
+            .into_iter()
+            .map(|(n, _)| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["cfg.json"]);
+
+        // A redirect whose source does not exist is not listed (no
+        // "ghost" entry advertising a lookup that fails).
+        let f = HostFs::collect(&Patterns(vec![(
+            "/conf/missing.json".to_string(),
+            Permission::Redirect {
+                source: base.join("missing.json"),
+                writable: false,
+            },
+        )]));
+        assert!(block(f.dir_entries(Path::new("/conf"))).is_empty());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn redirect_rw_is_writable_and_ro_is_not() {
         let ro = HostFs::collect(&Patterns(vec![(
             "/a".to_string(),
@@ -2852,8 +2930,10 @@ mod tests {
 
     #[test]
     fn readdir_filters_non_matching_entries() {
-        let base =
-            std::env::temp_dir().join(format!("ai-bubble-hostfs-test-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!(
+            "ai-bubble-hostfs-test-readdir-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("a.conf"), b"a").unwrap();
         std::fs::write(base.join("b.txt"), b"b").unwrap();

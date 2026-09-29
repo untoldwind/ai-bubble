@@ -438,6 +438,9 @@ QUOTED="quoted file value"
         // Loading appends a hide mapping for the spec directory.
         match spec.hostfs.mappings.last() {
             Some(Mapping::Hide { glob }) => {
+                let [glob] = &glob.0[..] else {
+                    panic!("expected a single glob")
+                };
                 assert_eq!(Path::new(glob), std::fs::canonicalize(&dir).unwrap())
             }
             other => panic!("expected a trailing hide mapping, got {other:?}"),
@@ -532,7 +535,7 @@ QUOTED="quoted file value"
         std::fs::remove_dir_all(&dir).ok();
         use crate::spec::hostfs::Mapping;
         match &spec.hostfs.mappings[0] {
-            Mapping::Rw { glob } => assert_eq!(glob, "/home/me/project"),
+            Mapping::Rw { glob } => assert_eq!(glob.0, vec!["/home/me/project"]),
             other => panic!("expected an rw mapping, got {other:?}"),
         }
         match &spec.hostfs.mappings[1] {

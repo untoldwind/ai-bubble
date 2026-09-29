@@ -9,7 +9,7 @@
 //! ```json
 //! {
 //!   "hostfs": { "mappings": [
-//!     { "type": "ro",    "glob": "/usr" },
+//!     { "type": "ro",    "globs": ["/usr", "/lib"] },
 //!     { "type": "bind",  "path": "/etc" },
 //!     { "type": "dev" },
 //!     { "type": "tmpfs", "path": "/tmp", "perms": "1777", "size": 1048576 },
@@ -246,7 +246,7 @@ impl Spec {
     /// ever hide *more*, never expose the spec directory).
     pub fn hide_spec_dir(&mut self, spec_dir: &Path) {
         self.hostfs.mappings.push(super::hostfs::Mapping::Hide {
-            glob: absolute_dir(spec_dir).to_string_lossy().into_owned(),
+            glob: super::hostfs::Globs(vec![absolute_dir(spec_dir).to_string_lossy().into_owned()]),
         });
     }
 }

@@ -22,16 +22,198 @@ use schemars::JsonSchema;
 use super::internal::{Op, Patterns, Permission};
 use super::tmpfs::TmpfsPerms;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Globs(pub Vec<String>);
+
+impl<'de> Deserialize<'de> for Globs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Globs;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a glob pattern or a list of glob patterns")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                Ok(Globs(vec![super::file::expand_str(s).map_err(E::custom)?]))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut globs = Vec::new();
+                while let Some(s) = seq.next_element::<&str>()? {
+                    globs.push(super::file::expand_str(s).map_err(serde::de::Error::custom)?);
+                }
+                Ok(Globs(globs))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl schemars::JsonSchema for Globs {
+    fn schema_name() -> String {
+        "Globs".to_string()
+    }
+
+    fn is_referenceable() -> bool {
+        // Inline the oneOf; the type has no name in the JSON format.
+        false
+    }
+
+    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Metadata, Schema, SchemaObject, SubschemaValidation};
+        Schema::Object(SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(
+                    "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`), either as a \
+                     single string or as a list of them (a list behaves like separate mappings \
+                     in the listed order). The list may also be spelled `globs` instead of `glob`."
+                        .to_string(),
+                ),
+                ..Default::default()
+            })),
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![
+                    SchemaObject {
+                        instance_type: Some(schemars::schema::SingleOrVec::Single(Box::new(
+                            InstanceType::String,
+                        ))),
+                        ..Default::default()
+                    }
+                    .into(),
+                    SchemaObject {
+                        instance_type: Some(schemars::schema::SingleOrVec::Single(Box::new(
+                            InstanceType::Array,
+                        ))),
+                        array: Some(Box::new(schemars::schema::ArrayValidation {
+                            items: Some(schemars::schema::SingleOrVec::Single(Box::new(
+                                SchemaObject {
+                                    instance_type: Some(schemars::schema::SingleOrVec::Single(
+                                        Box::new(InstanceType::String),
+                                    )),
+                                    ..Default::default()
+                                }
+                                .into(),
+                            ))),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                    .into(),
+                ]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+/// Like [`Globs`], for the single-path-or-list fields (`empty`, `tmpfs`,
+/// `session-cache`, `project-cache`): a single absolute path, or a list
+/// of them (a list behaves like separate mappings in the listed order).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Paths(pub Vec<String>);
+
+impl<'de> Deserialize<'de> for Paths {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Paths;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an absolute path or a list of them")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                Ok(Paths(vec![super::file::expand_str(s).map_err(E::custom)?]))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut paths = Vec::new();
+                while let Some(s) = seq.next_element::<&str>()? {
+                    paths.push(super::file::expand_str(s).map_err(serde::de::Error::custom)?);
+                }
+                Ok(Paths(paths))
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl schemars::JsonSchema for Paths {
+    fn schema_name() -> String {
+        "Paths".to_string()
+    }
+
+    fn is_referenceable() -> bool {
+        // Inline the oneOf; the type has no name in the JSON format.
+        false
+    }
+
+    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, Metadata, Schema, SchemaObject, SubschemaValidation};
+        Schema::Object(SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(
+                    "An absolute path, named exactly (no wildcards), either as a single string \
+                     or as a list of them (a list behaves like separate mappings in the listed \
+                     order). The list may also be spelled `paths` instead of `path`."
+                        .to_string(),
+                ),
+                ..Default::default()
+            })),
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![
+                    SchemaObject {
+                        instance_type: Some(schemars::schema::SingleOrVec::Single(Box::new(
+                            InstanceType::String,
+                        ))),
+                        ..Default::default()
+                    }
+                    .into(),
+                    SchemaObject {
+                        instance_type: Some(schemars::schema::SingleOrVec::Single(Box::new(
+                            InstanceType::Array,
+                        ))),
+                        array: Some(Box::new(schemars::schema::ArrayValidation {
+                            items: Some(schemars::schema::SingleOrVec::Single(Box::new(
+                                SchemaObject {
+                                    instance_type: Some(schemars::schema::SingleOrVec::Single(
+                                        Box::new(InstanceType::String),
+                                    )),
+                                    ..Default::default()
+                                }
+                                .into(),
+                            ))),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                    .into(),
+                ]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+}
+
 /// The spec's `hostfs.mappings` setting: an *ordered* list of mappings,
 /// each selecting host paths for one treatment.
 ///
-/// A `ro`, `rw` or `hide` mapping selects paths with a **glob** pattern of
-/// absolute host paths; every other mapping names absolute **paths**
-/// exactly (it makes no sense to glob a mount point). The `dev` and
-/// `proc` mappings default their path to `/dev` and `/proc`.
+/// A `ro`, `rw` or `hide` mapping selects paths with **glob** patterns of
+/// absolute host paths — either one (`"glob": "/usr"`) or several
+/// (`"globs": ["/usr", "/lib"]`); `empty`, `tmpfs`, `session-cache` and
+/// `project-cache` likewise take one absolute path (`"path": "/dev"`) or
+/// several (`"paths": ["/tmp", "/var/tmp"]`); every other mapping names
+/// one absolute path exactly (it makes no sense to glob a mount point).
+/// The `dev` and `proc` mappings default their path to `/dev` and `/proc`.
 /// The list order matters: when a path matches several mappings, the
 /// **last** matching mapping decides — and the mount ops the mappings
-/// generate are applied in mapping order, too.
+/// generate are applied in mapping order, too. A mapping with several
+/// globs (or paths) behaves exactly like separate mappings in the listed
+/// order.
 ///
 /// The mount-point mappings (`dev`, `tmpfs`, `proc`, `bind`) are
 /// shorthand for an `empty` mapping *plus* the corresponding mount op
@@ -44,14 +226,20 @@ use super::tmpfs::TmpfsPerms;
 pub enum Mapping {
     /// The matched paths are mirrored **read-only**.
     Ro {
-        /// A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`).
-        glob: String,
+        /// A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`),
+        /// either as a single string or as a list of them (a list behaves
+        /// like separate mappings in the listed order). Also accepted
+        /// under the alias `globs`.
+        glob: Globs,
     },
     /// The matched paths are mirrored **read-write** (as far as the real
     /// host permissions allow).
     Rw {
-        /// A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`).
-        glob: String,
+        /// A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`),
+        /// either as a single string or as a list of them (a list behaves
+        /// like separate mappings in the listed order). Also accepted
+        /// under the alias `globs`.
+        glob: Globs,
     },
     /// The matched paths are hidden (a hidden directory hides its whole
     /// subtree).
@@ -62,14 +250,20 @@ pub enum Mapping {
     /// `dir/**/*secret*` to hide every entry named `*secret*` anywhere
     /// below `dir`. Matching is case-sensitive.
     Hide {
-        /// A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`).
-        glob: String,
+        /// A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`),
+        /// either as a single string or as a list of them (a list behaves
+        /// like separate mappings in the listed order). Also accepted
+        /// under the alias `globs`.
+        glob: Globs,
     },
-    /// The named path is exposed **empty** — a mount point for the
+    /// The named paths are exposed **empty** — mount points for the
     /// sandbox's ops.
     Empty {
-        /// An absolute host path, named exactly (no wildcards).
-        path: String,
+        /// An absolute host path, named exactly (no wildcards) — either
+        /// as a single string or as a list of them (a list behaves like
+        /// separate mappings in the listed order). Also accepted under
+        /// the alias `paths`.
+        path: Paths,
     },
     /// Shorthand for `empty` at `path` **plus** a minimal `/dev` mount
     /// (like bwrap's `--dev`) on top of it. `path` defaults to `/dev`.
@@ -79,10 +273,12 @@ pub enum Mapping {
         path: String,
     },
     /// Shorthand for `empty` at `path` **plus** a fresh tmpfs (like
-    /// bwrap's `--tmpfs`) on top of it.
+    /// bwrap's `--tmpfs`) on top of it — one per named path.
     Tmpfs {
-        /// An absolute host path, named exactly (no wildcards).
-        path: String,
+        /// An absolute host path, named exactly (no wildcards) — either
+        /// as a single string or as a list of them (each gets its own
+        /// tmpfs). Also accepted under the alias `paths`.
+        path: Paths,
         /// Octal mode of the tmpfs root, e.g. `"1777"` or `1777`.
         /// Default: `0755`.
         perms: Option<TmpfsPerms>,
@@ -169,8 +365,11 @@ pub enum Mapping {
     /// mappings only exist in the unresolved config view.
     #[serde(rename = "session-cache")]
     SessionCache {
-        /// An absolute sandbox path, named exactly (no wildcards).
-        path: String,
+        /// An absolute sandbox path, named exactly (no wildcards) —
+        /// either as a single string or as a list of them (a list
+        /// behaves like separate mappings in the listed order). Also
+        /// accepted under the alias `paths`.
+        path: Paths,
     },
     /// Like [`Mapping::SessionCache`], but backed by the **project cache**
     /// instead of a tmp directory: the path maps onto `cache/<path>` below
@@ -179,8 +378,11 @@ pub enum Mapping {
     /// every sandbox using that spec directory.
     #[serde(rename = "project-cache")]
     ProjectCache {
-        /// An absolute sandbox path, named exactly (no wildcards).
-        path: String,
+        /// An absolute sandbox path, named exactly (no wildcards) —
+        /// either as a single string or as a list of them (a list
+        /// behaves like separate mappings in the listed order). Also
+        /// accepted under the alias `paths`.
+        path: Paths,
     },
     /// Create a symlink at `dest` pointing to `src`, like bwrap's
     /// `--symlink`. `src` is relative to the sandbox root (`usr/lib`,
@@ -224,33 +426,34 @@ fn default_proc_path() -> String {
 ///
 /// Every path-like field uses [`env_string`] as its deserializer, so
 /// `${VAR}` environment references are expanded while the field is read
-/// (before the `TryFrom` validation below sees it).
+/// (before the `TryFrom` validation below sees it). The `ro`/`rw`/`hide`
+/// globs expand inside [`Globs`], which also accepts a list of them.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum UncheckedMapping {
     Ro {
-        #[serde(deserialize_with = "env_string")]
-        glob: String,
+        #[serde(alias = "globs")]
+        glob: Globs,
     },
     Rw {
-        #[serde(deserialize_with = "env_string")]
-        glob: String,
+        #[serde(alias = "globs")]
+        glob: Globs,
     },
     Hide {
-        #[serde(deserialize_with = "env_string")]
-        glob: String,
+        #[serde(alias = "globs")]
+        glob: Globs,
     },
     Empty {
-        #[serde(deserialize_with = "env_string")]
-        path: String,
+        #[serde(alias = "paths")]
+        path: Paths,
     },
     Dev {
         #[serde(default = "default_dev_path", deserialize_with = "env_string")]
         path: String,
     },
     Tmpfs {
-        #[serde(deserialize_with = "env_string")]
-        path: String,
+        #[serde(alias = "paths")]
+        path: Paths,
         perms: Option<TmpfsPerms>,
         size: Option<u64>,
     },
@@ -281,13 +484,13 @@ enum UncheckedMapping {
     },
     #[serde(rename = "session-cache")]
     SessionCache {
-        #[serde(deserialize_with = "env_string")]
-        path: String,
+        #[serde(alias = "paths")]
+        path: Paths,
     },
     #[serde(rename = "project-cache")]
     ProjectCache {
-        #[serde(deserialize_with = "env_string")]
-        path: String,
+        #[serde(alias = "paths")]
+        path: Paths,
     },
     Symlink {
         #[serde(deserialize_with = "env_string")]
@@ -366,8 +569,8 @@ impl TryFrom<UncheckedMapping> for Mapping {
         /// single source anyway), and free of `..` components (a `..`
         /// would let a cache mapping's relative sub-path escape the cache
         /// root onto an arbitrary host directory — see `sub_path`).
-        fn redirect_dest(kind: &str, value: String) -> Result<String, String> {
-            let dest = absolute(kind, "dest", value)?;
+        fn redirect_dest(kind: &str, field: &str, value: String) -> Result<String, String> {
+            let dest = absolute(kind, field, value)?;
             if dest.contains(['*', '?', '[']) {
                 Err(format!(
                     "hostfs {kind} mapping: dest {dest:?} must not contain wildcards"
@@ -383,27 +586,57 @@ impl TryFrom<UncheckedMapping> for Mapping {
                 Ok(dest)
             }
         }
+        /// A set of glob patterns, all of which must be absolute.
+        fn absolute_globs(kind: &str, globs: Globs) -> Result<Globs, String> {
+            globs
+                .0
+                .into_iter()
+                .map(|g| absolute(kind, "glob", g))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Globs)
+        }
+        /// A set of paths, all of which must be absolute.
+        fn absolute_paths(kind: &str, paths: Paths) -> Result<Paths, String> {
+            paths
+                .0
+                .into_iter()
+                .map(|p| absolute(kind, "path", p))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Paths)
+        }
+        /// A set of redirect destinations, all of which must be absolute
+        /// and wildcard-free (see `redirect_dest`).
+        fn redirect_dests(kind: &str, paths: Paths) -> Result<Paths, String> {
+            paths
+                .0
+                .into_iter()
+                .map(|p| redirect_dest(kind, "path", p))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Paths)
+        }
         Ok(match raw {
             UncheckedMapping::Ro { glob } => Mapping::Ro {
-                glob: absolute("ro", "glob", glob)?,
+                glob: absolute_globs("ro", glob)?,
             },
             UncheckedMapping::Rw { glob } => Mapping::Rw {
-                glob: absolute("rw", "glob", glob)?,
+                glob: absolute_globs("rw", glob)?,
             },
             UncheckedMapping::Hide { glob } => {
-                warn_embedded_double_star("hide", &glob);
+                for g in &glob.0 {
+                    warn_embedded_double_star("hide", g);
+                }
                 Mapping::Hide {
-                    glob: absolute("hide", "glob", glob)?,
+                    glob: absolute_globs("hide", glob)?,
                 }
             }
             UncheckedMapping::Empty { path } => Mapping::Empty {
-                path: absolute("empty", "path", path)?,
+                path: absolute_paths("empty", path)?,
             },
             UncheckedMapping::Dev { path } => Mapping::Dev {
                 path: absolute("dev", "path", path)?,
             },
             UncheckedMapping::Tmpfs { path, perms, size } => Mapping::Tmpfs {
-                path: absolute("tmpfs", "path", path)?,
+                path: absolute_paths("tmpfs", path)?,
                 perms,
                 size,
             },
@@ -419,25 +652,25 @@ impl TryFrom<UncheckedMapping> for Mapping {
                 rw: rw.unwrap_or(false),
             },
             UncheckedMapping::RedirectRo { dest, source } => Mapping::RedirectRo {
-                dest: redirect_dest("redirect-ro", dest)?,
+                dest: redirect_dest("redirect-ro", "dest", dest)?,
                 source: nonempty("redirect-ro", "source", source)?,
             },
             UncheckedMapping::RedirectRw { dest, source } => Mapping::RedirectRw {
-                dest: redirect_dest("redirect-rw", dest)?,
+                dest: redirect_dest("redirect-rw", "dest", dest)?,
                 source: nonempty("redirect-rw", "source", source)?,
             },
             UncheckedMapping::SessionCache { path } => Mapping::SessionCache {
-                path: redirect_dest("session-cache", path)?,
+                path: redirect_dests("session-cache", path)?,
             },
             UncheckedMapping::ProjectCache { path } => Mapping::ProjectCache {
-                path: redirect_dest("project-cache", path)?,
+                path: redirect_dests("project-cache", path)?,
             },
             UncheckedMapping::Symlink { src, dest } => Mapping::Symlink {
                 src: nonempty("symlink", "src", src)?,
                 dest: absolute("symlink", "dest", dest)?,
             },
             UncheckedMapping::Inject { path, content } => Mapping::Inject {
-                path: redirect_dest("inject", path)?,
+                path: redirect_dest("inject", "path", path)?,
                 content: nonempty("inject", "content", content)?,
             },
         })
@@ -453,23 +686,28 @@ impl<'de> Deserialize<'de> for Mapping {
 }
 
 impl Mapping {
-    /// The hostfs glob pattern the mapping selects paths with, if it
+    /// The hostfs glob pattern(s) the mapping selects paths with, if it
     /// touches the host filesystem at all. The mount-point mappings
-    /// (`empty`, `dev`, `tmpfs`, `proc`, `bind`) name their single path
-    /// as a wildcard-free "pattern"; a `symlink` mapping exposes
-    /// nothing.
-    fn pattern(&self) -> Option<&str> {
+    /// (`empty`, `dev`, `tmpfs`, `proc`, `bind`) name their paths as
+    /// wildcard-free "patterns"; a `symlink` mapping exposes
+    /// nothing. A multi-path mapping (or multi-glob) yields its paths
+    /// in listed order — exactly like separate mappings.
+    fn pattern(&self) -> Vec<&str> {
         match self {
-            Mapping::Ro { glob } | Mapping::Rw { glob } | Mapping::Hide { glob } => Some(glob),
-            Mapping::Empty { path }
-            | Mapping::Dev { path }
-            | Mapping::Tmpfs { path, .. }
-            | Mapping::Proc { path } => Some(path),
-            Mapping::Bind { src, dest, .. } => Some(dest.as_deref().unwrap_or(src)),
-            Mapping::RedirectRo { dest, .. } | Mapping::RedirectRw { dest, .. } => Some(dest),
-            Mapping::SessionCache { path } | Mapping::ProjectCache { path } => Some(path),
-            Mapping::Inject { path, .. } => Some(path),
-            Mapping::Symlink { .. } => None,
+            Mapping::Ro { glob } | Mapping::Rw { glob } | Mapping::Hide { glob } => {
+                glob.0.iter().map(String::as_str).collect()
+            }
+            Mapping::Empty { path } | Mapping::Tmpfs { path, .. } => {
+                path.0.iter().map(String::as_str).collect()
+            }
+            Mapping::Dev { path } | Mapping::Proc { path } => vec![path],
+            Mapping::Bind { src, dest, .. } => vec![dest.as_deref().unwrap_or(src)],
+            Mapping::RedirectRo { dest, .. } | Mapping::RedirectRw { dest, .. } => vec![dest],
+            Mapping::SessionCache { path } | Mapping::ProjectCache { path } => {
+                path.0.iter().map(String::as_str).collect()
+            }
+            Mapping::Inject { path, .. } => vec![path],
+            Mapping::Symlink { .. } => vec![],
         }
     }
 
@@ -477,12 +715,12 @@ impl Mapping {
     /// and the paths it selects or mounts. Used by `ai-bubble ls`.
     pub fn describe(&self) -> String {
         match self {
-            Mapping::Ro { glob } => format!("ro     {glob}"),
-            Mapping::Rw { glob } => format!("rw     {glob}"),
-            Mapping::Hide { glob } => format!("hide   {glob}"),
-            Mapping::Empty { path } => format!("empty  {path}"),
+            Mapping::Ro { glob } => format!("ro     {}", glob.0.join(", ")),
+            Mapping::Rw { glob } => format!("rw     {}", glob.0.join(", ")),
+            Mapping::Hide { glob } => format!("hide   {}", glob.0.join(", ")),
+            Mapping::Empty { path } => format!("empty  {}", path.0.join(", ")),
             Mapping::Dev { path } => format!("dev    {path}"),
-            Mapping::Tmpfs { path, .. } => format!("tmpfs  {path}"),
+            Mapping::Tmpfs { path, .. } => format!("tmpfs  {}", path.0.join(", ")),
             Mapping::Proc { path } => format!("proc   {path}"),
             Mapping::Bind { src, dest, rw } => match (rw, dest) {
                 (false, Some(dest)) => format!("bind-ro {src} -> {dest}"),
@@ -496,8 +734,8 @@ impl Mapping {
             Mapping::RedirectRw { dest, source } => {
                 format!("redirect-rw {source} -> {dest}")
             }
-            Mapping::SessionCache { path } => format!("session-cache {path}"),
-            Mapping::ProjectCache { path } => format!("project-cache {path}"),
+            Mapping::SessionCache { path } => format!("session-cache {}", path.0.join(", ")),
+            Mapping::ProjectCache { path } => format!("project-cache {}", path.0.join(", ")),
             Mapping::Symlink { src, dest } => format!("symlink {dest} -> {src}"),
             Mapping::Inject { path, content } => format!("inject {path} ({} bytes)", content.len()),
         }
@@ -538,34 +776,39 @@ impl Mapping {
             _ => Permission::Empty,
         }
     }
-    /// The op the mapping stands for, if any. The mount-point mappings
+    /// The ops the mapping stands for, if any. The mount-point mappings
     /// (`dev`, `tmpfs`, `proc`, `bind`) produce the op that is stacked on
-    /// top of the empty path they expose, and `symlink` produces the
-    /// symlink op; every other mapping — including the redirects, which
-    /// live entirely inside the FUSE filesystem — produces none.
-    pub fn op(&self) -> Option<Op> {
+    /// top of the empty path they expose — one per path for a multi-path
+    /// mapping — and `symlink` produces the symlink op; every other
+    /// mapping — including the redirects, which live entirely inside the
+    /// FUSE filesystem — produces none.
+    pub fn op(&self) -> Vec<Op> {
         match self {
-            Mapping::Dev { path } => Some(Op::Dev {
+            Mapping::Dev { path } => vec![Op::Dev {
                 dest: PathBuf::from(path),
-            }),
-            Mapping::Tmpfs { path, perms, size } => Some(Op::Tmpfs {
+            }],
+            Mapping::Tmpfs { path, perms, size } => path
+                .0
+                .iter()
+                .map(|p| Op::Tmpfs {
+                    dest: PathBuf::from(p),
+                    perms: *perms,
+                    size: *size,
+                })
+                .collect(),
+            Mapping::Proc { path } => vec![Op::Proc {
                 dest: PathBuf::from(path),
-                perms: *perms,
-                size: *size,
-            }),
-            Mapping::Proc { path } => Some(Op::Proc {
-                dest: PathBuf::from(path),
-            }),
-            Mapping::Bind { src, dest, rw } => Some(Op::Bind {
+            }],
+            Mapping::Bind { src, dest, rw } => vec![Op::Bind {
                 src: src.clone(),
                 dest: PathBuf::from(dest.as_deref().unwrap_or(src)),
                 rw: *rw,
-            }),
-            Mapping::Symlink { src, dest } => Some(Op::Symlink {
+            }],
+            Mapping::Symlink { src, dest } => vec![Op::Symlink {
                 src: src.clone(),
                 dest: PathBuf::from(dest),
-            }),
-            _ => None,
+            }],
+            _ => vec![],
         }
     }
 }
@@ -576,12 +819,16 @@ impl Mapping {
 #[serde(default, deny_unknown_fields)]
 pub struct HostFsConfig {
     /// An ordered list of mappings. `ro`, `rw` and `hide` select paths
-    /// with a glob pattern (`glob`) of absolute host paths: matched paths
+    /// with glob patterns (`glob`: a string or a list of strings — the
+    /// list also spellable `globs`) of absolute host paths: matched paths
     /// are mirrored into the sandbox — read-only (`ro`) or read-write
     /// (`rw`, as far as the underlying host permissions allow) — or
-    /// hidden (`hide`). `empty` names a single absolute path (`path`) and
-    /// exposes it empty: an empty, unwritable directory, or an empty file
-    /// when the path matches a real file. Order matters — when a path
+    /// hidden (`hide`). `empty`, `tmpfs`, `session-cache` and
+    /// `project-cache` likewise take one absolute path (`path`) or
+    /// several (`paths`): `empty` exposes it empty (an empty, unwritable
+    /// directory, or an empty file when the path matches a real file),
+    /// `tmpfs` stacks a fresh tmpfs on it, and the cache mappings back it
+    /// with a session or project cache. Order matters — when a path
     /// matches several mappings, the **last** matching mapping decides,
     /// and the mount/symlink ops the mappings generate are applied in
     /// mapping order. Matched paths appear at the same absolute path
@@ -600,12 +847,17 @@ impl HostFsConfig {
     /// the redirect mappings contribute their `dest` with a
     /// [`Permission::Redirect`] permission; `symlink` mappings contribute
     /// nothing (they touch only the sandbox root, not the host
-    /// filesystem).
+    /// filesystem). A multi-glob mapping contributes one entry per glob,
+    /// in listed order — exactly like separate mappings.
     pub fn patterns(&self) -> Patterns {
         Patterns(
             self.mappings
                 .iter()
-                .filter_map(|m| m.pattern().map(|p| (p.to_string(), m.permission())))
+                .flat_map(|m| {
+                    m.pattern()
+                        .into_iter()
+                        .map(move |p| (p.to_string(), m.permission()))
+                })
                 .collect(),
         )
     }
@@ -613,7 +865,7 @@ impl HostFsConfig {
     /// The ops the mappings stand for, in mapping order (only the
     /// mount-point and symlink mappings contribute — see [`Mapping::op`]).
     pub fn ops(&self) -> Vec<Op> {
-        self.mappings.iter().filter_map(Mapping::op).collect()
+        self.mappings.iter().flat_map(Mapping::op).collect()
     }
 
     /// Resolve relative redirect `source`s against `spec_dir` (the
@@ -647,15 +899,19 @@ impl HostFsConfig {
     /// plain `redirect-rw` mappings against their backing directories,
     /// which are created here (empty, when new).
     ///
-    /// A cache mapping names one absolute sandbox path, which maps onto a
-    /// **relative sub-path** of a shared cache root — so several cache
-    /// mappings can share one backing directory:
+    /// A cache mapping names one or more absolute sandbox paths, each of
+    /// which maps onto a **relative sub-path** of a shared cache root —
+    /// so several cache mappings (and paths) can share one backing
+    /// directory:
     ///
     /// * `session-cache`: the per-run tmp directory `session_root`
     ///   (created by the caller, e.g. `crate::hostfs::new_session_cache_dir`;
     ///   that caller also arms the wipe at termination).
     /// * `project-cache`: the `cache` directory inside the spec directory
     ///   (`spec_dir/cache/<path>`); it persists across runs.
+    ///
+    /// A mapping with several paths is rewritten into one `redirect-rw`
+    /// per path, in the listed order — exactly like separate mappings.
     ///
     /// Returns without changing anything when there are no cache mappings.
     /// Called by `ai-bubble run` (never by `ls`, which only shows the
@@ -665,31 +921,52 @@ impl HostFsConfig {
         // `.ai-bubble`): resolve it against the current directory first,
         // like `resolve_relative_sources` does.
         let dir = std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf());
-        for mapping in &mut self.mappings {
-            let (path, source) = match mapping {
-                Mapping::SessionCache { path } => {
-                    let source = session_root
-                        .expect("session root provided whenever session-cache mappings exist")
-                        .join(sub_path(path));
-                    (path, source)
-                }
-                Mapping::ProjectCache { path } => {
-                    let source = dir.join("cache").join(sub_path(path));
-                    (path, source)
-                }
-                _ => continue,
-            };
-            if let Err(e) = std::fs::create_dir_all(&source) {
-                crate::sandbox::die(&format!(
-                    "Can't create cache directory {}: {e}",
-                    source.display()
-                ));
-            }
-            *mapping = Mapping::RedirectRw {
-                dest: path.clone(),
-                source: source.to_string_lossy().into_owned(),
-            };
+        /// One cache mapping expanded to its per-path redirect, or a
+        /// non-cache mapping passed through untouched.
+        enum Resolved {
+            Mapping(Mapping),
+            Cache { dest: String, source: PathBuf },
         }
+        self.mappings = self
+            .mappings
+            .iter()
+            .flat_map(|mapping| match mapping {
+                Mapping::SessionCache { path } => path
+                    .0
+                    .iter()
+                    .map(|p| Resolved::Cache {
+                        dest: p.clone(),
+                        source: session_root
+                            .expect("session root provided whenever session-cache mappings exist")
+                            .join(sub_path(p)),
+                    })
+                    .collect::<Vec<_>>(),
+                Mapping::ProjectCache { path } => path
+                    .0
+                    .iter()
+                    .map(|p| Resolved::Cache {
+                        dest: p.clone(),
+                        source: dir.join("cache").join(sub_path(p)),
+                    })
+                    .collect::<Vec<_>>(),
+                other => vec![Resolved::Mapping(other.clone())],
+            })
+            .map(|resolved| match resolved {
+                Resolved::Mapping(mapping) => mapping,
+                Resolved::Cache { dest, source } => {
+                    if let Err(e) = std::fs::create_dir_all(&source) {
+                        crate::sandbox::die(&format!(
+                            "Can't create cache directory {}: {e}",
+                            source.display()
+                        ));
+                    }
+                    Mapping::RedirectRw {
+                        dest,
+                        source: source.to_string_lossy().into_owned(),
+                    }
+                }
+            })
+            .collect();
     }
 
     /// Whether any `session-cache` mapping needs a per-run tmp directory
@@ -751,6 +1028,136 @@ mod tests {
                 ("/etc/passwd".to_string(), Permission::Hide),
                 ("/dev".to_string(), Permission::Empty)
             ])
+        );
+    }
+
+    #[test]
+    fn glob_mappings_accept_a_list_of_globs() {
+        // A list of globs behaves exactly like separate mappings in the
+        // listed order — under both spellings, `globs` and `glob`.
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [ { "type": "ro", "globs": ["/usr", "/lib"] } ] } }"#,
+        );
+        let separate = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "ro", "glob": "/usr" },
+                { "type": "ro", "glob": "/lib" }
+            ] } }"#,
+        );
+        assert_eq!(spec.hostfs.patterns(), separate.hostfs.patterns());
+        assert_eq!(spec.hostfs.mappings[0].describe(), "ro     /usr, /lib");
+        // The field name is `glob`; the list form may also be spelled
+        // `globs`.
+        assert_eq!(
+            parse(
+                r#"{ "hostfs": { "mappings": [ { "type": "ro", "glob": ["/usr", "/lib"] } ] } }"#
+            )
+            .hostfs
+            .patterns(),
+            spec.hostfs.patterns()
+        );
+        // Every glob in the list is expanded and validated like a single
+        // one — a relative pattern is rejected.
+        assert!(
+            serde_json::from_str::<crate::spec::Spec>(
+                r#"{ "hostfs": { "mappings": [ { "type": "ro", "globs": ["/usr", "lib"] } ] } }"#
+            )
+            .is_err()
+        );
+        // Naming the list under both spellings is a duplicate-field error.
+        assert!(
+            serde_json::from_str::<crate::spec::Spec>(
+                r#"{ "hostfs": { "mappings": [ { "type": "ro", "glob": "/usr", "globs": ["/usr"] } ] } }"#
+            )
+            .is_err()
+        );
+        // Order is preserved within the list: the last matching glob
+        // decides, so a later hide shadows an earlier rw.
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "rw", "globs": ["/etc", "/etc/passwd"] },
+                { "type": "hide", "glob": "/etc/passwd" }
+            ] } }"#,
+        );
+        assert_eq!(
+            spec.hostfs.patterns(),
+            Patterns(vec![
+                ("/etc".to_string(), Permission::Rw),
+                ("/etc/passwd".to_string(), Permission::Rw),
+                ("/etc/passwd".to_string(), Permission::Hide),
+            ])
+        );
+    }
+
+    #[test]
+    fn path_mappings_accept_a_list_of_paths() {
+        // `empty`, `tmpfs`, `session-cache` and `project-cache` accept a
+        // single path or a list of them — a list behaves exactly like
+        // separate mappings in the listed order, under both spellings
+        // (`paths` and `path`).
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [ { "type": "empty", "paths": ["/dev", "/tmp"] } ] } }"#,
+        );
+        let separate = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "empty", "path": "/dev" },
+                { "type": "empty", "path": "/tmp" }
+            ] } }"#,
+        );
+        assert_eq!(spec.hostfs.patterns(), separate.hostfs.patterns());
+        assert_eq!(spec.hostfs.mappings[0].describe(), "empty  /dev, /tmp");
+        assert_eq!(
+            parse(
+                r#"{ "hostfs": { "mappings": [ { "type": "empty", "path": ["/dev", "/tmp"] } ] } }"#
+            )
+            .hostfs
+            .patterns(),
+            spec.hostfs.patterns()
+        );
+        // Every path in the list is validated like a single one — a
+        // relative or wildcarded path is rejected.
+        for mapping in [
+            r#"{ "type": "empty", "paths": ["/dev", "tmp"] }"#,
+            r#"{ "type": "tmpfs", "paths": ["/tmp", "tmp"] }"#,
+            r#"{ "type": "session-cache", "paths": ["/a", "../b"] }"#,
+            r#"{ "type": "project-cache", "paths": ["/a", "/b", "/x?[y]"] }"#,
+        ] {
+            assert!(
+                serde_json::from_str::<crate::spec::Spec>(&format!(
+                    r#"{{ "hostfs": {{ "mappings": [ {mapping} ] }} }}"#
+                ))
+                .is_err(),
+                "should reject {mapping}"
+            );
+        }
+        // Naming the list under both spellings is a duplicate-field error.
+        assert!(
+            serde_json::from_str::<crate::spec::Spec>(
+                r#"{ "hostfs": { "mappings": [ { "type": "empty", "path": "/dev", "paths": ["/tmp"] } ] } }"#
+            )
+            .is_err()
+        );
+        // A multi-path tmpfs produces one op per path, sharing the same
+        // perms and size, in the listed order.
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "tmpfs", "paths": ["/tmp", "/var/tmp"], "perms": "1777", "size": 4096 }
+            ] } }"#,
+        );
+        assert_eq!(
+            spec.hostfs.ops(),
+            vec![
+                Op::Tmpfs {
+                    dest: PathBuf::from("/tmp"),
+                    perms: Some(TmpfsPerms(0o1777)),
+                    size: Some(4096)
+                },
+                Op::Tmpfs {
+                    dest: PathBuf::from("/var/tmp"),
+                    perms: Some(TmpfsPerms(0o1777)),
+                    size: Some(4096)
+                },
+            ]
         );
     }
 

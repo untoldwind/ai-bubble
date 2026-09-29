@@ -3,53 +3,25 @@
   "hostfs": {
     "mappings": [
       {
-        "type": "ro",
-        "glob": "/usr"
+        "type": "rw",
+        "glob": "${PWD}"
       },
       {
         "type": "ro",
-        "glob": "/lib"
-      },
-      {
-        "type": "ro",
-        "glob": "/lib64"
-      },
-      {
-        "type": "ro",
-        "glob": "/bin"
-      },
-      {
-        "type": "ro",
-        "glob": "${HOME}/.rustup"
+        "glob": ["/usr", "/lib", "/lib64", "/bin", "${HOME}/.rustup"]
       },
       {
         "type": "project-cache",
-        "path": "${HOME}/.cargo"
-      },
-      {
-        "type": "project-cache",
-        "path": "${HOME}/.local"
+        "path": ["${HOME}/.cargo", "${HOME}/.local", "${HOME}/.config/opencode"]
       },
       {
         "type": "session-cache",
         "path": "${HOME}/.cache"
       },
       {
-        "type": "project-cache",
-        "path": "${HOME}/.config/opencode"
-      },
-      {
-        "type": "redirect-rw",
-        "source": "conf",
-        "dest": "${HOME}/.config/opencode"
-      },
-      {
-        "type": "rw",
-        "glob": "${PWD}"
-      },
-      {
-        "type": "hide",
-        "glob": "${PWD}/h/*secret*"
+        "type": "redirect-ro",
+        "source": "conf/opencode.jsonc",
+        "dest": "${HOME}/.config/opencode/opencode.jsonc"
       },
       {
         "type": "dev"
@@ -63,11 +35,7 @@
       },
       {
         "type": "tmpfs",
-        "path": "/run"
-      },
-      {
-        "type": "tmpfs",
-        "path": "/tmp"
+        "path":["/run", "/tmp"]
       }
     ]
   },
@@ -97,5 +65,6 @@
       "HOME": "${HOME}",
       "TERM": "${TERM}"
     }
-  }
+  },
+  "seccomp": { "preset": "strict" }
 }

@@ -202,7 +202,7 @@ All fields are optional. A complete example:
 
 | `type` | fields | effect |
 |---|---|---|
-| `ro` / `rw` / `hide` | `glob` | mirror the matched paths read-only / read-write / hide them (with their subtree) |
+| `ro` / `rw` / `hide` | `glob` | mirror the matched paths read-only / read-write / hide them (with their subtree); `glob` is a glob pattern or a list of them (also spellable `globs`) — a list behaves like separate mappings in the listed order |
 | `empty` | `path` | expose the path **empty** — a mount point |
 | `dev` | `path` (default `/dev`) | `empty` **plus** a minimal `/dev` mount (like bwrap's `--dev`) |
 | `tmpfs` | `path`, `perms`, `size` | `empty` **plus** a fresh tmpfs (like bwrap's `--tmpfs`; `perms` is an octal mode, e.g. `"1777"` or `1777`, default `0755`; `size` is the maximum size in bytes) |
@@ -218,9 +218,12 @@ command line.
 
 ### Mapping semantics
 
-- `ro`, `rw` and `hide` select paths with a **glob** pattern of absolute
+- `ro`, `rw` and `hide` select paths with **glob** patterns of absolute
   host paths (`*`, `?`, `[...]`, `**`); every other mapping names
   absolute **paths** exactly (it makes no sense to glob a mount point).
+  `glob` accepts either a single pattern string or a list of them (also
+  spellable as `globs`); a list behaves exactly like separate mappings in
+  the listed order.
   Mirrored paths are exposed inside the sandbox at their absolute host
   paths (`/etc/passwd` → `/etc/passwd`). A mapping that names a directory
   exactly (`/usr/share/doc`) mirrors that directory **recursively**; `**`
@@ -569,11 +572,7 @@ symlinks) are mounted **on top of** it. A sandbox without any
 {
   "hostfs": {
     "mappings": [
-      { "type": "ro", "glob": "/bin" },
-      { "type": "ro", "glob": "/etc" },
-      { "type": "ro", "glob": "/lib" },
-      { "type": "ro", "glob": "/lib64" },
-      { "type": "ro", "glob": "/usr" },
+      { "type": "ro", "globs": ["/bin", "/etc", "/lib", "/lib64", "/usr"] },
       { "type": "dev" },
       { "type": "tmpfs", "path": "/tmp", "perms": "1777" },
       { "type": "proc" }
