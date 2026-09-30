@@ -27,7 +27,11 @@
 //! `netns.rs`), the server lives in its *own* forked child process: the parent
 //! (the sandbox) forks it first, waits for a readiness byte on a pipe, and only
 //! then proceeds with the namespace setup. When the parent dies, the FUSE
-//! server unmounts and exits.
+//! server unmounts and exits. The termination signals that would otherwise
+//! kill the server mid-mount (Ctrl-C to the process group, `SIGTERM`, …) are
+//! blocked around the fork and ignored inside it, and a failed unmount falls
+//! back to a lazy unmount — the mount is detached even when something still
+//! holds it busy.
 //!
 //! `hostfs.mappings` is an ordered pattern → permission list: `"ro"`/`"rw"`
 //! mirror the matched paths (read-only or read-write), `"hide"` hides them
@@ -63,6 +67,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::SeekFrom;
 use std::num::NonZeroU32;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -2354,6 +2359,48 @@ fn ts_to_timespec(ts: Option<Timestamp>) -> libc::timespec {
     }
 }
 
+/// The signals that must never kill the FUSE server child: the ones that
+/// terminate ai-bubble on the user's request (`SIGINT` from Ctrl-C, and the
+/// usual `SIGTERM`/`SIGQUIT`/`SIGHUP`), plus `SIGPIPE` (the readiness pipe's
+/// write end would otherwise kill the server when the parent has already
+/// died before reading the readiness byte). Blocked around the fork, ignored
+/// (and unblocked) inside the server: the server terminates on the parent's
+/// death, not on a signal — that is what lets it unmount cleanly.
+const SERVER_SIGNALS: [libc::c_int; 5] = [
+    libc::SIGINT,
+    libc::SIGTERM,
+    libc::SIGQUIT,
+    libc::SIGHUP,
+    libc::SIGPIPE,
+];
+
+/// A no-op signal handler: the signal is received and discarded.
+extern "C" fn swallow_signal(_: libc::c_int) {}
+
+/// Disarm the termination signals in the FUSE server child: install the
+/// no-op handler (a handler, not `SIG_IGN`, so an `exec`ed `fusermount3`
+/// gets back its default disposition instead of inheriting ignore flags)
+/// and unblock whatever the parent blocked around the fork — a pending
+/// signal is then received and discarded.
+///
+/// # Safety
+/// Raw `sigaction`/`sigprocmask` calls; must run in the freshly forked
+/// server child before it serves.
+unsafe fn disarm_signals() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = swallow_signal as extern "C" fn(libc::c_int) as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        let mut blocked: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut blocked);
+        for sig in SERVER_SIGNALS {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+            libc::sigaddset(&mut blocked, sig);
+        }
+        libc::sigprocmask(libc::SIG_UNBLOCK, &blocked, std::ptr::null_mut());
+    }
+}
+
 /// Fork the FUSE server process, wait for it to mount, and record the
 /// mountpoint for the sandbox child. Must run before any namespace setup.
 ///
@@ -2386,16 +2433,37 @@ pub fn start_host_fs(patterns: &crate::spec::internal::Patterns) {
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
 
+    // Block the signals that terminate ai-bubble (plus SIGPIPE) *around the
+    // fork*: the server child inherits the blocked mask, so a SIGINT/SIGTERM
+    // delivered to the process group — even in the window between the fork
+    // and the child's own signal setup — cannot kill the server before it
+    // has mounted (and later unmounted cleanly). The server exits when the
+    // parent dies, never on a signal. The parent restores its own mask right
+    // after the fork, so it stays killable as usual.
+    let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut old_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut blocked);
+        for sig in SERVER_SIGNALS {
+            libc::sigaddset(&mut blocked, sig);
+        }
+        libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut old_mask);
+    }
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         die_with_error("Can't fork mirrored-fs server");
     }
     if pid == 0 {
         // Child: serve the FUSE filesystem forever (or until the host dies).
-        unsafe { libc::close(read_fd) };
+        unsafe {
+            libc::close(read_fd);
+            disarm_signals();
+        }
         serve(patterns.clone(), mountpoint, write_fd);
         // serve never returns
     }
+    unsafe { libc::sigprocmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut()) };
 
     // Parent: wait for readiness.
     unsafe { libc::close(write_fd) };
@@ -2426,6 +2494,7 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
 
     let outcome = {
         let mp = mountpoint.clone();
+        let server_mountpoint = mountpoint.clone();
         fuselog::event(&format!("SERVER start mountpoint={}", mountpoint.display()));
         runtime.block_on(async move {
             let handle = match mount_with_fallback(
@@ -2464,7 +2533,16 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
             }
 
             fuselog::event("SERVER parent-gone, unmounting");
-            let outcome = handle.unmount().await;
+            let mut outcome = handle.unmount().await;
+            if let Err(e) = &outcome {
+                // fuse3's unmount is a single attempt (`fusermount3 -u`, or
+                // a plain `umount` on the privileged route) and fails with
+                // EBUSY when anything still holds the mount — e.g. a daemon
+                // child of the sandboxed command that outlived it. Fall back
+                // to a *lazy* unmount so the mount is detached regardless.
+                fuselog::event(&format!("SERVER unmount failed ({e}), trying lazy unmount"));
+                outcome = lazy_unmount(&server_mountpoint).await;
+            }
             fuselog::event(&format!("SERVER unmount outcome={outcome:?}"));
             // Give the audit writer a chance to flush the last batch
             // before this process exits.
@@ -2520,6 +2598,36 @@ async fn mount_with_fallback(
                 ))
             }),
     }
+}
+
+/// Last-resort unmount after fuse3's own unmount failed (typically EBUSY):
+/// first a lazy unprivileged `fusermount3 -uz`, then a direct
+/// `umount2(MNT_DETACH)` (the privileged route, or when fusermount3 is not
+/// available). A lazy unmount detaches the mount immediately even while
+/// busy; it disappears for good once the last user is gone — better than a
+/// mount left dangling until the next reboot.
+async fn lazy_unmount(mountpoint: &Path) -> std::io::Result<()> {
+    let mountpoint = mountpoint.to_path_buf();
+    blocking(move || {
+        let via_fusermount = match std::process::Command::new("fusermount3")
+            .args(["-uz"])
+            .arg(&mountpoint)
+            .status()
+        {
+            Ok(status) if status.success() => Ok(()),
+            Ok(_) => Err(std::io::Error::other("fusermount3 -uz failed")),
+            Err(e) => Err(e),
+        };
+        via_fusermount.or_else(|_| {
+            let c = CString::new(mountpoint.as_os_str().as_bytes()).expect("no NUL in mountpoint");
+            if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        })
+    })
+    .await
 }
 
 fn die(msg: &str) -> ! {
