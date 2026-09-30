@@ -30,10 +30,6 @@
         "type": "proc"
       },
       {
-        "type": "empty",
-        "path": "/net"
-      },
-      {
         "type": "tmpfs",
         "path":["/run", "/tmp"]
       }
@@ -55,11 +51,11 @@
       "*.githubusercontent.com:443",
       "ai.bettermarks.com:443",
       "api.tokenfactory.nebius.com:443",
-      "api.together.ai:443"
+      "api.together.ai:443",
+      "api.together.xyz:443"
     ]
   },
   "env": {
-    "env_file": "${HOME}/workspaces/o1/ai-sandbox/.env",
     "values": {
       "PATH": "${PATH}",
       "HOME": "${HOME}",

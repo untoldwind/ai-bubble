@@ -50,7 +50,7 @@ use crate::waf;
 /// `env` is the sandbox's isolated environment (the spec's `env` section);
 /// the proxy variables are merged into it below. `cwd` is the command's
 /// working directory inside the sandbox (see `sandbox::mount_and_exec`).
-pub unsafe fn run(
+pub fn run(
     ops: &[Op],
     command: &[String],
     net: &Net,
@@ -128,7 +128,7 @@ pub unsafe fn run(
 // forwards everything to the next one); one more parameter than clippy's
 // default limit is fine here.
 #[allow(clippy::too_many_arguments)]
-unsafe fn isolated_parent(
+fn isolated_parent(
     netdir: &Path,
     net: &Net,
     ops: &[Op],
@@ -185,10 +185,14 @@ unsafe fn isolated_parent(
         // at 127.0.0.2 are reachable.
         bring_up_loopback();
 
-        // Bind the mode's in-sandbox listeners before forking the child
-        // (all on 127.0.0.2, the address the waf DNS server resolves to).
+        // Set upSet up the mode's in-sandbox listeners (all on 127.0.0.2, the
+        // address the waf DNS server resolves to) and its environment
+        // before forking the child. Entries from the spec's `env` section
+        // are applied afterwards and so win over these: an explicit spec
+        // value is the user's authoritative choice.
         let mut proxy_listener = None;
         let mut waf_listeners = None;
+        let mut child_env: BTreeMap<String, String> = BTreeMap::new();
         match net.mode {
             NetMode::Proxy => {
                 let listener = match std::net::TcpListener::bind(PROXY_ADDR) {
@@ -197,6 +201,22 @@ unsafe fn isolated_parent(
                 };
                 let _ = libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
                 proxy_listener = Some(listener);
+                // Make standard tools (curl, wget, git, ...) use the proxy
+                // by adding the proxy variables to the sandbox's isolated
+                // environment.
+                child_env.extend(
+                    [
+                        ("http_proxy", PROXY_URL),
+                        ("HTTP_PROXY", PROXY_URL),
+                        ("https_proxy", PROXY_URL),
+                        ("HTTPS_PROXY", PROXY_URL),
+                        ("all_proxy", PROXY_URL),
+                        ("ALL_PROXY", PROXY_URL),
+                        ("NO_PROXY", "localhost,127.0.0.1,::1"),
+                    ]
+                    .into_iter()
+                    .map(|(key, val)| (key.to_string(), val.to_string())),
+                );
             }
             NetMode::Waf => {
                 let (tcp53, tcp80, tcp443) = (
@@ -214,55 +234,19 @@ unsafe fn isolated_parent(
                 }
                 let _ = libc::fcntl(udp53.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
                 waf_listeners = Some((tcp53, tcp80, tcp443, udp53));
+                // No proxy variables here — the DNS server and the
+                // 127.0.0.2 servers take care of the redirection. The waf
+                // mode injects its MITM CA as the sandbox's trust anchor
+                // (see `main`); point OpenSSL-based clients at it
+                // explicitly so a distro with a different default bundle
+                // path still finds it.
+                child_env.insert(
+                    "SSL_CERT_FILE".to_string(),
+                    "/etc/ssl/certs/ca-certificates.crt".to_string(),
+                );
             }
         }
-
-        // Environment: in proxy mode, make standard tools (curl, wget,
-        // git, ...) use the proxy by adding the proxy variables to the
-        // sandbox's isolated environment. In waf mode nothing is needed —
-        // the DNS server and the 127.0.0.2 servers take care of the
-        // redirection — so the command starts without proxy variables.
-        // Entries from the spec's `env` section are applied afterwards and
-        // so win over these: an explicit spec value is the user's
-        // authoritative choice.
-        let mut child_env: BTreeMap<String, String> = BTreeMap::new();
-        if net.mode == NetMode::Proxy {
-            child_env.extend(
-                [
-                    ("http_proxy", PROXY_URL),
-                    ("HTTP_PROXY", PROXY_URL),
-                    ("https_proxy", PROXY_URL),
-                    ("HTTPS_PROXY", PROXY_URL),
-                    ("all_proxy", PROXY_URL),
-                    ("ALL_PROXY", PROXY_URL),
-                    ("NO_PROXY", "localhost,127.0.0.1,::1"),
-                    ("RS_BUBBLE_PROXY", "/net/sock"),
-                ]
-                .into_iter()
-                .map(|(key, val)| (key.to_string(), val.to_string())),
-            );
-        }
-        if net.mode == NetMode::Waf {
-            // The waf mode injects its MITM CA as the sandbox's trust
-            // anchor (see `main`); point OpenSSL-based clients at it
-            // explicitly so a distro with a different default bundle path
-            // still finds it.
-            child_env.insert(
-                "SSL_CERT_FILE".to_string(),
-                "/etc/ssl/certs/ca-certificates.crt".to_string(),
-            );
-        }
         child_env.extend(env.iter().map(|(k, v)| (k.clone(), v.clone())));
-
-        let child_ops: Vec<Op> = std::iter::once(Op::Bind {
-            src: netdir.display().to_string(),
-            dest: PathBuf::from("/net"),
-            // The connector's Unix socket at /net/sock must be connectable;
-            // keep this internal bind writable.
-            rw: true,
-        })
-        .chain(ops.iter().cloned())
-        .collect();
 
         let child_pid = libc::fork();
         if child_pid < 0 {
@@ -270,14 +254,7 @@ unsafe fn isolated_parent(
         }
         if child_pid == 0 {
             // PID 1 of its own PID namespace (see pidns_and_exec).
-            pidns_and_exec(
-                &child_ops,
-                command,
-                &child_env,
-                cwd,
-                die_with_parent,
-                seccomp,
-            );
+            pidns_and_exec(&ops, command, &child_env, cwd, die_with_parent, seccomp);
         }
 
         // Serve the mode's network frontends while the command runs.

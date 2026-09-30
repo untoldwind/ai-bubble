@@ -24,7 +24,6 @@
 //!   simple command protocol (`resolve-dns`, `connect`).
 
 use clap::Parser;
-use std::path::{Path, PathBuf};
 
 mod audit;
 mod cli;
@@ -54,162 +53,11 @@ fn main() {
     match cli.command {
         Some(Command::Run {
             die_with_parent,
-            mut command,
-        }) => {
-            if command.is_empty() {
-                sandbox::die(
-                    "No command given; usage: ai-bubble run [--spec-dir DIR] -- COMMAND [args...]",
-                );
-            }
-            let mut spec = spec::Spec::load(cli.spec.as_deref());
+            command,
+        }) => cli::run(cli.spec.as_deref(), die_with_parent, command),
 
-            // In waf mode the sandbox has no real resolver configuration:
-            // inject a virtual, in-memory `/etc/resolv.conf` pointing at
-            // the in-sandbox DNS server (127.0.0.2, see `crate::waf`). The
-            // mapping is appended last, so it wins over earlier mappings of
-            // the same path (`hide` still wins over it — a hidden path is
-            // invisible no matter what).
-            if matches!(spec.net, spec::net::NetConfig::Waf { .. }) {
-                spec.hostfs.mappings.push(spec::hostfs::Mapping::Inject {
-                    path: "/etc/resolv.conf".to_string(),
-                    content: "nameserver 127.0.0.2\noptions timeout:1 attempts:1\n".to_string(),
-                });
-
-                // The waf mode MITMs HTTPS: generate (once per run) the
-                // self-signed CA the in-sandbox HTTPS server signs its
-                // certificates with, and inject it as the sandbox's trust
-                // anchor. /etc/ssl/certs/ca-certificates.crt is the
-                // bundle path of Debian/Ubuntu/Alpine (what curl and
-                // OpenSSL-based clients use by default); /etc/pki/... is
-                // the Fedora/RHEL equivalent. Only *verification* needs
-                // these files — a fake openssl.cnf is not necessary.
-                // Appended last, the mappings win over earlier ones, but
-                // not over an explicit `hide` of the same path.
-                let ca = waf::host::ca_certificate_pem();
-                spec.hostfs.mappings.push(spec::hostfs::Mapping::Inject {
-                    path: "/etc/ssl/certs/ca-certificates.crt".to_string(),
-                    content: ca.clone(),
-                });
-                spec.hostfs.mappings.push(spec::hostfs::Mapping::Inject {
-                    path: "/etc/pki/tls/certs/ca-bundle.crt".to_string(),
-                    content: ca,
-                });
-            }
-
-            // Resolve the cache mappings (`session-cache`,
-            // `project-cache`) against their backing directories before
-            // anything is compiled: the session-cache tmp directory is
-            // created here and wiped once ai-bubble terminates (the
-            // mirrored-fs server inherits the wipe).
-            let spec_dir = cli
-                .spec
-                .as_deref()
-                .unwrap_or(Path::new(spec::file::DEFAULT_SPEC_DIR));
-            let session_cache = hostfs::session_cache_needed(spec.hostfs.has_session_caches());
-            spec.hostfs
-                .prepare_caches(spec_dir, session_cache.as_deref());
-
-            // Compile the config-file spec down into the internal
-            // configuration (ops, hostfs patterns, net settings) the
-            // sandbox machinery runs with.
-            let sandbox_config = spec::internal::SandboxConfig::compile(&spec);
-
-            // Store the audit log path (if any) before any fork: every
-            // forked process (FUSE server, network frontends) sets up its
-            // own audit writer against the same file.
-            audit::configure(sandbox_config.audit_log.clone());
-
-            // Start the host FUSE filesystem server (in its own child
-            // process) before any namespace setup: its filesystem becomes
-            // the sandbox root, with the ops (dev, tmpfs, proc, binds)
-            // mounted on top of it. Only when the spec actually exposes
-            // something: a sandbox without any hostfs mappings must not
-            // depend on (or fail for the lack of) FUSE.
-            if !sandbox_config.patterns.is_empty() {
-                hostfs::set_root_mode(true);
-                if let Some(root) = &session_cache {
-                    hostfs::set_session_cache_root(root);
-                }
-                hostfs::start_host_fs(&sandbox_config.patterns);
-            }
-
-            let command = std::mem::take(&mut command);
-            unsafe {
-                if sandbox_config.net.isolated {
-                    netns::run(
-                        &sandbox_config.ops,
-                        &command,
-                        &sandbox_config.net,
-                        &sandbox_config.env,
-                        sandbox_config.cwd.as_deref(),
-                        die_with_parent,
-                        sandbox_config.seccomp.as_ref(),
-                    );
-                } else {
-                    sandbox::setup_and_exec(
-                        &sandbox_config.ops,
-                        &command,
-                        &sandbox_config.env,
-                        sandbox_config.cwd.as_deref(),
-                        die_with_parent,
-                        sandbox_config.seccomp.as_ref(),
-                    );
-                }
-            }
-        }
-
-        Some(Command::Ls { path }) => ls(cli.spec.as_deref(), &path),
+        Some(Command::Ls { path }) => cli::ls(cli.spec.as_deref(), &path),
 
         None => sandbox::die("No sub-command given; usage: ai-bubble run|ls ..."),
-    }
-}
-
-/// The `ls` sub-command: list `path` on the host filesystem, annotated
-/// with the effective sandbox permission of the current config, and show
-/// the config's mappings (permissions/actions).
-fn ls(spec_path: Option<&Path>, path: &Path) {
-    let spec = spec::Spec::load(spec_path);
-
-    // The mappings of the current config: permissions and mount/symlink
-    // actions, in spec order.
-    let shown_spec = spec_path
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(spec::file::DEFAULT_SPEC_DIR));
-    println!("mappings ({}):", shown_spec.display());
-    for mapping in &spec.hostfs.mappings {
-        println!("  {}", mapping.describe());
-    }
-    for op in spec.hostfs.ops() {
-        println!("  {}", op.describe());
-    }
-
-    // The listed path itself, and every entry, with the effective
-    // permission the config gives it (the last matching pattern wins;
-    // `None` means not visible in the sandbox at all).
-    let target = match std::fs::canonicalize(path) {
-        Ok(target) => target,
-        Err(err) => sandbox::die(&format!("cannot list {}: {err}", path.display())),
-    };
-    let patterns = spec.hostfs.patterns();
-    let permission_of = |p: &Path| hostfs::permission_of(&patterns, p);
-
-    let label = |permission: Option<spec::internal::Permission>| match permission {
-        Some(p) => format!("{p}"),
-        None => "-".to_string(),
-    };
-    println!("{} ({}):", target.display(), label(permission_of(&target)));
-
-    let mut entries: Vec<_> = match std::fs::read_dir(&target) {
-        Ok(entries) => entries.filter_map(|e| e.ok()).collect(),
-        Err(err) => sandbox::die(&format!("cannot list {}: {err}", target.display())),
-    };
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let full = target.join(entry.file_name());
-        println!(
-            "  {} ({})",
-            entry.file_name().to_string_lossy(),
-            label(permission_of(&full))
-        );
     }
 }

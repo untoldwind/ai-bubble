@@ -156,7 +156,7 @@ pub(crate) fn check_new_userns(old_userns: Option<(u64, u64)>) {
 /// `netns::isolated_parent` for P) and the sandboxed child before exec (in
 /// `pidns_and_exec`). That way the death of ai-bubble's caller ripples down
 /// and kills the whole process tree including the exec'd command.
-pub(crate) unsafe fn handle_die_with_parent(enabled: bool) {
+pub(crate) fn handle_die_with_parent(enabled: bool) {
     unsafe {
         if enabled && libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
             die_with_error("Can't set PR_SET_PDEATHSIG");
@@ -182,7 +182,7 @@ const CAP_LAST: libc::c_ulong = 40; // CAP_CHECKPOINT_RESTORE
 /// `env` is the sandbox's isolated environment (see [`mount_and_exec`]).
 /// `cwd` is the command's working directory *inside* the sandbox
 /// (see [`mount_and_exec`]).
-pub unsafe fn setup_and_exec(
+pub fn setup_and_exec(
     ops: &[Op],
     command: &[String],
     env: &BTreeMap<String, String>,

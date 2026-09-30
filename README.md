@@ -456,28 +456,12 @@ spec's `env` section win over these:
 - `https_proxy` / `HTTPS_PROXY` = same
 - `all_proxy` / `ALL_PROXY` = same
 - `NO_PROXY` = `localhost,127.0.0.1,::1`
-- `RS_BUBBLE_PROXY` = `/net/sock` (raw protocol, see below)
 
 For example, inside the sandbox:
 
 ```sh
 curl -si https://example.com/ | head -1
 ```
-
-### Raw protocol on /net/sock
-
-For tools that don't speak HTTP CONNECT, connect a Unix socket to
-`/net/sock`, send the target as one line `host:port\n`, read one status
-byte (`K` = connected, `E` = failed or denied), and the connection
-becomes a raw bidirectional pipe:
-
-```sh
-exec 3<>/net/sock
-printf 'example.com:443\n' >&3
-head -c 1 <&3   # 'K' if the connector connected
-```
-
-`net.allow` restricts both proxy paths.
 
 Exit status: the connector forwards the sandbox's status; a killed
 command yields `128+signal`.

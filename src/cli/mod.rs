@@ -7,6 +7,15 @@
 //! * `run` — run COMMAND inside the sandbox configured by the spec file
 //!   (the original, and still the default-ish, behaviour),
 //! * `ls`  — list a host path and show the mappings of the current config.
+//!
+//! Each sub-command's implementation lives in its own module (`run`, `ls`);
+//! this module holds only the argument parsing.
+
+mod ls;
+mod run;
+
+pub use ls::ls;
+pub use run::run;
 
 use clap::Parser;
 use std::path::PathBuf;
