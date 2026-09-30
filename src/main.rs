@@ -58,6 +58,8 @@ fn main() {
 
         Some(Command::Ls { path }) => cli::ls(cli.spec.as_deref(), &path),
 
-        None => sandbox::die("No sub-command given; usage: ai-bubble run|ls ..."),
+        Some(Command::Init) => cli::init(cli.spec.as_deref()),
+
+        None => sandbox::die("No sub-command given; usage: ai-bubble run|ls|init ..."),
     }
 }

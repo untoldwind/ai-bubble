@@ -56,4 +56,3 @@ pub fn ls(spec_dir: Option<&Path>, path: &Path) {
         );
     }
 }
-

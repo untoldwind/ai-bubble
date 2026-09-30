@@ -6,14 +6,17 @@
 //!
 //! * `run` — run COMMAND inside the sandbox configured by the spec file
 //!   (the original, and still the default-ish, behaviour),
-//! * `ls`  — list a host path and show the mappings of the current config.
+//! * `ls`  — list a host path and show the mappings of the current config,
+//! * `init` — bootstrap a spec directory with a starter spec file.
 //!
-//! Each sub-command's implementation lives in its own module (`run`, `ls`);
-//! this module holds only the argument parsing.
+//! Each sub-command's implementation lives in its own module (`run`, `ls`,,,,,,,,,,,,,,,,,,
+//! `init`); this module holds only the argument parsing.
 
+mod init;
 mod ls;
 mod run;
 
+pub use init::init;
 pub use ls::ls;
 pub use run::run;
 
@@ -80,6 +83,14 @@ pub enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+
+    /// Bootstrap the spec directory (`.ai-bubble`, or `--spec-dir DIR`) if
+    /// it does not exist yet: creates it and writes a starter `spec.json`
+    /// (pinning the project directory by absolute path) plus the JSON
+    /// Schema for it. When the current directory is a git repository, the
+    /// spec directory is also added to its `.gitignore`. An existing
+    /// directory is left untouched.
+    Init,
 }
 
 #[cfg(test)]
@@ -199,5 +210,15 @@ mod tests {
         let cli = parse(&["ai-bubble", "--print-schema"]);
         assert!(cli.print_schema);
         assert_eq!(cli.command, None);
+    }
+
+    #[test]
+    fn init_parses_and_takes_the_global_spec_dir() {
+        let cli = parse(&["ai-bubble", "init"]);
+        assert_eq!(cli.command, Some(Command::Init));
+
+        let cli = parse(&["ai-bubble", "--spec-dir", "somedir", "init"]);
+        assert_eq!(cli.spec.as_deref(), Some(std::path::Path::new("somedir")));
+        assert_eq!(cli.command, Some(Command::Init));
     }
 }

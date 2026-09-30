@@ -128,9 +128,7 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
             base64::engine::general_purpose::STANDARD.encode(&cert),
             base64::engine::general_purpose::STANDARD.encode(&key)
         );
-        if stream.write_all(reply.as_bytes()).await.is_err() {
-            return;
-        }
+        let _ = stream.write_all(reply.as_bytes()).await;
     } else if let Some(target) = cmd.strip_prefix("tls-connect ") {
         // Like `connect`, but the host also performs the TLS client
         // handshake (with the *real* root certificates), so the sandbox

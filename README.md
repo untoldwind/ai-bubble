@@ -42,12 +42,25 @@ ai-bubble --spec-dir custom run -- /bin/sh
 # mappings themselves:
 ai-bubble ls /etc
 
+# Bootstrap the spec directory (default: .ai-bubble) if it does not exist
+# yet, with a starter spec.json and the JSON Schema next to it:
+ai-bubble init
+
 # Print the JSON Schema for the spec file (see below):
 ai-bubble --print-schema > ai-bubble.spec.schema.json
 ```
 
 Notes:
 
+* `init` creates the spec directory (default `.ai-bubble`, or `--spec-dir
+  DIR`) together with a starter `spec.json` and `ai-bubble.spec.schema.json`
+  if it does not exist yet; an existing directory is left untouched. The
+  starter spec is a working baseline that exposes `/bin`, `/etc`, `/lib`,
+  `/lib64` and `/usr` read-only plus fresh `/dev`, `/tmp` and `/proc`, and
+  passes the host's `PATH`/`HOME` through. It pins the project directory by
+  its absolute path (rather than `${PWD}`); when the current directory is a
+  git repository, the spec directory is also added to its `.gitignore`
+  (created if missing, extended otherwise).
 * A missing `.ai-bubble/spec.json` is fine: an **empty spec** is used (empty
   tmpfs root, no mounts, host network). An *explicit* `--spec-dir` that
   cannot be read is a hard error.
@@ -598,7 +611,7 @@ shows the effective permission for a host path under the current spec.
 Starter project — the spec file's `hostfs.mappings` (ro, rw, hide, empty,
 dev, tmpfs, proc, bind, symlink, redirect-ro, redirect-rw, session-cache,
 project-cache), `net.mode` (`host`, `proxy`, `waf`) and `net.allow` are implemented, along
-with the `run` and `ls` sub-commands and `--print-schema`. Namespace-wise ai-bubble
+with the `run`, `ls` and `initinit` sub-commands and `--print-schema`. Namespace-wise ai-bubble
 always unshares user, cgroup, ipc, pid, uts and mount namespaces (see
 "Equivalence with bwrap's namespace flags" above); the network namespace is
 unshared with `"net": { "mode": "proxy" }`.

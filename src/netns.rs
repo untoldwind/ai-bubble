@@ -254,7 +254,7 @@ fn isolated_parent(
         }
         if child_pid == 0 {
             // PID 1 of its own PID namespace (see pidns_and_exec).
-            pidns_and_exec(&ops, command, &child_env, cwd, die_with_parent, seccomp);
+            pidns_and_exec(ops, command, &child_env, cwd, die_with_parent, seccomp);
         }
 
         // Serve the mode's network frontends while the command runs.

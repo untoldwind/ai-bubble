@@ -140,10 +140,10 @@ fn parse_dotenv(text: &str) -> Result<BTreeMap<String, String>, String> {
 /// Strip one pair of matching quotes from a dotenv value.
 fn unquote(value: &str) -> String {
     for quote in ['"', '\''] {
-        if let Some(rest) = value.strip_prefix(quote) {
-            if let Some(stripped) = rest.strip_suffix(quote) {
-                return stripped.to_string();
-            }
+        if let Some(rest) = value.strip_prefix(quote)
+            && let Some(stripped) = rest.strip_suffix(quote)
+        {
+            return stripped.to_string();
         }
     }
     value.to_string()

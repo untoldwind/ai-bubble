@@ -32,7 +32,7 @@ impl schemars::JsonSchema for TmpfsPerms {
                 {
                     "type": "integer",
                     "minimum": 0,
-                    "maximum": 0o7777 as i64,
+                    "maximum": 0o7777_i64,
                 },
                 // A string of (leading-zero-tolerant) octal digits.
                 {

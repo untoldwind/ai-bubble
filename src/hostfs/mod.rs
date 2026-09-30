@@ -1224,17 +1224,17 @@ impl Filesystem for HostFs {
         // do the truncation itself. Write paths (rustc, cargo, …) always
         // open their outputs with O_TRUNC, so ignoring it would leave the
         // tail of the old content in place behind the newly written data.
-        if write_flags && flags & libc::O_TRUNC as u32 != 0 {
-            if let Err(e) = tokio_fs::OpenOptions::new()
+        if write_flags
+            && flags & libc::O_TRUNC as u32 != 0
+            && let Err(e) = tokio_fs::OpenOptions::new()
                 .write(true)
                 .truncate(true)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(self.redirect(&mirrored))
                 .await
-            {
-                log_op_err("open-trunc", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
-                return Err(e.into());
-            }
+        {
+            log_op_err("open-trunc", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
+            return Err(e.into());
         }
         // fh 0 = stateless IO; every read re-opens the host file.
         self.inodes.write().await.open_handle(inode);
@@ -2079,10 +2079,9 @@ impl Filesystem for HostFs {
         // a plain O_CREAT (without O_EXCL) opens an existing file like the
         // host filesystem would. A path merely matched by a wildcard
         // pattern may not exist yet.
-        let existing = match tokio_fs::symlink_metadata(self.redirect(&mirrored)).await {
-            Ok(md) => Some(md),
-            Err(_) => None,
-        };
+        let existing = tokio_fs::symlink_metadata(self.redirect(&mirrored))
+            .await
+            .ok();
         let excl = flags & libc::O_EXCL as u32 != 0;
         let truncate = flags & libc::O_TRUNC as u32 != 0;
         if let Some(md) = existing {
@@ -2324,7 +2323,7 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
                     break;
                 }
                 heartbeat += 1;
-                if heartbeat % 10 == 0 {
+                if heartbeat.is_multiple_of(10) {
                     fuselog::event("SERVER alive");
                 }
             }
