@@ -27,7 +27,8 @@
 //!   the kernel's moved dentry unknown until its TTL expired.
 //! * **Zombies.** A nodeid that loses its lookup references (forget, unlink,
 //!   failed lookup) while open handles remain keeps its last known path, so
-//!   the (stateless, `fh = 0`) IO on those handles still resolves. It is
+//!   the IO on those handles still resolves (through the cached handle
+//!   file, or the stateless reopen fallback). It is
 //!   freed when the last handle is released.
 
 use std::collections::HashMap;
@@ -46,8 +47,8 @@ pub(crate) const ROOT_INODE: Inode = 1;
 #[derive(Debug)]
 struct InodeEntry {
     /// The mirrored path the nodeid stands for. Kept on zombies too (the
-    /// last known path), so stateless (`fh = 0`) IO on their handles still
-    /// resolves.
+    /// last known path), so IO on their handles still
+    /// resolves (via the cached handle file or the stateless fallback).
     path: PathBuf,
     /// The nodeid of the path's parent directory (for `..` in `readdir`).
     /// Meaningless on zombies (`parent_of` reports `None` for them, matching

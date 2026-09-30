@@ -59,12 +59,13 @@
 //! matches a pattern. This keeps the "only mapped paths are visible"
 //! guarantee intact even when the host contains links pointing elsewhere.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::SeekFrom;
 use std::num::NonZeroU32;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -349,6 +350,25 @@ struct HostFs {
     /// the mount fallback builds a fresh filesystem (the failed attempt never
     /// reached the kernel, so an empty map is correct there).
     inodes: tokio::sync::RwLock<InodeMap>,
+    /// Open host files keyed by FUSE handle (`fh`): stateful IO — the file
+    /// is opened once (`open`/`create`) and reused for every `read`/`write`
+    /// on the handle, instead of being reopened per request. `fh = 0` stays
+    /// stateless (injected files, directories); an unknown `fh` falls back
+    /// to the stateless reopen, so a lost entry degrades instead of failing.
+    handles: std::sync::Mutex<HashMap<u64, std::sync::Arc<OpenHandle>>>,
+    /// The next `fh` to hand out; 0 is reserved for stateless IO.
+    next_fh: AtomicU64,
+}
+
+/// One open host file behind a FUSE handle. The file is kept open for the
+/// handle's lifetime (released with it in `release`), so sequential reads
+/// and writes skip the per-request open/seek/close cycle. The per-handle
+/// mutex serializes the shared cursor; concurrent access to one handle is
+/// rare and only costs lock wait, never a reopen.
+struct OpenHandle {
+    file: tokio::sync::Mutex<tokio_fs::File>,
+    /// Opened with `O_APPEND`: every write goes to the end, offsets ignored.
+    append: bool,
 }
 
 impl HostFs {
@@ -366,7 +386,47 @@ impl HostFs {
             gid: unsafe { libc::getgid() },
             patterns: compiled,
             inodes: tokio::sync::RwLock::new(InodeMap::new()),
+            handles: std::sync::Mutex::new(HashMap::new()),
+            next_fh: AtomicU64::new(1),
         }
+    }
+
+    /// Allocate a fresh FUSE handle (`fh`) for a newly opened host file.
+    fn alloc_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Register an opened host file under a fresh `fh`.
+    fn insert_handle(&self, file: tokio_fs::File, append: bool) -> u64 {
+        let fh = self.alloc_fh();
+        self.handles
+            .lock()
+            .expect("hostfs handle table poisoned")
+            .insert(fh, std::sync::Arc::new(OpenHandle {
+                file: tokio::sync::Mutex::new(file),
+                append,
+            }));
+        fh
+    }
+
+    /// Take a handle's file out of the table (`release`): dropping the
+    /// `OpenHandle` closes the host file.
+    fn remove_handle(&self, fh: u64) {
+        self.handles
+            .lock()
+            .expect("hostfs handle table poisoned")
+            .remove(&fh);
+    }
+
+    /// A cloned reference to the handle's entry, or `None` for an unknown
+    /// (or stateless, `fh = 0`) handle — the caller falls back to the
+    /// stateless reopen in that case.
+    fn handle_of(&self, fh: u64) -> Option<std::sync::Arc<OpenHandle>> {
+        self.handles
+            .lock()
+            .expect("hostfs handle table poisoned")
+            .get(&fh)
+            .cloned()
     }
 
     /// Resolve a nodeid to its mirrored path (falling back to a zombie's
@@ -385,16 +445,17 @@ impl HostFs {
     /// directory when it is (or would be) a directory, an empty file when
     /// it matches a real file.
     fn is_empty(&self, mirrored: &Path) -> bool {
-        self.permission_of(mirrored) == Some(Permission::Empty)
+        matches!(self.permission_of(mirrored), Some(Permission::Empty))
     }
 
     /// The in-memory content of the mirrored path when it is matched with
     /// the `inject` permission (by the last pattern naming it): the path
     /// is a purely virtual file served from the mirror's memory, with no
-    /// host counterpart at all.
-    fn is_inject(&self, mirrored: &Path) -> Option<String> {
+    /// host counterpart at all. Borrowed: this is consulted on every
+    /// operation touching the path.
+    fn is_inject(&self, mirrored: &Path) -> Option<&str> {
         match self.permission_of(mirrored) {
-            Some(Permission::Inject { content }) => Some(content),
+            Some(Permission::Inject { content }) => Some(content.as_str()),
             _ => None,
         }
     }
@@ -517,7 +578,7 @@ impl HostFs {
     /// The result is only the *spec* side: the real host filesystem may
     /// still deny the operation (the server acts with the real host
     /// credentials, so the underlying file or directory permissions apply).
-    fn write_permission(&self, mirrored: &Path) -> Option<Permission> {
+    fn write_permission(&self, mirrored: &Path) -> Option<&Permission> {
         // Fail closed: a non-UTF-8 component can never match a pattern, so
         // its write permission could never be derived from the spec — a
         // hidden name spelled with invalid UTF-8 bytes must not become
@@ -547,14 +608,16 @@ impl HostFs {
 
     /// The permission of the **last** pattern that names the path itself
     /// (exactly, or via a `**` that covers it), or `None` when no pattern
-    /// names it.
-    fn permission_of(&self, mirrored: &Path) -> Option<Permission> {
+    /// names it. Borrowed from the compiled pattern list: this runs on
+    /// every operation (often several times per path), and a clone would
+    /// copy an `Inject` permission's whole content each time.
+    fn permission_of(&self, mirrored: &Path) -> Option<&Permission> {
         // `*` must not cross directory separators, like in a shell.
         self.patterns
             .iter()
             .rev()
             .find(|p| p.names(mirrored))
-            .map(|p| p.permission.clone())
+            .map(|p| &p.permission)
     }
 
     /// Whether the path is hidden because a pattern hides it directly, or
@@ -1001,8 +1064,11 @@ fn is_root(path: &OsStr) -> bool {
 
 impl Filesystem for HostFs {
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
+        // Advertise a large max write (the kernel clamps it to its own
+        // limit): with a tiny value the kernel splits every write into
+        // small FUSE requests, multiplying the per-request overhead.
         Ok(ReplyInit {
-            max_write: NonZeroU32::new(4096).unwrap(),
+            max_write: NonZeroU32::new(1024 * 1024).unwrap(),
         })
     }
 
@@ -1224,28 +1290,42 @@ impl Filesystem for HostFs {
         // do the truncation itself. Write paths (rustc, cargo, …) always
         // open their outputs with O_TRUNC, so ignoring it would leave the
         // tail of the old content in place behind the newly written data.
-        if write_flags
-            && flags & libc::O_TRUNC as u32 != 0
-            && let Err(e) = tokio_fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(self.redirect(&mirrored))
-                .await
-        {
-            log_op_err("open-trunc", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
-            return Err(e.into());
+        // The truncation happens in the open below (the file is opened for
+        // real and kept for the handle's lifetime).
+        let append = flags & libc::O_APPEND as u32 != 0;
+        let mut opts = tokio_fs::OpenOptions::new();
+        if !write_flags || flags & libc::O_RDWR as u32 != 0 {
+            opts.read(true);
         }
-        // fh 0 = stateless IO; every read re-opens the host file.
+        if write_flags {
+            opts.write(true);
+        }
+        if append {
+            opts.append(true);
+        }
+        if write_flags && flags & libc::O_TRUNC as u32 != 0 {
+            opts.truncate(true);
+        }
+        opts.custom_flags(libc::O_NOFOLLOW);
+        let file = match opts.open(self.redirect(&mirrored)).await {
+            Ok(f) => f,
+            Err(e) => {
+                log_op_err("open", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
+                return Err(e.into());
+            }
+        };
+        // Stateful IO: the opened host file is reused for every read/write
+        // on this handle (released with it in `release`).
         self.inodes.write().await.open_handle(inode);
-        Ok(ReplyOpen { fh: 0, flags: 0 })
+        let fh = self.insert_handle(file, append);
+        Ok(ReplyOpen { fh, flags: 0 })
     }
 
     async fn read(
         &self,
         _req: Request,
         inode: Inode,
-        _fh: u64,
+        fh: u64,
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
@@ -1286,9 +1366,28 @@ impl Filesystem for HostFs {
         if self.is_empty(&mirrored) {
             return Ok(ReplyData::from(Bytes::new()));
         }
-        // Stateless IO: reopen the host file for every read — never
-        // following symlinks (a host symlink is visible only as a link,
-        // and its target may not be mirrored at all).
+        // Stateful IO: the handle keeps the host file open — reuse it
+        // instead of reopening per request. An unknown `fh` (the handle
+        // entry was lost) falls back to the stateless reopen below.
+        if fh != 0
+            && let Some(handle) = self.handle_of(fh)
+        {
+            let mut file = handle.file.lock().await;
+            file.seek(SeekFrom::Start(offset)).await?;
+            let mut buf = vec![0u8; size as usize];
+            let n = match file.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    log_op_err("read-io", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
+                    return Err(e.into());
+                }
+            };
+            buf.truncate(n);
+            return Ok(ReplyData::from(Bytes::from(buf)));
+        }
+        // Stateless IO fallback: reopen the host file — never following
+        // symlinks (a host symlink is visible only as a link, and its
+        // target may not be mirrored at all).
         let mut file = match tokio_fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -1318,7 +1417,7 @@ impl Filesystem for HostFs {
         &self,
         _req: Request,
         inode: Inode,
-        _fh: u64,
+        fh: u64,
         offset: u64,
         data: &[u8],
         _write_flags: u32,
@@ -1360,10 +1459,38 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        // Stateless IO: reopen the host file for every write — never
-        // following symlinks (a host symlink is never written through;
-        // its target may not be mirrored at all).
+        // Stateful IO: the handle keeps the host file open — reuse it instead
+        // of reopening per request. An unknown `fh` falls back to the
+        // stateless reopen below.
         let append = flags & libc::O_APPEND as u32 != 0;
+        if fh != 0
+            && let Some(handle) = self.handle_of(fh)
+        {
+            let mut file = handle.file.lock().await;
+            if !handle.append {
+                file.seek(SeekFrom::Start(offset)).await?;
+            }
+            let n = match file.write(data).await {
+                Ok(n) => n,
+                Err(e) => {
+                    log_op_err("write-io", &mirrored, Some(&self.redirect(&mirrored)), &e).await;
+                    return Err(e.into());
+                }
+            };
+            drop(file);
+            crate::audit::record(
+                "hostfs",
+                "write",
+                Some(&mirrored.to_string_lossy()),
+                Some("ok"),
+                Some(format!("{} bytes at offset {}", n, offset)),
+            )
+            .await;
+            return Ok(ReplyWrite { written: n as u32 });
+        }
+        // Stateless IO fallback: reopen the host file — never following
+        // symlinks (a host symlink is never written through; its target
+        // may not be mirrored at all).
         let mut file = match tokio_fs::OpenOptions::new()
             .write(true)
             .append(append)
@@ -2084,6 +2211,7 @@ impl Filesystem for HostFs {
             .ok();
         let excl = flags & libc::O_EXCL as u32 != 0;
         let truncate = flags & libc::O_TRUNC as u32 != 0;
+        let append = flags & libc::O_APPEND as u32 != 0;
         if let Some(md) = existing {
             if md.file_type().is_symlink() {
                 log_op_err(
@@ -2120,6 +2248,9 @@ impl Filesystem for HostFs {
             if truncate {
                 opts.truncate(true);
             }
+            if append {
+                opts.append(true);
+            }
             let file = match opts.open(self.redirect(&mirrored)).await {
                 Ok(f) => f,
                 Err(e) => {
@@ -2131,13 +2262,14 @@ impl Filesystem for HostFs {
             log_op_ok("create", &mirrored, &self.redirect(&mirrored)).await;
             let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
             self.inodes.write().await.open_handle(inode);
+            let fh = self.insert_handle(file, append);
             let mut attr = attr_from_metadata(&md);
             attr.ino = inode;
             return Ok(ReplyCreated {
                 ttl: TTL,
                 attr,
                 generation: 0,
-                fh: 0,
+                fh,
                 flags: 0,
             });
         }
@@ -2165,29 +2297,32 @@ impl Filesystem for HostFs {
         log_op_ok("create-new", &mirrored, &self.redirect(&mirrored)).await;
         let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
         self.inodes.write().await.open_handle(inode);
+        let fh = self.insert_handle(file, append);
         attr.ino = inode;
         Ok(ReplyCreated {
             ttl: TTL,
             attr,
             generation: 0,
-            fh: 0,
+            fh,
             flags: 0,
         })
     }
 
-    /// Release an open file: all IO is stateless (`fh = 0`), so there is
-    /// nothing to flush — the handle bookkeeping is all that remains. The
-    /// reply mirrors the path API's default (`ENOSYS`), which the kernel
-    /// does not propagate to `close()`.
+    /// Release an open file: the cached host file is dropped (closing it);
+    /// there is nothing to flush. The reply mirrors the path API's default
+    /// (`ENOSYS`), which the kernel does not propagate to `close()`.
     async fn release(
         &self,
         _req: Request,
         inode: Inode,
-        _fh: u64,
+        fh: u64,
         _flags: u32,
         _lock_owner: u64,
         _flush: bool,
     ) -> Result<()> {
+        // Drop the cached host file (closing it); the handle bookkeeping
+        // is all that remains — IO is stateful but needs no flush.
+        self.remove_handle(fh);
         self.inodes.write().await.close_handle(inode);
         Err(libc::ENOSYS.into())
     }
@@ -3059,11 +3194,14 @@ mod tests {
     #[test]
     fn write_permission_follows_the_last_pattern() {
         let f = fs(&[("/etc", Permission::Ro), ("/etc/passwd", Permission::Rw)]);
-        assert_eq!(f.write_permission(Path::new("/etc")), Some(Permission::Ro));
-        assert_eq!(
+        assert!(matches!(
+            f.write_permission(Path::new("/etc")),
+            Some(Permission::Ro)
+        ));
+        assert!(matches!(
             f.write_permission(Path::new("/etc/passwd")),
             Some(Permission::Rw)
-        );
+        ));
         assert!(!f.writable(Path::new("/etc")));
         assert!(f.writable(Path::new("/etc/passwd")));
         // The root is never writable.
