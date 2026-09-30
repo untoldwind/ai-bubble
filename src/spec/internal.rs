@@ -135,14 +135,14 @@ pub struct SandboxConfig {
     pub patterns: Patterns,
     /// The environment of the sandboxed command: exactly what the spec's
     /// `env.values` lists, with the `env_file` entries (if any) merged
-    /// in and the `${VAR}` references already expanded (expansion happens
-    /// while the spec is parsed, so the values are fixed here). The
-    /// command inherits nothing else from the host.
+    /// in and the `${VAR}` references resolved at compile time (see
+    /// [`super::env::EnvConfig::expand_values`]). The command inherits
+    /// nothing else from the host.
     pub env: BTreeMap<String, String>,
     /// The working directory of the sandboxed command *inside* the
     /// sandbox, from the spec's `cwd` field (default: none, meaning `/`).
-    /// Already `${VAR}`-expanded and validated as an absolute, `..`-free
-    /// path at parse time (see `crate::spec::file::cwd_string`).
+    /// Expanded and validated as an absolute, `..`-free path when the
+    /// config is compiled (see [`Spec::expand_cwd`]).
     pub cwd: Option<PathBuf>,
     /// The audit log path from the spec's `audit` section (with `${VAR}`
     /// references already expanded at parse time), or `None` when
@@ -174,11 +174,9 @@ impl SandboxConfig {
             patterns: spec.hostfs.patterns(),
             env: spec
                 .env
-                .values
-                .iter()
-                .map(|(name, value)| (name.clone(), value.0.clone()))
-                .collect(),
-            cwd: spec.cwd.as_deref().map(PathBuf::from),
+                .expand_values()
+                .unwrap_or_else(|e| crate::sandbox::die(&e)),
+            cwd: spec.expand_cwd().unwrap_or_else(|e| crate::sandbox::die(&e)),
             audit_log: spec.audit.log.as_deref().map(PathBuf::from),
             seccomp: compile_seccomp(&spec.seccomp),
         }

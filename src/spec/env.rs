@@ -23,6 +23,12 @@
 //!   environment as well (see [`parse_dotenv`]). Entries already present
 //!   in `values` win: the spec is the user's explicit choice, the file
 //!   fills in the rest.
+//!
+//! Neither the value `${VAR}` references nor the reference in `env_file`
+//! are expanded while the file is parsed: this type holds exactly what
+//! the user wrote. The value expansion happens when the spec is compiled
+//! down to the internal config (see [`EnvConfig::expand_values`]), so a
+//! programmatically updated spec is expanded too.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -40,14 +46,17 @@ pub struct EnvConfig {
     ///
     /// The variable names are used as-is (they become the names the
     /// sandboxed command sees); only the values are `${VAR}`-expanded.
+    /// The expansion happens at compile time (see
+    /// [`EnvConfig::expand_values`]), not while the file is parsed.
     pub values: BTreeMap<String, EnvVar>,
     /// An optional dotenv-style file (relative to the spec directory)
     /// whose `KEY=VALUE` lines are loaded into the environment. Entries
     /// already present in [`EnvConfig::values`] win over the file.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "env_file_path"
-    )]
+    ///
+    /// The path itself may reference host environment variables as
+    /// `${VAR}`; it is expanded when the file is loaded (see
+    /// [`EnvConfig::load_env_file`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub env_file: Option<String>,
 }
 
@@ -56,50 +65,54 @@ impl EnvConfig {
     /// any) and merge its entries into [`EnvConfig::values`] — without
     /// overwriting entries the spec already lists. The path is resolved
     /// relative to the spec directory (like the redirect sources); a
-    /// missing file, a malformed line or an unset `${VAR}` reference in
-    /// a file value is an error.
+    /// missing file or a malformed line is an error.
+    ///
+    /// The file entries are merged as written: their `${VAR}` references
+    /// are expanded later, together with the spec values, when the config
+    /// is compiled (see [`EnvConfig::expand_values`]).
     pub fn load_env_file(&mut self, spec_dir: &Path) -> Result<(), String> {
         let Some(file) = &self.env_file else {
             return Ok(());
         };
+        let file = super::file::expand_str(file)
+            .map_err(|e| format!("Invalid env file path {file:?}: {e}"))?;
         let path = spec_dir.join(file);
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("Can't read env file {}: {e}", path.display()))?;
         let entries = parse_dotenv(&text).map_err(|e| format!("Invalid env file {path:?}: {e}"))?;
         for (name, raw) in entries {
-            let value = super::file::expand_str(&raw)
-                .map_err(|e| format!("Invalid env file {path:?}: {e}"))?;
-            self.values.entry(name).or_insert(EnvVar(value));
+            self.values.entry(name).or_insert(EnvVar(raw));
         }
         Ok(())
     }
+
+    /// The fully expanded environment: [`EnvConfig::values`] with every
+    /// `${VAR}` reference resolved from the **host** environment (see
+    /// [`super::file::expand_str`]), ready to hand to the sandboxed
+    /// command. An unset host variable is an error; the caller reports it.
+    ///
+    /// This is the environment-value replacement; it runs when the spec is
+    /// compiled down to the internal config, so values a program
+    /// assembled after parsing are expanded as well.
+    pub fn expand_values(&self) -> Result<BTreeMap<String, String>, String> {
+        self.values
+            .iter()
+            .map(|(name, value)| {
+                super::file::expand_str(&value.0)
+                    .map(|expanded| (name.clone(), expanded))
+                    .map_err(|e| format!("Invalid env value {name:?}: {e}"))
+            })
+            .collect()
+    }
 }
 
-/// One environment value: a string whose `${VAR}` references are
-/// expanded from the **host** environment while the spec is read (see
-/// [`super::file::expand_str`]), so everything downstream only ever sees
-/// the fully expanded text.
+/// One environment value, exactly as written in the spec file. The
+/// `${VAR}` references are expanded from the **host** environment when
+/// the config is compiled down (see [`EnvConfig::expand_values`]), so the
+/// spec-file view keeps the raw text and the sandbox machinery only ever
+/// sees the fully expanded text.
 #[derive(Debug, PartialEq, Deserialize, JsonSchema)]
-pub struct EnvVar(#[serde(deserialize_with = "env_var_value")] pub String);
-
-/// Deserialize the `env_file` field: a path-like value whose `${VAR}`
-/// references are expanded (see [`super::file::expand_str`]).
-fn env_file_path<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error> {
-    let raw = String::deserialize(deserializer)?;
-    super::file::expand_str(&raw)
-        .map(Some)
-        .map_err(serde::de::Error::custom)
-}
-
-/// Deserialize one `env` value with `${VAR}` expansion: the field is
-/// read as a plain string, then the references are resolved against the
-/// host environment. An unset host variable is a deserialization error.
-fn env_var_value<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    let raw = String::deserialize(deserializer)?;
-    super::file::expand_str(&raw).map_err(serde::de::Error::custom)
-}
+pub struct EnvVar(pub String);
 
 /// Parse a dotenv-style file into `KEY → raw value` entries:
 ///

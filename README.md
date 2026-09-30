@@ -126,7 +126,10 @@ All fields are optional. A complete example:
   empty environment. `values` maps variable names to values, which may
   reference host variables as `${VAR}`, so the variables the sandbox
   needs are copied over explicitly, one by one (e.g. `"PATH": "${PATH}"`).
-  Referencing an unset host variable is an error. Optionally, `env_file`
+  Referencing an unset host variable is an error; the references are
+  expanded when the spec is compiled down to the internal config (not
+  while the file is parsed), so a programmatically assembled spec is
+  expanded too. Optionally, `env_file`
   names a dotenv-style file (relative to the spec directory) whose
   `KEY=VALUE` lines (comments, quotes and an optional `export` prefix are
   supported) are loaded as well; entries already present in `values` win
@@ -136,11 +139,12 @@ All fields are optional. A complete example:
 
 - `cwd` — the command's **working directory inside the sandbox**
   (default: `/`). An absolute sandbox path without `..` components; it
-  may reference host variables as `${VAR}` like the path-like mapping
-  fields. The directory must exist inside the sandbox (e.g. via a
-  hostfs mapping or a mount-point mapping such as `tmpfs`) — nothing
-  is created automatically, and a missing directory is a hard error
-  right before exec.
+  may reference host variables as `${VAR}` (expanded when the spec is
+  compiled down to the internal config, like the `env` values). The
+  directory must exist inside the sandbox (e.g. via a hostfs mapping or
+  a mount-point mapping such as `tmpfs`) — nothing is created
+  automatically, and a missing directory is a hard error right before
+  exec.
 
 - `hostfs.mappings` — an **ordered** array of mappings, each selecting
   host paths for one treatment (`type`); see below for the details.
@@ -299,11 +303,11 @@ command line.
   `rw`.
 - **Environment variables** — the path-like mapping fields (`glob`,
   `path`, `src`, `dest`, `source`) may reference environment variables
-  as `${VAR}` (e.g. `"glob": "${HOME}/project"`); the references are
-  expanded while the spec is read, so everything downstream only ever
-  sees the fully expanded text. Other fields (`net.allow`, ...) are
-  never expanded. Referencing an unset variable is an error; only the
-  `${VAR}` form is recognized (a bare `$` stays untouched).
+  as `${VAR}` or `$VAR` (e.g. `"glob": "${HOME}/project"`); the
+  references are expanded while the spec is read, so everything
+  downstream only ever sees the fully expanded text. Other mapping
+  fields (`content`, ...), `net.allow` and the like are never expanded.
+  Referencing an unset variable is an error.
 
 ## Equivalence with bwrap's namespace flags
 

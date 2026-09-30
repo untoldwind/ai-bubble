@@ -65,15 +65,19 @@
 //! the `env` section decides what exists inside it (see
 //! [`super::env`]). Its `values` map may use `${VAR}` to copy host
 //! variables in explicitly, and its optional `env_file` loads
-//! dotenv-style entries from a file next to the spec. Without an `env`
+//! dotenv-style entries from a file next to the spec. The values are
+//! kept as written while the file is parsed and only expanded when the
+//! spec is compiled down to the internal config. Without an `env`
 //! section (or with an empty one) the command runs with an empty
 //! environment.
 //!
 //! The working directory: `cwd` sets the directory the command starts
-//! in *inside* the sandbox (default: `/`). Like the path-like mapping
-//! fields it may use `${VAR}` references, must be an absolute sandbox
-//! path without `..` components, and must exist inside the sandbox (be
-//! it through a hostfs mapping or as a mount point).
+//! in *inside* the sandbox (default: `/`). The value is kept as written
+//! while the file is parsed; like the `env` values its `${VAR}`
+//! references are only expanded when the spec is compiled down to the
+//! internal config. The expanded value must be an absolute sandbox path
+//! without `..` components, and must exist inside the sandbox (be it
+//! through a hostfs mapping or as a mount point).
 //!
 //! The syscall filter: the `seccomp` section installs a seccomp-bpf
 //! filter for the sandboxed command right before exec (see
@@ -142,21 +146,21 @@ pub struct Spec {
     /// variables the sandboxed command sees. Nothing is inherited from
     /// the host; use `${VAR}` in the values to copy host variables in
     /// explicitly, and `env_file` to load dotenv-style entries from a
-    /// file (see [`super::env`]).
+    /// file (see [`super::env`]). The values are kept as written and the
+    /// `${VAR}` references are expanded when the spec is compiled down to
+    /// the internal config.
     pub env: EnvConfig,
     /// The working directory of the sandboxed command, *inside* the
-    /// sandbox (default: `/`). Like the path-like mapping fields the
-    /// value may reference host environment variables as `${VAR}`; it
-    /// must be an absolute sandbox path without `..` components. The
-    /// directory must exist inside the sandbox — in hostfs-root mode
+    /// sandbox (default: `/`). The value is kept exactly as written while
+    /// the file is parsed and may reference host environment variables as
+    /// `${VAR}`; the references are expanded — and the result validated as
+    /// an absolute sandbox path without `..` components — when the spec is
+    /// compiled down to the internal config (see [`Spec::expand_cwd`]).
+    /// The directory must exist inside the sandbox — in hostfs-root mode
     /// through a mapping, on the tmpfs root because a mount or symlink
     /// created it. Nothing is created automatically: a missing directory
     /// is a hard error right before exec.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "cwd_string"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// The syscall filter installed for the sandboxed command right
     /// before exec (see [`super::seccomp`]). Either an `allow` or a
@@ -207,7 +211,8 @@ impl Spec {
                     spec.hostfs.resolve_relative_sources(dir);
                     // Same for the env file: it is resolved against the
                     // spec directory and its entries merged into
-                    // `env.values` right away.
+                    // `env.values` (the values are still unexpanded; see
+                    // `SandboxConfig::compile`).
                     if let Err(e) = spec.env.load_env_file(dir) {
                         crate::sandbox::die(&e);
                     }
@@ -251,40 +256,45 @@ impl Spec {
             glob: super::hostfs::Globs(vec![absolute_dir(spec_dir).to_string_lossy().into_owned()]),
         });
     }
-}
 
-/// Deserialize the spec's `cwd` field: a `${VAR}`-expanded, absolute
-/// sandbox path without `..` components (see [`expand_str`] and
-/// [`Spec::cwd`]). The checks run at parse time so a bad working
-/// directory is reported like any other spec error, not as a late
-/// failure right before exec.
-fn cwd_string<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error> {
-    let raw = String::deserialize(deserializer)?;
-    let expanded = expand_str(&raw).map_err(serde::de::Error::custom)?;
-    let path = Path::new(&expanded);
-    if !path.is_absolute() {
-        return Err(serde::de::Error::custom(format!(
-            "cwd {expanded:?} is not an absolute sandbox path"
-        )));
+    /// Expand and validate the [`Spec::cwd`] field for compilation: the
+    /// `${VAR}` references are resolved from the **host** environment
+    /// (like the `env` values, see [`expand_str`]), and the result must be
+    /// an absolute sandbox path without `..` components. `None` stays
+    /// `None` (the sandbox root). Called when the spec is compiled down to
+    /// the internal config, so a programmatically updated spec is expanded
+    /// and validated too, and a bad working directory is reported as a
+    /// compile error rather than a late failure right before exec.
+    pub(crate) fn expand_cwd(&self) -> Result<Option<PathBuf>, String> {
+        let Some(raw) = &self.cwd else {
+            return Ok(None);
+        };
+        let expanded = expand_str(raw).map_err(|e| format!("Invalid cwd {raw:?}: {e}"))?;
+        let path = Path::new(&expanded);
+        if !path.is_absolute() {
+            return Err(format!(
+                "cwd {expanded:?} is not an absolute sandbox path"
+            ));
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "cwd {expanded:?} must not contain \"..\" components"
+            ));
+        }
+        Ok(Some(PathBuf::from(expanded)))
     }
-    if path
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(serde::de::Error::custom(format!(
-            "cwd {expanded:?} must not contain \"..\" components"
-        )));
-    }
-    Ok(Some(expanded))
 }
 
 /// Expand the `${VAR}` references in one string with
 /// [`shellexpand`]: both the `${VAR}` and the bare `$VAR` forms are
 /// recognized, as in a shell. Used by the path-like mapping fields (see
-/// [`super::hostfs::env_string`]); unset variables are errors, so typos
-/// don't silently produce bogus paths.
+/// [`super::hostfs::env_string`]), the `env` values (see
+/// [`super::env::EnvConfig::expand_values`]) and the `cwd`/audit-log
+/// fields (see [`Spec::expand_cwd`]); unset variables are errors, so
+/// typos don't silently produce bogus paths.
 pub(crate) fn expand_str(s: &str) -> Result<String, String> {
     shellexpand::env(s)
         .map(Cow::into_owned)
