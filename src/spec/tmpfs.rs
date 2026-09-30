@@ -13,58 +13,33 @@ use serde::Deserialize;
 pub struct TmpfsPerms(pub u32);
 
 impl schemars::JsonSchema for TmpfsPerms {
-    fn schema_name() -> String {
-        "TmpfsPerms".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TmpfsPerms".into()
     }
 
-    fn is_referenceable() -> bool {
+    fn inline_schema() -> bool {
         // Inline the oneOf; the type has no name in the JSON format.
-        false
+        true
     }
 
-    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::SingleOrVec;
-        use schemars::schema::{
-            InstanceType, Metadata, NumberValidation, Schema, SchemaObject, StringValidation,
-            SubschemaValidation,
-        };
-        Schema::Object(SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some(
-                    "An octal permission mode like bwrap's `--perms`: a JSON number (`755`) or \
-                     string (`\"0755\"`), both interpreted as *octal*."
-                        .to_string(),
-                ),
-                ..Default::default()
-            })),
-            subschemas: Some(Box::new(SubschemaValidation {
-                one_of: Some(vec![
-                    // A bare number is a sequence of octal digits, like
-                    // bwrap's command line: 755 means 0o755.
-                    SchemaObject {
-                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Integer))),
-                        number: Some(Box::new(NumberValidation {
-                            minimum: Some(0.0),
-                            maximum: Some(0o7777 as f64),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    }
-                    .into(),
-                    // A string of (leading-zero-tolerant) octal digits.
-                    SchemaObject {
-                        instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-                        string: Some(Box::new(StringValidation {
-                            pattern: Some("^[0-7]{1,4}$".to_string()),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    }
-                    .into(),
-                ]),
-                ..Default::default()
-            })),
-            ..Default::default()
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "An octal permission mode like bwrap's `--perms`: a JSON number \
+                            (`755`) or string (\"0755\"), both interpreted as *octal*.",
+            "oneOf": [
+                // A bare number is a sequence of octal digits, like
+                // bwrap's command line: 755 means 0o755.
+                {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 0o7777 as i64,
+                },
+                // A string of (leading-zero-tolerant) octal digits.
+                {
+                    "type": "string",
+                    "pattern": "^[0-7]{1,4}$",
+                },
+            ],
         })
     }
 }

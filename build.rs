@@ -39,15 +39,12 @@ fn main() {
     println!("cargo:rerun-if-changed=src/spec/hostfs.rs");
     println!("cargo:rerun-if-changed=src/spec/seccomp.rs");
 
-    let mut schema = schemars::r#gen::SchemaSettings::draft07()
+    let mut schema = schemars::generate::SchemaSettings::draft07()
         .into_generator()
         .into_root_schema_for::<spec::Spec>();
     schema
-        .schema
-        .metadata
-        .as_mut()
-        .expect("root schema has metadata")
-        .title = Some("ai-bubble sandbox spec".to_string());
+        .ensure_object()
+        .insert("title".to_string(), "ai-bubble sandbox spec".into());
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set for build scripts");
     let path = std::path::Path::new(&out_dir).join("ai-bubble-schema.json");

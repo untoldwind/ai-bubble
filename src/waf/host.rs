@@ -249,8 +249,7 @@ fn valid_target(target: &str) -> bool {
 /// `tls-connect` handshakes (real root certificates, loaded once).
 struct Pki {
     /// The CA certificate (DER) and its signing key pair.
-    ca: rcgen::Certificate,
-    ca_key: rcgen::KeyPair,
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
     /// The rustls client config verifying real servers (native roots).
     client: Arc<ClientConfig>,
 }
@@ -278,8 +277,7 @@ fn pki() -> &'static Pki {
             rcgen::KeyUsagePurpose::CrlSign,
             rcgen::KeyUsagePurpose::DigitalSignature,
         ];
-        let ca = params
-            .self_signed(&ca_key)
+        let ca = rcgen::CertifiedIssuer::self_signed(params, ca_key)
             .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't create the waf CA: {e}")));
 
         let mut roots = RootCertStore::empty();
@@ -300,7 +298,6 @@ fn pki() -> &'static Pki {
         let client = builder.with_root_certificates(roots).with_no_client_auth();
         Pki {
             ca,
-            ca_key,
             client: Arc::new(client),
         }
     })
@@ -340,7 +337,7 @@ pub fn sign_leaf(name: &str) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let key = rcgen::KeyPair::generate()
         .map_err(|e| io::Error::other(format!("can't generate a leaf key: {e}")))?;
     let leaf = params
-        .signed_by(&key, &pki.ca, &pki.ca_key)
+        .signed_by(&key, &pki.ca)
         .map_err(|e| io::Error::other(format!("can't sign the leaf certificate: {e}")))?;
     Ok((leaf.der().to_vec(), key.serialize_der()))
 }

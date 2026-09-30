@@ -52,59 +52,25 @@ impl<'de> Deserialize<'de> for Globs {
 }
 
 impl schemars::JsonSchema for Globs {
-    fn schema_name() -> String {
-        "Globs".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Globs".into()
     }
 
-    fn is_referenceable() -> bool {
+    fn inline_schema() -> bool {
         // Inline the oneOf; the type has no name in the JSON format.
-        false
+        true
     }
 
-    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, Metadata, Schema, SchemaObject, SubschemaValidation};
-        Schema::Object(SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some(
-                    "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`), either as a \
-                     single string or as a list of them (a list behaves like separate mappings \
-                     in the listed order). The list may also be spelled `globs` instead of `glob`."
-                        .to_string(),
-                ),
-                ..Default::default()
-            })),
-            subschemas: Some(Box::new(SubschemaValidation {
-                one_of: Some(vec![
-                    SchemaObject {
-                        instance_type: Some(schemars::schema::SingleOrVec::Single(Box::new(
-                            InstanceType::String,
-                        ))),
-                        ..Default::default()
-                    }
-                    .into(),
-                    SchemaObject {
-                        instance_type: Some(schemars::schema::SingleOrVec::Single(Box::new(
-                            InstanceType::Array,
-                        ))),
-                        array: Some(Box::new(schemars::schema::ArrayValidation {
-                            items: Some(schemars::schema::SingleOrVec::Single(Box::new(
-                                SchemaObject {
-                                    instance_type: Some(schemars::schema::SingleOrVec::Single(
-                                        Box::new(InstanceType::String),
-                                    )),
-                                    ..Default::default()
-                                }
-                                .into(),
-                            ))),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    }
-                    .into(),
-                ]),
-                ..Default::default()
-            })),
-            ..Default::default()
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`), \
+                            either as a single string or as a list of them (a list behaves like \
+                            separate mappings in the listed order). The list may also be spelled \
+                            `globs` instead of `glob`.",
+            "oneOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } },
+            ],
         })
     }
 }
@@ -142,59 +108,25 @@ impl<'de> Deserialize<'de> for Paths {
 }
 
 impl schemars::JsonSchema for Paths {
-    fn schema_name() -> String {
-        "Paths".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Paths".into()
     }
 
-    fn is_referenceable() -> bool {
+    fn inline_schema() -> bool {
         // Inline the oneOf; the type has no name in the JSON format.
-        false
+        true
     }
 
-    fn json_schema(_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, Metadata, Schema, SchemaObject, SubschemaValidation};
-        Schema::Object(SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some(
-                    "An absolute path, named exactly (no wildcards), either as a single string \
-                     or as a list of them (a list behaves like separate mappings in the listed \
-                     order). The list may also be spelled `paths` instead of `path`."
-                        .to_string(),
-                ),
-                ..Default::default()
-            })),
-            subschemas: Some(Box::new(SubschemaValidation {
-                one_of: Some(vec![
-                    SchemaObject {
-                        instance_type: Some(schemars::schema::SingleOrVec::Single(Box::new(
-                            InstanceType::String,
-                        ))),
-                        ..Default::default()
-                    }
-                    .into(),
-                    SchemaObject {
-                        instance_type: Some(schemars::schema::SingleOrVec::Single(Box::new(
-                            InstanceType::Array,
-                        ))),
-                        array: Some(Box::new(schemars::schema::ArrayValidation {
-                            items: Some(schemars::schema::SingleOrVec::Single(Box::new(
-                                SchemaObject {
-                                    instance_type: Some(schemars::schema::SingleOrVec::Single(
-                                        Box::new(InstanceType::String),
-                                    )),
-                                    ..Default::default()
-                                }
-                                .into(),
-                            ))),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    }
-                    .into(),
-                ]),
-                ..Default::default()
-            })),
-            ..Default::default()
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "An absolute path, named exactly (no wildcards), either as a single \
+                            string or as a list of them (a list behaves like separate mappings \
+                            in the listed order). The list may also be spelled `paths` instead \
+                            of `path`.",
+            "oneOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } },
+            ],
         })
     }
 }
