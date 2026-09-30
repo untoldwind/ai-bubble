@@ -547,7 +547,7 @@ QUOTED="quoted file value"
     }
 
     #[test]
-    fn unset_env_vars_are_an_error_and_literals_pass_through() {
+    fn unset_env_vars_are_an_error_and_refs_expand() {
         use crate::spec::file::expand_str;
         // An unset variable is an error, so typos don't silently produce
         // bogus paths.
@@ -559,11 +559,10 @@ QUOTED="quoted file value"
             expand_str("${RS_BUBBLE_TEST_VAR}/${RS_BUBBLE_TEST_VAR}").unwrap(),
             "v/v"
         );
+        // The bare $VAR form expands, too — shell semantics now.
+        unsafe { std::env::set_var("RS_BUBBLE_TEST_VAR", "v") };
+        assert_eq!(expand_str("$RS_BUBBLE_TEST_VAR/x").unwrap(), "v/x");
         unsafe { std::env::remove_var("RS_BUBBLE_TEST_VAR") };
-        // Only the ${VAR} form is recognized: a bare $ stays untouched,
-        // as does an unterminated ${.
-        assert_eq!(expand_str("$HOME/x").unwrap(), "$HOME/x");
-        assert_eq!(expand_str("/a${b").unwrap(), "/a${b");
     }
 
     #[test]

@@ -53,11 +53,12 @@
 //!
 //! Environment variables: the path-like fields of the hostfs mappings
 //! (`glob`, `path`, `src`, `dest`, `source`) may reference environment
-//! variables as `${VAR}` (e.g. `"glob": "${HOME}/project"`). Expansion
-//! happens per field, while the spec is deserialized (see
-//! [`super::hostfs::env_string`]) — so everything downstream only ever
-//! sees the fully expanded text. Other fields (e.g. `net.allow`) are
-//! never expanded. Referencing an unset variable is an error.
+//! variables as `${VAR}` or `$VAR` (e.g. `"glob": "${HOME}/project"`),
+//! expanded with [`shellexpand`]. Expansion happens per field, while the
+//! spec is deserialized (see [`super::hostfs::env_string`]) — so
+//! everything downstream only ever sees the fully expanded text. Other
+//! fields (e.g. `net.allow`) are never expanded. Referencing an unset
+//! variable is an error.
 //!
 //! The environment: the sandboxed command does *not* inherit the host's
 //! environment — like the filesystem, the environment is isolated, and
@@ -84,6 +85,7 @@
 //! exceptions back out. `on_violation` selects between `EPERM` (default)
 //! and `SIGSYS` for denied syscalls.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -278,41 +280,18 @@ fn cwd_string<'de, D: serde::Deserializer<'de>>(
     Ok(Some(expanded))
 }
 
-/// Expand the `${VAR}` references in one string. Only the `${VAR}` form
-/// is recognized (not bare `$VAR`), so a literal `$` stays untouched.
-/// Used by the path-like mapping fields (see
-/// [`super::hostfs::env_string`]); unset variables (and empty or
-/// unterminated references) are errors, so typos don't silently produce
-/// bogus paths.
+/// Expand the `${VAR}` references in one string with
+/// [`shellexpand`]: both the `${VAR}` and the bare `$VAR` forms are
+/// recognized, as in a shell. Used by the path-like mapping fields (see
+/// [`super::hostfs::env_string`]); unset variables are errors, so typos
+/// don't silently produce bogus paths.
 pub(crate) fn expand_str(s: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end) => {
-                let name = &after[..end];
-                if name.is_empty() {
-                    return Err("empty environment-variable reference \"${}\"".to_string());
-                }
-                match std::env::var(name) {
-                    Ok(value) => out.push_str(&value),
-                    Err(_) => {
-                        return Err(format!(
-                            "environment variable {name:?} referenced as {s:?} is not set"
-                        ));
-                    }
-                }
-                rest = &after[end + 1..];
-            }
-            None => {
-                // No closing brace: leave the rest as it is.
-                out.push_str(&rest[start..]);
-                rest = "";
-            }
-        }
-    }
-    out.push_str(rest);
-    Ok(out)
+    shellexpand::env(s)
+        .map(Cow::into_owned)
+        .map_err(|e| {
+            format!(
+                "environment variable {:?} referenced as {s:?} is not set",
+                e.var_name
+            )
+        })
 }
