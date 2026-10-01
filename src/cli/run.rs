@@ -75,7 +75,7 @@ pub fn run(spec_dir: Option<&Path>, die_with_parent: bool, mut command: Vec<Stri
     // mounted on top of it. Only when the spec actually exposes
     // something: a sandbox without any hostfs mappings must not
     // depend on (or fail for the lack of) FUSE.
-    if !sandbox_config.patterns.is_empty() {
+    if sandbox_config.patterns.has_patterns() {
         hostfs::set_root_mode(true);
         if let Some(root) = &session_cache {
             hostfs::set_session_cache_root(root);

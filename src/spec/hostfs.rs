@@ -1153,7 +1153,7 @@ mod tests {
                 ("/tmp".to_string(), Permission::Empty)
             ])
         );
-        assert!(parse("{}").hostfs.patterns().is_empty());
+        assert!(!parse("{}").hostfs.patterns().has_patterns());
     }
 
     #[test]

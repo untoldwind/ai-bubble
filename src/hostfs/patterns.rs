@@ -122,8 +122,9 @@ impl Patterns {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.patterns.is_empty()
+    /// Whether the pattern list is non-empty (at least one hostfs mapping).
+    pub fn has_patterns(&self) -> bool {
+        !self.patterns.is_empty()
     }
 
     /// Whether any pattern grants write access: the FUSE mount is mounted
@@ -174,7 +175,7 @@ impl Patterns {
             return None;
         }
         // A hidden path is never visible — the mirror enforces this
-        // unconditionally (`HostFs::hidden` checks every `hide` pattern,
+        // unconditionally (`Patterns::hidden` checks every `hide` pattern,
         // naming the path itself or a strict ancestor, before any direct
         // permission), so the last-match rule below only applies among
         // the non-`hide` patterns.
@@ -193,6 +194,101 @@ impl Patterns {
         path.ancestors()
             .skip(1)
             .find_map(|a| direct(a).filter(|p| p.is_mirrored()))
+    }
+
+    /// Whether the mirrored path is matched with the `empty` permission (by
+    /// the last pattern naming it): it is exposed empty — as an empty
+    /// directory when it is (or would be) a directory, an empty file when
+    /// it matches a real file.
+    pub fn is_empty(&self, mirrored: &Path) -> bool {
+        matches!(self.permission_of(mirrored), Some(Permission::Empty))
+    }
+
+    /// The in-memory content of the mirrored path when it is matched with
+    /// the `inject` permission (by the last pattern naming it): the path
+    /// is a purely virtual file served from the mirror's memory, with no
+    /// host counterpart at all. Borrowed: this is consulted on every
+    /// operation touching the path.
+    pub fn is_inject(&self, mirrored: &Path) -> Option<&str> {
+        match self.permission_of(mirrored) {
+            Some(Permission::Inject { content }) => Some(content.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether the mirrored path lies strictly *below* an empty path (so it is
+    /// shadowed by the empty path's precedence and never visible).
+    pub fn under_empty(&self, mirrored: &Path) -> bool {
+        mirrored.ancestors().skip(1).any(|a| self.is_empty(a))
+    }
+
+    /// The spec-level permission governing the mirrored path: the shared
+    /// semantics of [`Patterns::permission_of`] — with one deliberate
+    /// fail-closed exception: a path with a non-UTF-8 component can never
+    /// match a pattern, so its permission could never be derived from the
+    /// spec — a hidden name spelled with invalid UTF-8 bytes must not
+    /// become visible or writable (or creatable) through the mirror.
+    fn effective(&self, mirrored: &Path) -> Option<&Permission> {
+        if Pattern::has_non_utf8_component(mirrored) {
+            return None;
+        }
+        self.permission_of(mirrored)
+    }
+
+    /// Whether a mirrored path matches one of the patterns directly (as a file,
+    /// symlink, or a directory named by the pattern itself), with the
+    /// **last** matching pattern mirroring it. Empty paths and everything
+    /// below them take precedence over the mirror.
+    pub fn matches(&self, mirrored: &Path) -> bool {
+        matches!(self.effective(mirrored), Some(p) if p.is_mirrored())
+    }
+
+    /// The spec-level permission that governs **writing** to the mirrored path
+    /// (modifying its content or metadata, creating or deleting it): the
+    /// last pattern naming the path itself decides, or — when no pattern
+    /// names it directly — the permission of the *nearest* mirrored
+    /// ancestor (an exactly-named or `**`-covered directory is a recursive
+    /// mirror, so its permission governs everything below it). Empty paths
+    /// and hidden paths are never writable.
+    ///
+    /// The result is only the *spec* side: the real host filesystem may
+    /// still deny the operation (the server acts with the real host
+    /// credentials, so the underlying file or directory permissions apply).
+    pub fn write_permission(&self, mirrored: &Path) -> Option<&Permission> {
+        match self.effective(mirrored) {
+            Some(p) if p.is_mirrored() => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Whether writes to the mirrored path are allowed: the spec must say `rw`.
+    /// (Whether the *real* file or directory actually allows it is decided
+    /// by the host filesystem when the operation is performed.)
+    pub fn writable(&self, mirrored: &Path) -> bool {
+        self.write_permission(mirrored)
+            .is_some_and(|p| p.is_writable())
+    }
+
+    /// Whether the mirrored path exists at all: it either is mirrored
+    /// by the last matching pattern itself, is empty (an empty dir or
+    /// empty file), is an ancestor of something that is (so the tree under
+    /// `/host` stays navigable down to the matched leaves), or is an
+    /// ancestor leading to an empty path — and nothing hides it directly
+    /// or via an ancestor.
+    pub fn exists(&self, mirrored: &Path) -> bool {
+        if self.under_empty(mirrored) {
+            return false;
+        }
+        if self.is_empty(mirrored) {
+            return true;
+        }
+        if self.is_inject(mirrored).is_some() {
+            return true;
+        }
+        if self.hidden(mirrored) {
+            return false;
+        }
+        self.matches(mirrored) || self.dir_prefix(mirrored) || self.is_empty_prefix(mirrored)
     }
 
     /// Whether the path is hidden because a pattern hides it directly, or
@@ -691,5 +787,174 @@ mod tests {
         assert!(patterns.subtree_restricted(Path::new("/project/src")));
         assert!(patterns.subtree_restricted(Path::new("/project")));
         assert!(!patterns.subtree_restricted(Path::new("/other")));
+    }
+
+    #[test]
+    fn pattern_matching_per_operation() {
+        let patterns = ps(&[
+            ("/etc/*.conf", Permission::Ro),
+            ("/home/me/project", Permission::Ro),
+        ]);
+
+        // Direct matches.
+        assert!(patterns.matches(Path::new("/etc/foo.conf")));
+        assert!(patterns.matches(Path::new("/home/me/project")));
+        assert!(!patterns.matches(Path::new("/etc/passwd")));
+
+        // exists: matches plus ancestor directories.
+        assert!(patterns.exists(Path::new("/etc/foo.conf")));
+        assert!(patterns.exists(Path::new("/etc"))); // ancestor of a match
+        assert!(patterns.exists(Path::new("/"))); // root
+        assert!(patterns.exists(Path::new("/home/me/project")));
+        assert!(!patterns.exists(Path::new("/etc/passwd")));
+        assert!(!patterns.exists(Path::new("/etc/nothing")));
+
+        // dir_prefix: only true for ancestors of matches — an exactly
+        // matched path (file or recursively mirrored directory) is not a
+        // prefix itself.
+        assert!(patterns.dir_prefix(Path::new("/etc")));
+        assert!(patterns.dir_prefix(Path::new("/home")));
+        assert!(patterns.dir_prefix(Path::new("/home/me")));
+        assert!(!patterns.dir_prefix(Path::new("/home/me/project")));
+        assert!(!patterns.dir_prefix(Path::new("/etc/passwd")));
+        assert!(!patterns.dir_prefix(Path::new("/etc/foo.conf")));
+    }
+
+    #[test]
+    fn double_star_spans_directories() {
+        let patterns = ps(&[("/usr/share/**/*.rs", Permission::Ro)]);
+        assert!(patterns.exists(Path::new("/usr/share")));
+        assert!(patterns.dir_prefix(Path::new("/usr/share/doc")));
+        assert!(patterns.matches(Path::new("/usr/share/doc/x/y.rs")));
+        assert!(!patterns.matches(Path::new("/usr/share/doc/x/y.c")));
+    }
+
+    #[test]
+    fn last_matching_pattern_wins() {
+        // The later hide hides the file inside the mirrored tree...
+        let patterns = ps(&[("/etc", Permission::Ro), ("/etc/passwd", Permission::Hide)]);
+        assert!(patterns.exists(Path::new("/etc")));
+        assert!(!patterns.exists(Path::new("/etc/passwd")));
+        assert!(!patterns.matches(Path::new("/etc/passwd")));
+        // ...and the reverse order shows *other* files under /etc again:
+        // the last pattern that names a path decides. "/etc/passwd" is
+        // still hidden (its own hide pattern is the only one naming it),
+        // but a sibling is visible via the later recursive mirror.
+        let patterns = ps(&[("/etc/passwd", Permission::Hide), ("/etc", Permission::Ro)]);
+        assert!(!patterns.exists(Path::new("/etc/passwd")));
+        assert!(patterns.exists(Path::new("/etc/hosts")));
+    }
+
+    #[test]
+    fn hidden_patterns_do_not_make_paths_navigable() {
+        // Only a hide pattern: nothing appears, not even ancestor dirs.
+        let patterns = ps(&[("/etc/passwd", Permission::Hide)]);
+        assert!(!patterns.exists(Path::new("/")));
+        assert!(!patterns.exists(Path::new("/etc")));
+    }
+
+    #[test]
+    fn write_permission_follows_the_last_pattern() {
+        let patterns = ps(&[("/etc", Permission::Ro), ("/etc/passwd", Permission::Rw)]);
+        assert!(matches!(
+            patterns.write_permission(Path::new("/etc")),
+            Some(Permission::Ro)
+        ));
+        assert!(matches!(
+            patterns.write_permission(Path::new("/etc/passwd")),
+            Some(Permission::Rw)
+        ));
+        assert!(!patterns.writable(Path::new("/etc")));
+        assert!(patterns.writable(Path::new("/etc/passwd")));
+        // The root is never writable.
+        assert!(!patterns.writable(Path::new("/")));
+    }
+
+    #[test]
+    fn rw_directories_are_recursively_writable() {
+        let patterns = ps(&[("/proj", Permission::Rw), ("/proj/secret", Permission::Ro)]);
+        // Children of an exactly-named rw dir inherit its permission.
+        assert!(patterns.writable(Path::new("/proj/newfile")));
+        assert!(patterns.writable(Path::new("/proj/sub/x")));
+        // The nearest mirrored ancestor decides: `ro` wins below /secret.
+        assert!(!patterns.writable(Path::new("/proj/secret")));
+        assert!(!patterns.writable(Path::new("/proj/secret/x")));
+    }
+
+    #[test]
+    fn wildcard_rw_patterns_allow_creating_matching_children() {
+        let patterns = ps(&[("/out/*.txt", Permission::Rw)]);
+        assert!(patterns.writable(Path::new("/out/a.txt")));
+        assert!(!patterns.writable(Path::new("/out/a.conf")));
+        // The parent dir itself is only a wildcard ancestor, not writable.
+        assert!(!patterns.writable(Path::new("/out")));
+    }
+
+    #[test]
+    fn star_star_rw_covers_everything_below() {
+        let patterns = ps(&[("/work/**", Permission::Rw)]);
+        assert!(patterns.writable(Path::new("/work")));
+        assert!(patterns.writable(Path::new("/work/a/b/c")));
+    }
+
+    #[test]
+    fn hide_and_empty_block_writes() {
+        let patterns = ps(&[
+            ("/a", Permission::Rw),
+            ("/a/h", Permission::Hide),
+            ("/a/e", Permission::Empty),
+        ]);
+        assert!(!patterns.writable(Path::new("/a/h/x")));
+        assert!(!patterns.writable(Path::new("/a/e")));
+        assert!(!patterns.writable(Path::new("/a/e/x")));
+    }
+
+    #[test]
+    fn redirect_rw_is_writable_and_ro_is_not() {
+        let ro = ps(&[(
+            "/a",
+            Permission::Redirect {
+                source: PathBuf::from("/x"),
+                writable: false,
+            },
+        )]);
+        let rw = ps(&[(
+            "/a",
+            Permission::Redirect {
+                source: PathBuf::from("/x"),
+                writable: true,
+            },
+        )]);
+        assert!(!ro.writable(Path::new("/a/f")));
+        assert!(!ro.any_writable());
+        assert!(rw.writable(Path::new("/a/f")));
+        assert!(rw.any_writable());
+    }
+
+    #[test]
+    fn writable_patterns_are_detected_for_the_mount_options() {
+        assert!(!ps(&[("/etc", Permission::Ro)]).any_writable());
+        assert!(ps(&[("/etc", Permission::Ro), ("/tmp/x", Permission::Rw),]).any_writable());
+        let empty = ps(&[]);
+        assert!(!empty.any_writable());
+        assert!(!empty.has_patterns());
+    }
+
+    #[test]
+    fn non_utf8_components_fail_closed_for_writes() {
+        use std::os::unix::ffi::OsStrExt;
+        // A non-UTF-8 component can never match a pattern, so its write
+        // permission could never be derived from the spec: deny even
+        // under a `**`-covered `rw` mirror that would allow a UTF-8 name.
+        let patterns = ps(&[
+            ("/work/**", Permission::Rw),
+            ("/work/*secret*", Permission::Hide),
+        ]);
+        assert!(patterns.writable(Path::new("/work/plain")));
+        let weird = Path::new("/work").join(std::ffi::OsStr::from_bytes(b"\xffsecret\xff"));
+        assert!(!patterns.writable(&weird));
+        assert!(!patterns.exists(&weird));
+        // The UTF-8 spelling of the same name stays hidden.
+        assert!(!patterns.writable(Path::new("/work/secret")));
     }
 }

@@ -465,7 +465,7 @@ fn no_spec_dir_no_hide() {
     std::env::set_current_dir(saved).unwrap();
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(spec, Spec::default());
-    assert!(spec.hostfs.patterns().is_empty());
+    assert!(!spec.hostfs.patterns().has_patterns());
 }
 
 #[test]

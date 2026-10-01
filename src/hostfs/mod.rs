@@ -94,8 +94,7 @@ pub(crate) mod patterns;
 mod perf;
 
 use inodes::InodeMap;
-use pattern::Pattern;
-use patterns::{Patterns, Permission};
+use patterns::Patterns;
 
 /// Log a failed FUSE op with the mirrored and the real host path (debug
 /// helper, only active with `RS_BUBBLE_FUSE_LOG` set) and turn it into an
@@ -133,12 +132,6 @@ async fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
         Some(real.to_string_lossy().into_owned()),
     )
     .await;
-}
-
-/// Whether any pattern grants write access: the FUSE mount is mounted
-/// read-only unless it does.
-fn has_writable_patterns(patterns: &Patterns) -> bool {
-    patterns.any_writable()
 }
 
 /// The sandbox-absolute path the host filesystem is mounted at.
@@ -250,7 +243,7 @@ const TTL: Duration = Duration::from_secs(1);
 /// or one below a hidden directory — is not visible at all. Ancestors of
 /// visible matches stay navigable as long as no hidden pattern stands
 /// between them and the matches below. Writes additionally require the
-/// `rw` permission (see [`HostFs::write_permission`]).
+/// `rw` permission (see [`Patterns::write_permission`]).
 struct HostFs {
     uid: u32,
     gid: u32,
@@ -376,35 +369,6 @@ impl HostFs {
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))
     }
 
-    /// Whether the mirrored path is matched with the `empty` permission (by
-    /// the last pattern naming it): it is exposed empty — as an empty
-    /// directory when it is (or would be) a directory, an empty file when
-    /// it matches a real file.
-    fn is_empty(&self, mirrored: &Path) -> bool {
-        matches!(
-            self.patterns.permission_of(mirrored),
-            Some(Permission::Empty)
-        )
-    }
-
-    /// The in-memory content of the mirrored path when it is matched with
-    /// the `inject` permission (by the last pattern naming it): the path
-    /// is a purely virtual file served from the mirror's memory, with no
-    /// host counterpart at all. Borrowed: this is consulted on every
-    /// operation touching the path.
-    fn is_inject(&self, mirrored: &Path) -> Option<&str> {
-        match self.patterns.permission_of(mirrored) {
-            Some(Permission::Inject { content }) => Some(content.as_str()),
-            _ => None,
-        }
-    }
-
-    /// Whether the mirrored path lies strictly *below* an empty path (so it is
-    /// shadowed by the empty path's precedence and never visible).
-    fn under_empty(&self, mirrored: &Path) -> bool {
-        mirrored.ancestors().skip(1).any(|a| self.is_empty(a))
-    }
-
     /// Whether the path is purely virtual, so its access is answered
     /// directly instead of by the real filesystem: empty paths, injected
     /// paths, and purely virtual ancestors of empty or injected paths
@@ -412,83 +376,12 @@ impl HostFs {
     /// directories (mode 0555) — or injected files — that are never
     /// writable. Async: it stats the real host filesystem.
     async fn virtual_only(&self, mirrored: &Path) -> bool {
-        self.is_empty(mirrored)
-            || self.is_inject(mirrored).is_some()
+        self.patterns.is_empty(mirrored)
+            || self.patterns.is_inject(mirrored).is_some()
             || (self.patterns.is_empty_prefix(mirrored) || self.patterns.is_inject_prefix(mirrored))
                 && tokio_fs::symlink_metadata(self.patterns.redirect(mirrored))
                     .await
                     .is_err()
-    }
-
-    /// The spec-level permission governing the mirrored path: the shared
-    /// semantics of [`Patterns::permission_of`] — with one deliberate
-    /// fail-closed exception: a path with a non-UTF-8 component can never
-    /// match a pattern, so its permission could never be derived from the
-    /// spec — a hidden name spelled with invalid UTF-8 bytes must not
-    /// become visible or writable (or creatable) through the mirror.
-    fn effective(&self, mirrored: &Path) -> Option<&Permission> {
-        if Pattern::has_non_utf8_component(mirrored) {
-            return None;
-        }
-        self.patterns.permission_of(mirrored)
-    }
-
-    /// Whether a mirrored path matches one of the patterns directly (as a file,
-    /// symlink, or a directory named by the pattern itself), with the
-    /// **last** matching pattern mirroring it. Empty paths and everything
-    /// below them take precedence over the mirror.
-    fn matches(&self, mirrored: &Path) -> bool {
-        matches!(self.effective(mirrored), Some(p) if p.is_mirrored())
-    }
-
-    /// The spec-level permission that governs **writing** to the mirrored path
-    /// (modifying its content or metadata, creating or deleting it): the
-    /// last pattern naming the path itself decides, or — when no pattern
-    /// names it directly — the permission of the *nearest* mirrored
-    /// ancestor (an exactly-named or `**`-covered directory is a recursive
-    /// mirror, so its permission governs everything below it). Empty paths
-    /// and hidden paths are never writable.
-    ///
-    /// The result is only the *spec* side: the real host filesystem may
-    /// still deny the operation (the server acts with the real host
-    /// credentials, so the underlying file or directory permissions apply).
-    fn write_permission(&self, mirrored: &Path) -> Option<&Permission> {
-        match self.effective(mirrored) {
-            Some(p) if p.is_mirrored() => Some(p),
-            _ => None,
-        }
-    }
-
-    /// Whether writes to the mirrored path are allowed: the spec must say `rw`.
-    /// (Whether the *real* file or directory actually allows it is decided
-    /// by the host filesystem when the operation is performed.)
-    fn writable(&self, mirrored: &Path) -> bool {
-        self.write_permission(mirrored)
-            .is_some_and(|p| p.is_writable())
-    }
-
-    /// Whether the mirrored path exists at all: it either is mirrored
-    /// by the last matching pattern itself, is empty (an empty dir or
-    /// empty file), is an ancestor of something that is (so the tree under
-    /// `/host` stays navigable down to the matched leaves), or is an
-    /// ancestor leading to an empty path — and nothing hides it directly
-    /// or via an ancestor.
-    fn exists(&self, mirrored: &Path) -> bool {
-        if self.under_empty(mirrored) {
-            return false;
-        }
-        if self.is_empty(mirrored) {
-            return true;
-        }
-        if self.is_inject(mirrored).is_some() {
-            return true;
-        }
-        if self.patterns.hidden(mirrored) {
-            return false;
-        }
-        self.matches(mirrored)
-            || self.patterns.dir_prefix(mirrored)
-            || self.patterns.is_empty_prefix(mirrored)
     }
 
     /// The attributes of an empty path (or a purely virtual ancestor of
@@ -558,14 +451,14 @@ impl HostFs {
     async fn attr(&self, mirrored: &Path) -> std::io::Result<FileAttr> {
         // Injected paths take precedence over everything: they are purely
         // virtual files served from memory.
-        if let Some(content) = self.is_inject(mirrored) {
+        if let Some(content) = self.patterns.is_inject(mirrored) {
             return Ok(self.inject_file_attr(content.as_bytes()));
         }
         // Empty paths take precedence: they appear even when the real host
         // path exists (with different attributes) — as an empty directory
         // when the path is (or would be) a directory, as an empty file
         // when it matches a real file.
-        if self.is_empty(mirrored) {
+        if self.patterns.is_empty(mirrored) {
             return match tokio_fs::symlink_metadata(mirrored).await {
                 Ok(md) if !md.is_dir() => Ok(Self::empty_file_attr(&md)),
                 _ => Ok(self.empty_dir_attr()),
@@ -598,7 +491,7 @@ impl HostFs {
     /// path, or a purely virtual ancestor of an empty path. Async: it
     /// stats the real host filesystem (`tokio::fs`).
     async fn is_listable_dir(&self, mirrored: &Path) -> bool {
-        if self.is_empty(mirrored)
+        if self.patterns.is_empty(mirrored)
             || self.patterns.is_empty_prefix(mirrored)
             || self.patterns.is_inject_prefix(mirrored)
         {
@@ -622,7 +515,7 @@ impl HostFs {
         // A directory named by a mirrored pattern itself is a recursive
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
-        let unfiltered = self.matches(mirrored);
+        let unfiltered = self.patterns.matches(mirrored);
         let mut names: Vec<std::ffi::OsString> =
             if self.is_host_dir(&self.patterns.redirect(mirrored)).await {
                 match tokio_fs::read_dir(self.patterns.redirect(mirrored)).await {
@@ -643,10 +536,10 @@ impl HostFs {
                             // visible, not even a mirror match. Denied entries (and
                             // everything below a hidden directory) are hidden even
                             // inside a recursively mirrored directory.
-                            if self.under_empty(&child) || self.patterns.hidden(&child) {
+                            if self.patterns.under_empty(&child) || self.patterns.hidden(&child) {
                                 continue;
                             }
-                            if unfiltered || self.exists(&child) {
+                            if unfiltered || self.patterns.exists(&child) {
                                 names.push(name);
                             }
                         }
@@ -667,7 +560,9 @@ impl HostFs {
         // visible entries.
         for (name, permission) in self.patterns.virtual_children(mirrored) {
             let child = mirrored.join(&name);
-            if names.iter().any(|n| n.as_os_str() == OsStr::new(&name)) || !self.exists(&child) {
+            if names.iter().any(|n| n.as_os_str() == OsStr::new(&name))
+                || !self.patterns.exists(&child)
+            {
                 continue;
             }
             // A redirected entry is only listed when the redirect target
@@ -811,7 +706,7 @@ impl Filesystem for HostFs {
             }
         };
         let mirrored = parent_path.join(name);
-        if self.exists(&mirrored) {
+        if self.patterns.exists(&mirrored) {
             match self.attr(&mirrored).await {
                 Ok(mut attr) => {
                     let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
@@ -871,7 +766,7 @@ impl Filesystem for HostFs {
             attr.ino = inode;
             return Ok(ReplyAttr { ttl: TTL, attr });
         }
-        if self.exists(&mirrored) {
+        if self.patterns.exists(&mirrored) {
             match self.attr(&mirrored).await {
                 Ok(mut attr) => {
                     attr.ino = inode;
@@ -902,7 +797,7 @@ impl Filesystem for HostFs {
     async fn readlink(&self, _req: Request, inode: Inode) -> Result<ReplyData> {
         perf::fuse_op!("readlink");
         let mirrored = self.resolve(inode).await?;
-        if !self.exists(&mirrored) {
+        if !self.patterns.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
         let target = tokio_fs::read_link(self.patterns.redirect(&mirrored)).await?;
@@ -916,7 +811,7 @@ impl Filesystem for HostFs {
         let mirrored = self.resolve(inode).await?;
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
-        if !self.exists(&mirrored) {
+        if !self.patterns.exists(&mirrored) {
             log_op_err(
                 "open",
                 &mirrored,
@@ -928,7 +823,7 @@ impl Filesystem for HostFs {
         }
         // An injected path is a purely virtual file: served from memory,
         // never writable, the host is not consulted at all.
-        if let Some(_content) = self.is_inject(&mirrored) {
+        if let Some(_content) = self.patterns.is_inject(&mirrored) {
             let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
             if write_flags {
                 log_op_err(
@@ -992,7 +887,7 @@ impl Filesystem for HostFs {
             return Err(libc::EISDIR.into());
         }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
-        if write_flags && !self.writable(&mirrored) {
+        if write_flags && !self.patterns.writable(&mirrored) {
             // `ro` paths (and anything below an empty or hidden pattern) are
             // never writable; the real file permissions are checked by the
             // host filesystem on the actual write.
@@ -1042,7 +937,7 @@ impl Filesystem for HostFs {
         // Stateful IO: the opened host file is reused for every read/write
         // on this handle (released with it in `release`).
         self.inodes.write().await.open_handle(inode);
-        let writable = self.writable(&mirrored);
+        let writable = self.patterns.writable(&mirrored);
         let fh = self.insert_handle(file, mirrored, append, writable);
         Ok(ReplyOpen { fh, flags: 0 })
     }
@@ -1098,7 +993,7 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
-        if !self.exists(&mirrored) {
+        if !self.patterns.exists(&mirrored) {
             log_op_err(
                 "read",
                 &mirrored,
@@ -1110,7 +1005,7 @@ impl Filesystem for HostFs {
         }
         // An injected path is served from memory: slice the content at
         // the requested offset (nothing is read from the host).
-        if let Some(content) = self.is_inject(&mirrored) {
+        if let Some(content) = self.patterns.is_inject(&mirrored) {
             let bytes = content.as_bytes();
             let offset = offset.min(bytes.len() as u64) as usize;
             let end = (offset + size as usize).min(bytes.len());
@@ -1118,7 +1013,7 @@ impl Filesystem for HostFs {
         }
         // An empty path has no content: an empty file reads as empty (the
         // host file is never opened).
-        if self.is_empty(&mirrored) {
+        if self.patterns.is_empty(&mirrored) {
             return Ok(ReplyData::from(Bytes::new()));
         }
         // Stateless IO fallback: reopen the host file — never following
@@ -1201,9 +1096,9 @@ impl Filesystem for HostFs {
         // verdict matters here.
         let writable = match &handle {
             Some(h) => h.writable,
-            None => self.writable(&mirrored),
+            None => self.patterns.writable(&mirrored),
         };
-        if handle.is_none() && !self.exists(&mirrored) {
+        if handle.is_none() && !self.patterns.exists(&mirrored) {
             log_op_err(
                 "write",
                 &mirrored,
@@ -1318,7 +1213,7 @@ impl Filesystem for HostFs {
         // holds for a purely virtual ancestor of an injected (or empty)
         // path with no real counterpart: it is a virtual directory, and
         // there is nothing to open on the host.
-        if self.is_inject(&mirrored).is_some()
+        if self.patterns.is_inject(&mirrored).is_some()
             || (self.patterns.is_empty_prefix(&mirrored)
                 || self.patterns.is_inject_prefix(&mirrored))
                 && tokio_fs::symlink_metadata(self.patterns.redirect(&mirrored))
@@ -1375,7 +1270,7 @@ impl Filesystem for HostFs {
     async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
         perf::fuse_op!("opendir");
         let mirrored = self.resolve(inode).await?;
-        if !self.exists(&mirrored)
+        if !self.patterns.exists(&mirrored)
             || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored).await
         {
             return Err(libc::ENOENT.into());
@@ -1394,7 +1289,7 @@ impl Filesystem for HostFs {
     {
         perf::fuse_op!("readdir");
         let mirrored = self.resolve(parent).await?;
-        if !self.exists(&mirrored)
+        if !self.patterns.exists(&mirrored)
             || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored).await
         {
             return Err(libc::ENOENT.into());
@@ -1447,7 +1342,7 @@ impl Filesystem for HostFs {
     > {
         perf::fuse_op!("readdirplus");
         let mirrored = self.resolve(parent).await?;
-        if !self.exists(&mirrored)
+        if !self.patterns.exists(&mirrored)
             || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored).await
         {
             return Err(libc::ENOENT.into());
@@ -1501,7 +1396,7 @@ impl Filesystem for HostFs {
     async fn access(&self, _req: Request, inode: Inode, mask: u32) -> Result<()> {
         perf::fuse_op!("access");
         let mirrored = self.resolve(inode).await?;
-        if !self.exists(&mirrored) {
+        if !self.patterns.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
         // Empty paths (and purely virtual ancestors) are unwritable by
@@ -1520,7 +1415,7 @@ impl Filesystem for HostFs {
         // W_OK is answered by the spec: only `rw` paths may be written (the
         // real file permissions are checked when a write is attempted).
         let non_write = mask & !(libc::W_OK as u32);
-        if mask & libc::W_OK as u32 != 0 && !self.writable(&mirrored) {
+        if mask & libc::W_OK as u32 != 0 && !self.patterns.writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
         // The rest (R_OK, X_OK) is decided by the real filesystem, with the
@@ -1562,14 +1457,14 @@ impl Filesystem for HostFs {
     ) -> Result<ReplyAttr> {
         perf::fuse_op!("setattr");
         let mirrored = self.resolve(inode).await?;
-        if self.is_empty(&mirrored) {
+        if self.patterns.is_empty(&mirrored) {
             // Empty paths are virtual: nothing to change.
             return Err(libc::EACCES.into());
         }
-        if !self.exists(&mirrored) {
+        if !self.patterns.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        if !self.writable(&mirrored) {
+        if !self.patterns.writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
         let real = self.patterns.redirect(&mirrored);
@@ -1641,7 +1536,7 @@ impl Filesystem for HostFs {
         perf::fuse_op!("mkdir");
         let parent_path = self.resolve(parent).await?;
         let mirrored = parent_path.join(name);
-        if !self.writable(&mirrored) {
+        if !self.patterns.writable(&mirrored) {
             log_op_err(
                 "mkdir",
                 &mirrored,
@@ -1701,11 +1596,11 @@ impl Filesystem for HostFs {
         perf::fuse_op!("unlink");
         let parent_path = self.resolve(parent).await?;
         let mirrored = parent_path.join(name);
-        if self.is_empty(&mirrored) {
+        if self.patterns.is_empty(&mirrored) {
             // Empty paths are virtual mount points; they cannot be removed.
             return Err(libc::EACCES.into());
         }
-        if !self.exists(&mirrored) {
+        if !self.patterns.exists(&mirrored) {
             log_op_err(
                 "unlink",
                 &mirrored,
@@ -1715,7 +1610,7 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::ENOENT.into());
         }
-        if !self.writable(&mirrored) {
+        if !self.patterns.writable(&mirrored) {
             log_op_err(
                 "unlink",
                 &mirrored,
@@ -1751,10 +1646,10 @@ impl Filesystem for HostFs {
         perf::fuse_op!("rmdir");
         let parent_path = self.resolve(parent).await?;
         let mirrored = parent_path.join(name);
-        if self.is_empty(&mirrored) {
+        if self.patterns.is_empty(&mirrored) {
             return Err(libc::EACCES.into());
         }
-        if !self.exists(&mirrored) {
+        if !self.patterns.exists(&mirrored) {
             log_op_err(
                 "rmdir",
                 &mirrored,
@@ -1764,7 +1659,7 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::ENOENT.into());
         }
-        if !self.writable(&mirrored) {
+        if !self.patterns.writable(&mirrored) {
             log_op_err(
                 "rmdir",
                 &mirrored,
@@ -1810,10 +1705,10 @@ impl Filesystem for HostFs {
         let new_parent_path = self.resolve(parent).await?;
         let old = origin_parent_path.join(origin_name);
         let new = new_parent_path.join(name);
-        if self.is_empty(&old) || self.is_empty(&new) {
+        if self.patterns.is_empty(&old) || self.patterns.is_empty(&new) {
             return Err(libc::EACCES.into());
         }
-        if !self.exists(&old) {
+        if !self.patterns.exists(&old) {
             log_op_err(
                 "rename",
                 &old,
@@ -1823,7 +1718,7 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::ENOENT.into());
         }
-        if !self.writable(&old) || !self.writable(&new) {
+        if !self.patterns.writable(&old) || !self.patterns.writable(&new) {
             log_op_err(
                 "rename",
                 &old,
@@ -1940,10 +1835,10 @@ impl Filesystem for HostFs {
         let new_parent_path = self.resolve(new_parent).await?;
         let old = source_path;
         let new = new_parent_path.join(new_name);
-        if self.is_empty(&old) || self.is_empty(&new) {
+        if self.patterns.is_empty(&old) || self.patterns.is_empty(&new) {
             return Err(libc::EACCES.into());
         }
-        if !self.exists(&old) {
+        if !self.patterns.exists(&old) {
             log_op_err(
                 "link",
                 &old,
@@ -1956,7 +1851,7 @@ impl Filesystem for HostFs {
         // The source must be writable, too: a read-only source must not be
         // linked into a writable path (the write would follow the host
         // inode and bypass the source path's `ro` permission).
-        if !self.writable(&old) {
+        if !self.patterns.writable(&old) {
             log_op_err(
                 "link",
                 &old,
@@ -1966,7 +1861,7 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        if !self.writable(&new) {
+        if !self.patterns.writable(&new) {
             log_op_err(
                 "link",
                 &new,
@@ -2004,7 +1899,7 @@ impl Filesystem for HostFs {
         perf::fuse_op!("create");
         let parent_path = self.resolve(parent).await?;
         let mirrored = parent_path.join(name);
-        let writable = self.writable(&mirrored);
+        let writable = self.patterns.writable(&mirrored);
         if !writable {
             log_op_err(
                 "create",
@@ -2319,18 +2214,12 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
         let server_mountpoint = mountpoint.clone();
         fuselog::event!("SERVER start mountpoint={}", mountpoint.display());
         runtime.block_on(async move {
-            let handle = match mount_with_fallback(
-                &mp,
-                uid,
-                gid,
-                &patterns,
-                !has_writable_patterns(&patterns),
-            )
-            .await
-            {
-                Ok(handle) => handle,
-                Err(e) => return Err(e),
-            };
+            let handle =
+                match mount_with_fallback(&mp, uid, gid, &patterns, !patterns.any_writable()).await
+                {
+                    Ok(handle) => handle,
+                    Err(e) => return Err(e),
+                };
 
             fuselog::event!("SERVER mounted");
 
