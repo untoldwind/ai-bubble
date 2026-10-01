@@ -16,9 +16,7 @@ fn fs_with_empties(entries: &[(&str, Permission)]) -> HostFs {
     fs(entries)
 }
 
-/// The async HostFs methods (`attr`, `dir_entries`, …) run their host
-/// syscalls via `tokio::fs` on the blocking pool; the synchronous tests
-/// await them on a throwaway current-thread runtime.
+#[allow(unused)]
 fn block<T>(fut: impl std::future::Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -34,13 +32,10 @@ fn empty_paths_are_virtual_unwritable_directories() {
     // The dir itself exists, with no write permission...
     assert!(f.patterns.exists(Path::new("/dev")));
     assert!(f.patterns.is_empty(Path::new("/dev")));
-    assert_eq!(block(f.attr(Path::new("/dev"))).unwrap().perm, 0o555);
-    assert_eq!(
-        block(f.attr(Path::new("/dev"))).unwrap().kind,
-        FileType::Directory
-    );
+    assert_eq!(f.attr(Path::new("/dev")).unwrap().perm, 0o555);
+    assert_eq!(f.attr(Path::new("/dev")).unwrap().kind, FileType::Directory);
     // ...and it is empty even though the real host /dev has entries.
-    assert!(block(f.dir_entries(Path::new("/dev"))).is_empty());
+    assert!(f.dir_entries(Path::new("/dev")).is_empty());
     // Deeper paths are shadowed by the precedence.
     assert!(!f.patterns.exists(Path::new("/dev/null")));
     assert!(!f.patterns.matches(Path::new("/dev/null")));
@@ -62,9 +57,10 @@ fn empty_paths_take_precedence_over_mirror() {
     assert!(f.patterns.is_empty(Path::new("/etc")));
     // Mirror contents below the empty dir are hidden.
     assert!(!f.patterns.exists(Path::new("/etc/passwd")));
-    assert!(block(f.dir_entries(Path::new("/etc"))).is_empty());
+    assert!(f.dir_entries(Path::new("/etc")).is_empty());
     // But /etc still appears at the root listing.
-    let names: Vec<_> = block(f.dir_entries(Path::new("/")))
+    let names: Vec<_> = f
+        .dir_entries(Path::new("/"))
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -85,7 +81,7 @@ fn injected_paths_are_virtual_read_only_files() {
     assert!(f.patterns.matches(Path::new("/etc/resolv.conf")));
 
     // Its attributes: a read-only regular file sized like the content.
-    let attr = block(f.attr(Path::new("/etc/resolv.conf"))).unwrap();
+    let attr = f.attr(Path::new("/etc/resolv.conf")).unwrap();
     assert_eq!(attr.kind, FileType::RegularFile);
     assert_eq!(attr.perm, 0o444);
     assert_eq!(attr.size, "nameserver 127.0.0.2\n".len() as u64);
@@ -94,8 +90,9 @@ fn injected_paths_are_virtual_read_only_files() {
     // /etc), and the file shows up in its (virtual) directory.
     assert!(f.patterns.exists(Path::new("/etc")));
     assert!(f.patterns.dir_prefix(Path::new("/etc")));
-    assert!(block(f.is_listable_dir(Path::new("/etc"))));
-    let names: Vec<_> = block(f.dir_entries(Path::new("/etc")))
+    assert!(f.is_listable_dir(Path::new("/etc")));
+    let names: Vec<_> = f
+        .dir_entries(Path::new("/etc"))
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -136,18 +133,16 @@ fn injected_path_ancestors_are_virtual_directories_for_access() {
     for p in ["/etc", "/etc/pki", "/etc/pki/tls", "/etc/pki/tls/certs"] {
         let p = Path::new(p);
         assert_eq!(
-            block(f.virtual_only(p)),
+            f.virtual_only(p),
             !f.patterns.redirect(p).exists(),
             "virtual_only({p:?})"
         );
     }
     // An injected file itself is always purely virtual.
-    assert!(block(
-        f.virtual_only(Path::new("/etc/pki/tls/certs/ca-bundle.crt"))
-    ));
+    assert!(f.virtual_only(Path::new("/etc/pki/tls/certs/ca-bundle.crt")));
 
     // A real mirror path is not: the real filesystem decides.
-    assert!(!block(f.virtual_only(Path::new("/usr/bin"))));
+    assert!(!f.virtual_only(Path::new("/usr/bin")));
 }
 
 #[test]
@@ -162,14 +157,14 @@ fn empty_paths_match_real_files_as_empty_files() {
 
     let f = fs(&[(&format!("{}/*", base.display()), Permission::Empty)]);
     // The real file is shown empty.
-    let file = block(f.attr(&base.join("f.txt"))).unwrap();
+    let file = f.attr(&base.join("f.txt")).unwrap();
     assert_eq!(file.kind, FileType::RegularFile);
     assert_eq!(file.size, 0);
     // The real directory is shown as an empty directory.
-    let dir = block(f.attr(&base.join("d"))).unwrap();
+    let dir = f.attr(&base.join("d")).unwrap();
     assert_eq!(dir.kind, FileType::Directory);
     assert_eq!(dir.perm, 0o555);
-    assert!(block(f.dir_entries(&base.join("d"))).is_empty());
+    assert!(f.dir_entries(&base.join("d")).is_empty());
     std::fs::remove_dir_all(&base).unwrap();
 }
 
@@ -183,12 +178,14 @@ fn empty_path_ancestors_stay_navigable() {
     assert!(!f.patterns.exists(Path::new("/var/tmp/other")));
     assert!(!f.patterns.exists(Path::new("/var/etc")));
     // The root listing contains both levels of the chain.
-    let root: Vec<_> = block(f.dir_entries(Path::new("/")))
+    let root: Vec<_> = f
+        .dir_entries(Path::new("/"))
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
     assert_eq!(root, ["var"]);
-    let var: Vec<_> = block(f.dir_entries(Path::new("/var")))
+    let var: Vec<_> = f
+        .dir_entries(Path::new("/var"))
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -200,7 +197,8 @@ fn empty_paths_coexist_with_mirror() {
     // /dev is empty, /etc/passwd is mirrored normally; siblings of the
     // empty path are listed together with it.
     let f = fs(&[("/etc/passwd", Permission::Ro), ("/dev", Permission::Empty)]);
-    let names: Vec<_> = block(f.dir_entries(Path::new("/")))
+    let names: Vec<_> = f
+        .dir_entries(Path::new("/"))
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -230,12 +228,13 @@ fn redirected_paths_show_the_source_content() {
     // The redirected path is visible and shows the source's content.
     assert!(f.patterns.exists(Path::new("/virtual")));
     assert!(f.patterns.matches(Path::new("/virtual")));
-    let attr = block(f.attr(Path::new("/virtual"))).unwrap();
+    let attr = f.attr(Path::new("/virtual")).unwrap();
     assert_eq!(attr.kind, FileType::Directory);
 
     // Its entries are the source dir's entries, listed under the
     // redirected name.
-    let mut names: Vec<_> = block(f.dir_entries(Path::new("/virtual")))
+    let mut names: Vec<_> = f
+        .dir_entries(Path::new("/virtual"))
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -243,7 +242,7 @@ fn redirected_paths_show_the_source_content() {
     assert_eq!(names, ["file.txt", "sub"]);
 
     // A file below the redirect reads the real source file.
-    let attr = block(f.attr(Path::new("/virtual/file.txt"))).unwrap();
+    let attr = f.attr(Path::new("/virtual/file.txt")).unwrap();
     assert_eq!(attr.kind, FileType::RegularFile);
     assert_eq!(attr.size, 10);
 
@@ -283,7 +282,8 @@ fn redirected_files_are_listed_in_their_directory() {
             },
         ),
     ]));
-    let names: Vec<_> = block(f.dir_entries(Path::new("/conf")))
+    let names: Vec<_> = f
+        .dir_entries(Path::new("/conf"))
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -298,7 +298,7 @@ fn redirected_files_are_listed_in_their_directory() {
             writable: false,
         },
     )]));
-    assert!(block(f.dir_entries(Path::new("/conf"))).is_empty());
+    assert!(f.dir_entries(Path::new("/conf")).is_empty());
 
     std::fs::remove_dir_all(&base).unwrap();
 }
@@ -320,7 +320,8 @@ fn readdir_filters_non_matching_entries() {
     let f = fs(&[(&format!("{}/*.conf", base.display()), Permission::Ro)]);
 
     // Only matching entries (and entries leading to matches) survive.
-    let names: Vec<_> = block(f.dir_entries(&base))
+    let names: Vec<_> = f
+        .dir_entries(&base)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -331,7 +332,8 @@ fn readdir_filters_non_matching_entries() {
 
     // An entry that only leads to a match (virtual ancestor) is shown.
     let f = fs(&[(&format!("{}/c.conf.dir/x", base.display()), Permission::Ro)]);
-    let names: Vec<_> = block(f.dir_entries(&base))
+    let names: Vec<_> = f
+        .dir_entries(&base)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -345,7 +347,8 @@ fn readdir_filters_non_matching_entries() {
         &format!("{}", base.join("c.conf.dir").display()),
         Permission::Ro,
     )]);
-    let names: Vec<_> = block(f.dir_entries(&base.join("c.conf.dir")))
+    let names: Vec<_> = f
+        .dir_entries(&base.join("c.conf.dir"))
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -358,7 +361,7 @@ fn readdir_filters_non_matching_entries() {
 fn empty_mirror_matches_nothing() {
     let f = fs(&[]);
     assert!(!f.patterns.exists(Path::new("/")));
-    assert!(block(f.dir_entries(Path::new("/"))).is_empty());
+    assert!(f.dir_entries(Path::new("/")).is_empty());
 }
 
 #[test]
@@ -366,7 +369,7 @@ fn empty_patterns_only_still_show_root() {
     let f = fs_with_empties(&[("/dev", Permission::Empty)]);
     assert!(f.patterns.exists(Path::new("/")));
     assert_eq!(
-        block(f.dir_entries(Path::new("/")))
+        f.dir_entries(Path::new("/"))
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect::<Vec<_>>(),
@@ -384,7 +387,7 @@ fn hidden_directories_hide_their_subtree() {
     // The hide pattern matches /etc last and shadows everything below.
     assert!(!f.patterns.exists(Path::new("/etc")));
     assert!(!f.patterns.exists(Path::new("/etc/passwd")));
-    assert!(block(f.dir_entries(Path::new("/"))).is_empty());
+    assert!(f.dir_entries(Path::new("/")).is_empty());
     // Siblings are unaffected; the hide is scoped to /etc.
     let base =
         std::env::temp_dir().join(format!("ai-bubble-hostfs-hide-test-{}", std::process::id()));
@@ -400,7 +403,8 @@ fn hidden_directories_hide_their_subtree() {
     assert!(!f.patterns.exists(&base.join("secret")));
     // The parent stays navigable for the still-mirrored matches.
     assert!(f.patterns.exists(&base));
-    let names: Vec<_> = block(f.dir_entries(&base))
+    let names: Vec<_> = f
+        .dir_entries(&base)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();

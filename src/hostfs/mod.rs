@@ -49,10 +49,15 @@
 //! says `"rw"`, **and** the real host filesystem allows the operation. The
 //! FUSE mount is mounted read-only unless some pattern says `"rw"`.
 //!
-//! The FUSE handlers are async: the pure pattern matching runs inline, but
-//! every blocking host operation (std::fs, raw libc calls) is pushed to
-//! tokio's blocking pool (`tokio::fs` / `spawn_blocking`), so a slow read
-//! or a hung network filesystem never stalls the mount's event loop.
+//! The FUSE handlers are async (fuse3's trait demands it), but every host
+//! operation runs *synchronously* inline: plain `std::fs` calls and raw
+//! libc calls. Wrapping them in `tokio::fs`/`spawn_blocking` was measured
+//! (see `perf.rs`) to cost far more CPU per op than the syscalls themselves
+//! — task spawning, cross-thread handoffs and wakers for what are
+//! microsecond-fast local syscalls — while buying no concurrency (the IO
+//! was blocking anyway). A genuinely slow host filesystem (a hung network
+//! mount) now delays the event loop instead of only the blocking pool; for
+//! the local mirror this process serves, that trade is the right one.
 //!
 //! Symlinks: every access to the **real host filesystem** uses
 //! no-follow semantics — host paths are always opened with `O_NOFOLLOW`
@@ -66,9 +71,10 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::SeekFrom;
+use std::io::{Read, Seek, Write};
 use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -81,9 +87,6 @@ use fuse3::raw::reply::{
 use fuse3::raw::{Filesystem, Request, Session};
 use fuse3::{FileType, Inode, MountOptions, Result, SetAttr, Timestamp};
 use futures_util::stream;
-
-use tokio::fs as tokio_fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::sandbox::die_with_error;
 
@@ -256,7 +259,12 @@ struct HostFs {
     /// map per FUSE session: the filesystem is *moved* into the mount, and
     /// the mount fallback builds a fresh filesystem (the failed attempt never
     /// reached the kernel, so an empty map is correct there).
-    inodes: tokio::sync::RwLock<InodeMap>,
+    inodes: std::sync::RwLock<InodeMap>,
+    /// Open host files keyed by FUSE handle (`fh`): stateful IO — the file
+    /// is opened once (`open`/`create`) and reused for every `read`/`write`
+    /// on the handle, instead of being reopened per request. `fh = 0` stays
+    /// stateless (injected files, directories); an unknown `fh` falls back
+    /// to the stateless reopen, so a lost entry degrades instead of failing.
     /// Open host files keyed by FUSE handle (`fh`): stateful IO — the file
     /// is opened once (`open`/`create`) and reused for every `read`/`write`
     /// on the handle, instead of being reopened per request. `fh = 0` stays
@@ -273,7 +281,7 @@ struct HostFs {
 /// mutex serializes the shared cursor; concurrent access to one handle is
 /// rare and only costs lock wait, never a reopen.
 struct OpenHandle {
-    file: tokio::sync::Mutex<tokio_fs::File>,
+    file: std::sync::Mutex<std::fs::File>,
     /// The mirrored path the handle was opened with, cached for the handle's
     /// lifetime. `read`/`write` never look the inode up in the map on this
     /// fast path; the path is only consulted for error logging.
@@ -298,7 +306,7 @@ impl HostFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             patterns: patterns.clone(),
-            inodes: tokio::sync::RwLock::new(InodeMap::new()),
+            inodes: std::sync::RwLock::new(InodeMap::new()),
             handles: std::sync::Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
         }
@@ -312,7 +320,7 @@ impl HostFs {
     /// Register an opened host file under a fresh `fh`.
     fn insert_handle(
         &self,
-        file: tokio_fs::File,
+        file: std::fs::File,
         path: PathBuf,
         append: bool,
         writable: bool,
@@ -324,7 +332,7 @@ impl HostFs {
             .insert(
                 fh,
                 std::sync::Arc::new(OpenHandle {
-                    file: tokio::sync::Mutex::new(file),
+                    file: std::sync::Mutex::new(file),
                     path,
                     append,
                     writable,
@@ -360,10 +368,10 @@ impl HostFs {
     /// The map stores mirrored paths already, so the result is used directly:
     /// there is no second `mirror_path` parse on the hot path. The lock guard
     /// is dropped before returning, hence the single owned clone.
-    async fn resolve(&self, inode: Inode) -> std::io::Result<PathBuf> {
+    fn resolve(&self, inode: Inode) -> std::io::Result<PathBuf> {
         self.inodes
             .read()
-            .await
+            .expect("hostfs inode map poisoned")
             .path_of(inode)
             .map(Path::to_path_buf)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))
@@ -374,14 +382,12 @@ impl HostFs {
     /// paths, and purely virtual ancestors of empty or injected paths
     /// whose real host path does not exist. Such paths are readable
     /// directories (mode 0555) — or injected files — that are never
-    /// writable. Async: it stats the real host filesystem.
-    async fn virtual_only(&self, mirrored: &Path) -> bool {
+    /// writable. It stats the real host filesystem.
+    fn virtual_only(&self, mirrored: &Path) -> bool {
         self.patterns.is_empty(mirrored)
             || self.patterns.is_inject(mirrored).is_some()
             || (self.patterns.is_empty_prefix(mirrored) || self.patterns.is_inject_prefix(mirrored))
-                && tokio_fs::symlink_metadata(self.patterns.redirect(mirrored))
-                    .await
-                    .is_err()
+                && std::fs::symlink_metadata(self.patterns.redirect(mirrored)).is_err()
     }
 
     /// The attributes of an empty path (or a purely virtual ancestor of
@@ -438,17 +444,15 @@ impl HostFs {
     /// Whether the given **host** path can act as a listable directory
     /// without following symlinks: it must really be a directory (a
     /// symlink to a directory is not followed).
-    async fn is_host_dir(&self, real: &Path) -> bool {
-        tokio_fs::symlink_metadata(real)
-            .await
+    fn is_host_dir(&self, real: &Path) -> bool {
+        std::fs::symlink_metadata(real)
             .map(|m| m.is_dir())
             .unwrap_or(false)
     }
 
-    /// The `lstat`-style attribute of a mirrored path, or ENOENT. Async: it
-    /// stats the real host filesystem (`tokio::fs` runs the syscall on
-    /// tokio's blocking pool) and must never run on the FUSE event loop.
-    async fn attr(&self, mirrored: &Path) -> std::io::Result<FileAttr> {
+    /// The `lstat`-style attribute of a mirrored path, or ENOENT. It
+    /// stats the real host filesystem.
+    fn attr(&self, mirrored: &Path) -> std::io::Result<FileAttr> {
         // Injected paths take precedence over everything: they are purely
         // virtual files served from memory.
         if let Some(content) = self.patterns.is_inject(mirrored) {
@@ -459,13 +463,13 @@ impl HostFs {
         // when the path is (or would be) a directory, as an empty file
         // when it matches a real file.
         if self.patterns.is_empty(mirrored) {
-            return match tokio_fs::symlink_metadata(mirrored).await {
+            return match std::fs::symlink_metadata(mirrored) {
                 Ok(md) if !md.is_dir() => Ok(Self::empty_file_attr(&md)),
                 _ => Ok(self.empty_dir_attr()),
             };
         }
         let real = self.patterns.redirect(mirrored);
-        match tokio_fs::symlink_metadata(&real).await {
+        match std::fs::symlink_metadata(&real) {
             Ok(md) => Ok(attr_from_metadata(&md)),
             // A purely virtual ancestor of an empty path has no real
             // counterpart; present it as a directory. The same holds for
@@ -488,16 +492,16 @@ impl HostFs {
 
     /// Whether the mirrored path is a listable directory: a real one (a
     /// host symlink to a directory is not followed), an empty
-    /// path, or a purely virtual ancestor of an empty path. Async: it
-    /// stats the real host filesystem (`tokio::fs`).
-    async fn is_listable_dir(&self, mirrored: &Path) -> bool {
+    /// path, or a purely virtual ancestor of an empty path. It
+    /// stats the real host filesystem.
+    fn is_listable_dir(&self, mirrored: &Path) -> bool {
         if self.patterns.is_empty(mirrored)
             || self.patterns.is_empty_prefix(mirrored)
             || self.patterns.is_inject_prefix(mirrored)
         {
             return true;
         }
-        self.is_host_dir(&self.patterns.redirect(mirrored)).await
+        self.is_host_dir(&self.patterns.redirect(mirrored))
     }
 
     /// The visible entries of a mirrored directory, sorted by name: every
@@ -506,22 +510,20 @@ impl HostFs {
     /// of its real entries. Everything below an empty path is shadowed by
     /// its precedence; empty paths that live directly under the directory
     /// are always shown. Symlinks are never followed: a host symlink
-    /// standing for the directory is not listed through. Async: it reads
-    /// and stats the real host directory (`tokio::fs`).
-    async fn dir_entries(
-        &self,
-        mirrored: &Path,
-    ) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
+    /// standing for the directory is not listed through. It reads
+    /// and stats the real host directory.
+    fn dir_entries(&self, mirrored: &Path) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
         // A directory named by a mirrored pattern itself is a recursive
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
         let unfiltered = self.patterns.matches(mirrored);
         let mut names: Vec<std::ffi::OsString> =
-            if self.is_host_dir(&self.patterns.redirect(mirrored)).await {
-                match tokio_fs::read_dir(self.patterns.redirect(mirrored)).await {
-                    Ok(mut entries) => {
+            if self.is_host_dir(&self.patterns.redirect(mirrored)) {
+                match std::fs::read_dir(self.patterns.redirect(mirrored)) {
+                    Ok(entries) => {
                         let mut names = Vec::new();
-                        while let Ok(Some(entry)) = entries.next_entry().await {
+                        for entry in entries {
+                            let Ok(entry) = entry else { continue };
                             let name = entry.file_name();
                             // Fail closed for names that can never match a
                             // pattern: they are not creatable through the
@@ -569,7 +571,7 @@ impl HostFs {
             // really exists on the host — otherwise the entry would
             // advertise a lookup that fails (an undeletable "ghost").
             if let Some(source) = permission.redirect_source()
-                && tokio_fs::symlink_metadata(source).await.is_err()
+                && std::fs::symlink_metadata(source).is_err()
             {
                 continue;
             }
@@ -579,7 +581,7 @@ impl HostFs {
         let mut entries = Vec::with_capacity(names.len());
         for name in names {
             let child = mirrored.join(&name);
-            entries.push((name, self.attr(&child).await));
+            entries.push((name, self.attr(&child)));
         }
         entries
     }
@@ -670,7 +672,11 @@ impl Filesystem for HostFs {
     /// dentry); a nodeid with open handles keeps its last path as a zombie.
     async fn forget(&self, _req: Request, inode: Inode, nlookup: u64) {
         perf::fuse_op!("forget");
-        let path = self.inodes.write().await.forget(inode);
+        let path = self
+            .inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .forget(inode);
         fuselog::event!(
             "INODE forget inode={inode} nlookup={nlookup} path={}",
             path.map(|p| fuselog::path_string(p.as_os_str()))
@@ -680,7 +686,7 @@ impl Filesystem for HostFs {
 
     async fn batch_forget(&self, _req: Request, inodes: &[Inode]) {
         perf::fuse_op!("batch_forget");
-        let mut map = self.inodes.write().await;
+        let mut map = self.inodes.write().expect("hostfs inode map poisoned");
         for &inode in inodes {
             let path = map.forget(inode);
             fuselog::event!(
@@ -695,7 +701,7 @@ impl Filesystem for HostFs {
         perf::fuse_op!("lookup");
         // The nodeid resolves to the parent's mirrored path; "/" means the
         // root directory itself.
-        let parent_path = match self.resolve(parent).await {
+        let parent_path = match self.resolve(parent) {
             Ok(p) => p,
             Err(e) => {
                 fuselog::event!(
@@ -707,9 +713,13 @@ impl Filesystem for HostFs {
         };
         let mirrored = parent_path.join(name);
         if self.patterns.exists(&mirrored) {
-            match self.attr(&mirrored).await {
+            match self.attr(&mirrored) {
                 Ok(mut attr) => {
-                    let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
+                    let inode = self
+                        .inodes
+                        .write()
+                        .expect("hostfs inode map poisoned")
+                        .get_or_insert(&mirrored, parent);
                     attr.ino = inode;
                     return Ok(ReplyEntry {
                         ttl: TTL,
@@ -729,7 +739,10 @@ impl Filesystem for HostFs {
                         // The kernel dentry is stale: drop the mapping so the
                         // next lookup re-maps the path (a zombie stays while
                         // open handles remain).
-                        self.inodes.write().await.release_path(&mirrored);
+                        self.inodes
+                            .write()
+                            .expect("hostfs inode map poisoned")
+                            .release_path(&mirrored);
                     }
                     return Err(e.into());
                 }
@@ -742,7 +755,10 @@ impl Filesystem for HostFs {
             &std::io::Error::from_raw_os_error(libc::ENOENT),
         )
         .await;
-        self.inodes.write().await.release_path(&mirrored);
+        self.inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .release_path(&mirrored);
         Err(libc::ENOENT.into())
     }
 
@@ -754,7 +770,7 @@ impl Filesystem for HostFs {
         _flags: u32,
     ) -> Result<ReplyAttr> {
         perf::fuse_op!("getattr");
-        let mirrored = match self.resolve(inode).await {
+        let mirrored = match self.resolve(inode) {
             Ok(p) => p,
             Err(e) => {
                 fuselog::event(&format!("INODE getattr no-path inode={inode}"));
@@ -767,7 +783,7 @@ impl Filesystem for HostFs {
             return Ok(ReplyAttr { ttl: TTL, attr });
         }
         if self.patterns.exists(&mirrored) {
-            match self.attr(&mirrored).await {
+            match self.attr(&mirrored) {
                 Ok(mut attr) => {
                     attr.ino = inode;
                     return Ok(ReplyAttr { ttl: TTL, attr });
@@ -796,11 +812,11 @@ impl Filesystem for HostFs {
 
     async fn readlink(&self, _req: Request, inode: Inode) -> Result<ReplyData> {
         perf::fuse_op!("readlink");
-        let mirrored = self.resolve(inode).await?;
+        let mirrored = self.resolve(inode)?;
         if !self.patterns.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        let target = tokio_fs::read_link(self.patterns.redirect(&mirrored)).await?;
+        let target = std::fs::read_link(self.patterns.redirect(&mirrored))?;
         Ok(ReplyData::from(Bytes::copy_from_slice(
             target.as_os_str().as_encoded_bytes(),
         )))
@@ -808,7 +824,7 @@ impl Filesystem for HostFs {
 
     async fn open(&self, _req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
         perf::fuse_op!("open");
-        let mirrored = self.resolve(inode).await?;
+        let mirrored = self.resolve(inode)?;
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
         if !self.patterns.exists(&mirrored) {
@@ -835,14 +851,17 @@ impl Filesystem for HostFs {
                 .await;
                 return Err(libc::EACCES.into());
             }
-            self.inodes.write().await.open_handle(inode);
+            self.inodes
+                .write()
+                .expect("hostfs inode map poisoned")
+                .open_handle(inode);
             return Ok(ReplyOpen { fh: 0, flags: 0 });
         }
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not), and
         // symlinks are never followed: a host symlink cannot be opened
         // through the mirror (its target may not be mirrored at all).
-        let md = match tokio_fs::symlink_metadata(self.patterns.redirect(&mirrored)).await {
+        let md = match std::fs::symlink_metadata(self.patterns.redirect(&mirrored)) {
             Ok(md) => md,
             Err(e) => {
                 log_op_err(
@@ -907,7 +926,7 @@ impl Filesystem for HostFs {
         // The truncation happens in the open below (the file is opened for
         // real and kept for the handle's lifetime).
         let append = flags & libc::O_APPEND as u32 != 0;
-        let mut opts = tokio_fs::OpenOptions::new();
+        let mut opts = std::fs::OpenOptions::new();
         if !write_flags || flags & libc::O_RDWR as u32 != 0 {
             opts.read(true);
         }
@@ -921,7 +940,7 @@ impl Filesystem for HostFs {
             opts.truncate(true);
         }
         opts.custom_flags(libc::O_NOFOLLOW);
-        let file = match opts.open(self.patterns.redirect(&mirrored)).await {
+        let file = match opts.open(self.patterns.redirect(&mirrored)) {
             Ok(f) => f,
             Err(e) => {
                 log_op_err(
@@ -936,7 +955,10 @@ impl Filesystem for HostFs {
         };
         // Stateful IO: the opened host file is reused for every read/write
         // on this handle (released with it in `release`).
-        self.inodes.write().await.open_handle(inode);
+        self.inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .open_handle(inode);
         let writable = self.patterns.writable(&mirrored);
         let fh = self.insert_handle(file, mirrored, append, writable);
         Ok(ReplyOpen { fh, flags: 0 })
@@ -960,12 +982,20 @@ impl Filesystem for HostFs {
         {
             // The handle caches the mirrored path from open time; the path is
             // only used for error logging here, so the inode map is never
-            // consulted on this fast path.
-            let mut file = handle.file.lock().await;
-            file.seek(SeekFrom::Start(offset)).await?;
-            let mut buf = vec![0u8; size as usize];
-            let n = match file.read(&mut buf).await {
-                Ok(n) => n,
+            // consulted on this fast path. The guard's scope ends before any
+            // await (a std MutexGuard is not Send, and the sync IO makes the
+            // await-free block trivial).
+            let read_result = {
+                let mut file = handle.file.lock().expect("hostfs handle poisoned");
+                file.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; size as usize];
+                file.read(&mut buf).map(|n| {
+                    buf.truncate(n);
+                    buf
+                })
+            };
+            let buf = match read_result {
+                Ok(buf) => buf,
                 Err(e) => {
                     log_op_err(
                         "read-io",
@@ -977,10 +1007,9 @@ impl Filesystem for HostFs {
                     return Err(e.into());
                 }
             };
-            buf.truncate(n);
             return Ok(ReplyData::from(Bytes::from(buf)));
         }
-        let mirrored = match self.resolve(inode).await {
+        let mirrored = match self.resolve(inode) {
             Ok(p) => p,
             Err(e) => {
                 log_op_err(
@@ -1019,11 +1048,10 @@ impl Filesystem for HostFs {
         // Stateless IO fallback: reopen the host file — never following
         // symlinks (a host symlink is visible only as a link, and its
         // target may not be mirrored at all).
-        let mut file = match tokio_fs::OpenOptions::new()
+        let mut file = match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.patterns.redirect(&mirrored))
-            .await
         {
             Ok(f) => f,
             Err(e) => {
@@ -1037,9 +1065,9 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
-        file.seek(SeekFrom::Start(offset)).await?;
+        file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; size as usize];
-        let n = match file.read(&mut buf).await {
+        let n = match file.read(&mut buf) {
             Ok(n) => n,
             Err(e) => {
                 log_op_err(
@@ -1075,7 +1103,7 @@ impl Filesystem for HostFs {
             // Only used for logging on this path; the IO goes through the
             // cached file descriptor.
             Some(h) => h.path.clone(),
-            None => match self.resolve(inode).await {
+            None => match self.resolve(inode) {
                 Ok(p) => p,
                 Err(e) => {
                     log_op_err(
@@ -1125,11 +1153,16 @@ impl Filesystem for HostFs {
         // stateless reopen below.
         let append = flags & libc::O_APPEND as u32 != 0;
         if let Some(handle) = handle {
-            let mut file = handle.file.lock().await;
-            if !handle.append {
-                file.seek(SeekFrom::Start(offset)).await?;
-            }
-            let n = match file.write(data).await {
+            // The guard's scope ends before any await (a std MutexGuard is
+            // not Send, and the sync IO makes the await-free block trivial).
+            let write_result = {
+                let mut file = handle.file.lock().expect("hostfs handle poisoned");
+                if !handle.append {
+                    file.seek(SeekFrom::Start(offset))?;
+                }
+                file.write(data)
+            };
+            let n = match write_result {
                 Ok(n) => n,
                 Err(e) => {
                     log_op_err(
@@ -1142,7 +1175,6 @@ impl Filesystem for HostFs {
                     return Err(e.into());
                 }
             };
-            drop(file);
             crate::audit::record(
                 "hostfs",
                 "write",
@@ -1156,12 +1188,11 @@ impl Filesystem for HostFs {
         // Stateless IO fallback: reopen the host file — never following
         // symlinks (a host symlink is never written through; its target
         // may not be mirrored at all).
-        let mut file = match tokio_fs::OpenOptions::new()
+        let mut file = match std::fs::OpenOptions::new()
             .write(true)
             .append(append)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.patterns.redirect(&mirrored))
-            .await
         {
             Ok(f) => f,
             Err(e) => {
@@ -1176,9 +1207,9 @@ impl Filesystem for HostFs {
             }
         };
         if !append {
-            file.seek(SeekFrom::Start(offset)).await?;
+            file.seek(SeekFrom::Start(offset))?;
         }
-        let n = match file.write(data).await {
+        let n = match file.write(data) {
             Ok(n) => n,
             Err(e) => {
                 log_op_err(
@@ -1207,7 +1238,7 @@ impl Filesystem for HostFs {
         // the root), so tools like `df` behave sensibly. The path is opened
         // with `O_NOFOLLOW` and `fstatvfs` runs on the descriptor: symlinks
         // are never followed to a filesystem outside the mirror.
-        let mirrored = self.resolve(inode).await?;
+        let mirrored = self.resolve(inode)?;
         // An injected path has no host counterpart: report a minimal,
         // self-consistent statfs instead of opening anything. The same
         // holds for a purely virtual ancestor of an injected (or empty)
@@ -1216,9 +1247,7 @@ impl Filesystem for HostFs {
         if self.patterns.is_inject(&mirrored).is_some()
             || (self.patterns.is_empty_prefix(&mirrored)
                 || self.patterns.is_inject_prefix(&mirrored))
-                && tokio_fs::symlink_metadata(self.patterns.redirect(&mirrored))
-                    .await
-                    .is_err()
+                && std::fs::symlink_metadata(self.patterns.redirect(&mirrored)).is_err()
         {
             return Ok(ReplyStatFs {
                 blocks: 1,
@@ -1238,44 +1267,43 @@ impl Filesystem for HostFs {
         };
         let cpath =
             CString::new(mirrored.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
-        // errno is per-thread: capture the error on the blocking thread.
-        blocking(move || {
-            // O_PATH works on any file type (including directories) and
-            // O_NOFOLLOW keeps symlinked paths from being followed.
-            let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
-            let rc = unsafe { libc::fstatvfs(fd, &mut vfs) };
-            let err = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            if rc != 0 { Err(err) } else { Ok(vfs) }
+        // O_PATH works on any file type (including directories) and
+        // O_NOFOLLOW keeps symlinked paths from being followed.
+        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstatvfs(fd, &mut vfs) };
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        if rc != 0 {
+            return Err(err.into());
+        }
+        Ok(ReplyStatFs {
+            blocks: vfs.f_blocks,
+            bfree: vfs.f_bfree,
+            bavail: vfs.f_bavail,
+            files: vfs.f_files,
+            ffree: vfs.f_ffree,
+            bsize: vfs.f_bsize as u32,
+            namelen: vfs.f_namemax as u32,
+            frsize: vfs.f_frsize as u32,
         })
-        .await
-        .map(|vfs| {
-            Ok(ReplyStatFs {
-                blocks: vfs.f_blocks,
-                bfree: vfs.f_bfree,
-                bavail: vfs.f_bavail,
-                files: vfs.f_files,
-                ffree: vfs.f_ffree,
-                bsize: vfs.f_bsize as u32,
-                namelen: vfs.f_namemax as u32,
-                frsize: vfs.f_frsize as u32,
-            })
-        })?
     }
 
     async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
         perf::fuse_op!("opendir");
-        let mirrored = self.resolve(inode).await?;
+        let mirrored = self.resolve(inode)?;
         if !self.patterns.exists(&mirrored)
-            || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored).await
+            || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored)
         {
             return Err(libc::ENOENT.into());
         }
-        self.inodes.write().await.open_handle(inode);
+        self.inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .open_handle(inode);
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
@@ -1288,15 +1316,14 @@ impl Filesystem for HostFs {
     ) -> Result<ReplyDirectory<impl futures_util::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
         perf::fuse_op!("readdir");
-        let mirrored = self.resolve(parent).await?;
+        let mirrored = self.resolve(parent)?;
         if !self.patterns.exists(&mirrored)
-            || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored).await
+            || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored)
         {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
             .dir_entries(&mirrored)
-            .await
             .into_iter()
             .skip(offset.max(0) as usize)
             .enumerate()
@@ -1304,7 +1331,7 @@ impl Filesystem for HostFs {
         // Every listed entry needs a nodeid for the kernel's dentry cache:
         // "." is the directory itself, ".." its parent, everything else is
         // mapped (or re-mapped) under the directory's nodeid.
-        let mut map = self.inodes.write().await;
+        let mut map = self.inodes.write().expect("hostfs inode map poisoned");
         let entries: Vec<_> = entries
             .into_iter()
             .map(|(i, (name, attr))| {
@@ -1341,15 +1368,14 @@ impl Filesystem for HostFs {
         >,
     > {
         perf::fuse_op!("readdirplus");
-        let mirrored = self.resolve(parent).await?;
+        let mirrored = self.resolve(parent)?;
         if !self.patterns.exists(&mirrored)
-            || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored).await
+            || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored)
         {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
             .dir_entries(&mirrored)
-            .await
             .into_iter()
             .skip(offset as usize)
             .enumerate()
@@ -1358,7 +1384,7 @@ impl Filesystem for HostFs {
         // "." is the directory itself, ".." its parent, everything else is
         // mapped (or re-mapped) under the directory's nodeid — and carries
         // its attributes with the nodeid filled in.
-        let mut map = self.inodes.write().await;
+        let mut map = self.inodes.write().expect("hostfs inode map poisoned");
         let entries: Vec<_> = entries
             .into_iter()
             .map(|(i, (name, attr))| {
@@ -1395,7 +1421,7 @@ impl Filesystem for HostFs {
 
     async fn access(&self, _req: Request, inode: Inode, mask: u32) -> Result<()> {
         perf::fuse_op!("access");
-        let mirrored = self.resolve(inode).await?;
+        let mirrored = self.resolve(inode)?;
         if !self.patterns.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
@@ -1406,7 +1432,7 @@ impl Filesystem for HostFs {
         // kernel consults `access` for `chdir` (MAY_CHDIR), so an
         // unanswered ENOENT here would make a directory that `ls` lists
         // and `stat` resolves impossible to `cd` into.
-        if self.virtual_only(&mirrored).await {
+        if self.virtual_only(&mirrored) {
             if mask & libc::W_OK as u32 != 0 {
                 return Err(libc::EACCES.into());
             }
@@ -1425,26 +1451,19 @@ impl Filesystem for HostFs {
         }
         let real = self.patterns.redirect(&mirrored);
         let cpath = CString::new(real.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
-        // errno is per-thread: capture the error on the blocking thread.
         // `faccessat` with `AT_SYMLINK_NOFOLLOW` — never follow symlinks
         // when deciding access on the real host filesystem.
-        blocking(move || {
-            if unsafe {
-                libc::faccessat(
-                    libc::AT_FDCWD,
-                    cpath.as_ptr(),
-                    non_write as libc::c_int,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
-            {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        })
-        .await
-        .map_err(fuse3::Errno::from)?;
+        if unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                cpath.as_ptr(),
+                non_write as libc::c_int,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
         Ok(())
     }
 
@@ -1456,7 +1475,7 @@ impl Filesystem for HostFs {
         set_attr: SetAttr,
     ) -> Result<ReplyAttr> {
         perf::fuse_op!("setattr");
-        let mirrored = self.resolve(inode).await?;
+        let mirrored = self.resolve(inode)?;
         if self.patterns.is_empty(&mirrored) {
             // Empty paths are virtual: nothing to change.
             return Err(libc::EACCES.into());
@@ -1471,30 +1490,23 @@ impl Filesystem for HostFs {
         if let Some(size) = set_attr.size {
             // Never follow symlinks: a host symlink is not truncated
             // through (its target may not be mirrored at all).
-            let f = tokio_fs::OpenOptions::new()
+            let f = std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(libc::O_NOFOLLOW)
-                .open(&real)
-                .await?;
-            f.set_len(size).await?;
+                .open(&real)?;
+            f.set_len(size)?;
         }
         if let Some(mode) = set_attr.mode {
             let perms = std::fs::Permissions::from_mode(mode);
-            tokio_fs::set_permissions(&real, perms).await?;
+            std::fs::set_permissions(&real, perms)?;
         }
         if set_attr.uid.is_some() || set_attr.gid.is_some() {
             let cpath = cstring_of(&real)?;
             let uid = set_attr.uid.unwrap_or(u32::MAX);
             let gid = set_attr.gid.unwrap_or(u32::MAX);
-            // errno is per-thread: capture the error on the blocking thread.
-            blocking(move || {
-                if unsafe { libc::lchown(cpath.as_ptr(), uid, gid) } != 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            })
-            .await?;
+            if unsafe { libc::lchown(cpath.as_ptr(), uid, gid) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
         }
         if set_attr.atime.is_some() || set_attr.mtime.is_some() {
             let times = [
@@ -1502,25 +1514,19 @@ impl Filesystem for HostFs {
                 ts_to_timespec(set_attr.mtime),
             ];
             let cpath = cstring_of(&real)?;
-            // errno is per-thread: capture the error on the blocking thread.
-            blocking(move || {
-                if unsafe {
-                    libc::utimensat(
-                        libc::AT_FDCWD,
-                        cpath.as_ptr(),
-                        times.as_ptr(),
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                } != 0
-                {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            })
-            .await?;
+            if unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    cpath.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
         }
-        let mut attr = self.attr(&mirrored).await?;
+        let mut attr = self.attr(&mirrored)?;
         attr.ino = inode;
         Ok(ReplyAttr { ttl: TTL, attr })
     }
@@ -1534,7 +1540,7 @@ impl Filesystem for HostFs {
         _umask: u32,
     ) -> Result<ReplyEntry> {
         perf::fuse_op!("mkdir");
-        let parent_path = self.resolve(parent).await?;
+        let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         if !self.patterns.writable(&mirrored) {
             log_op_err(
@@ -1548,10 +1554,7 @@ impl Filesystem for HostFs {
         }
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet.
-        if tokio_fs::symlink_metadata(self.patterns.redirect(&mirrored))
-            .await
-            .is_ok()
-        {
+        if std::fs::symlink_metadata(self.patterns.redirect(&mirrored)).is_ok() {
             log_op_err(
                 "mkdir",
                 &mirrored,
@@ -1561,17 +1564,12 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EEXIST.into());
         }
-        // errno is per-thread: capture the error on the blocking thread.
         let cpath = cstring_of(&self.patterns.redirect(&mirrored))?;
-        if let Err(e) = blocking(move || {
-            if unsafe { libc::mkdir(cpath.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        })
-        .await
-        {
+        let rc = unsafe { libc::mkdir(cpath.as_ptr(), (mode & 0o7777) as libc::mode_t) };
+        if rc != 0 {
+            // Capture the error right after the syscall (errno is per-thread
+            // and any intervening call would clobber it).
+            let e = std::io::Error::last_os_error();
             log_op_err(
                 "mkdir",
                 &mirrored,
@@ -1582,8 +1580,12 @@ impl Filesystem for HostFs {
             return Err(fuse3::Errno::from(e));
         }
         log_op_ok("mkdir", &mirrored, &self.patterns.redirect(&mirrored)).await;
-        let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
-        let mut attr = self.attr(&mirrored).await?;
+        let inode = self
+            .inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .get_or_insert(&mirrored, parent);
+        let mut attr = self.attr(&mirrored)?;
         attr.ino = inode;
         Ok(ReplyEntry {
             ttl: TTL,
@@ -1594,7 +1596,7 @@ impl Filesystem for HostFs {
 
     async fn unlink(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<()> {
         perf::fuse_op!("unlink");
-        let parent_path = self.resolve(parent).await?;
+        let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         if self.patterns.is_empty(&mirrored) {
             // Empty paths are virtual mount points; they cannot be removed.
@@ -1620,7 +1622,7 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        if let Err(e) = tokio_fs::remove_file(self.patterns.redirect(&mirrored)).await {
+        if let Err(e) = std::fs::remove_file(self.patterns.redirect(&mirrored)) {
             log_op_err(
                 "unlink",
                 &mirrored,
@@ -1630,21 +1632,30 @@ impl Filesystem for HostFs {
             .await;
             if e.kind() == std::io::ErrorKind::NotFound {
                 // A stale kernel dentry: drop the mapping.
-                self.inodes.write().await.release_path(&mirrored);
+                self.inodes
+                    .write()
+                    .expect("hostfs inode map poisoned")
+                    .release_path(&mirrored);
             } else if e.raw_os_error() == Some(libc::EISDIR) {
                 // Unlinking a directory: the kernel keeps the dentry, so the
                 // name must stay resolvable.
-                self.inodes.write().await.get_or_insert(&mirrored, parent);
+                self.inodes
+                    .write()
+                    .expect("hostfs inode map poisoned")
+                    .get_or_insert(&mirrored, parent);
             }
             return Err(e.into());
         }
         log_op_ok("unlink", &mirrored, &self.patterns.redirect(&mirrored)).await;
-        self.inodes.write().await.release_path(&mirrored);
+        self.inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .release_path(&mirrored);
         Ok(())
     }
     async fn rmdir(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<()> {
         perf::fuse_op!("rmdir");
-        let parent_path = self.resolve(parent).await?;
+        let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         if self.patterns.is_empty(&mirrored) {
             return Err(libc::EACCES.into());
@@ -1669,7 +1680,7 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        if let Err(e) = tokio_fs::remove_dir(self.patterns.redirect(&mirrored)).await {
+        if let Err(e) = std::fs::remove_dir(self.patterns.redirect(&mirrored)) {
             log_op_err(
                 "rmdir",
                 &mirrored,
@@ -1679,16 +1690,25 @@ impl Filesystem for HostFs {
             .await;
             if e.kind() == std::io::ErrorKind::NotFound {
                 // A stale kernel dentry: drop the mapping.
-                self.inodes.write().await.release_path(&mirrored);
+                self.inodes
+                    .write()
+                    .expect("hostfs inode map poisoned")
+                    .release_path(&mirrored);
             } else if e.raw_os_error() == Some(libc::ENOTDIR) {
                 // Rmdir of a non-directory: the kernel keeps the dentry, so
                 // the name must stay resolvable.
-                self.inodes.write().await.get_or_insert(&mirrored, parent);
+                self.inodes
+                    .write()
+                    .expect("hostfs inode map poisoned")
+                    .get_or_insert(&mirrored, parent);
             }
             return Err(e.into());
         }
         log_op_ok("rmdir", &mirrored, &self.patterns.redirect(&mirrored)).await;
-        self.inodes.write().await.release_path(&mirrored);
+        self.inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .release_path(&mirrored);
         Ok(())
     }
 
@@ -1701,8 +1721,8 @@ impl Filesystem for HostFs {
         name: &OsStr,
     ) -> Result<()> {
         perf::fuse_op!("rename");
-        let origin_parent_path = self.resolve(origin_parent).await?;
-        let new_parent_path = self.resolve(parent).await?;
+        let origin_parent_path = self.resolve(origin_parent)?;
+        let new_parent_path = self.resolve(parent)?;
         let old = origin_parent_path.join(origin_name);
         let new = new_parent_path.join(name);
         if self.patterns.is_empty(&old) || self.patterns.is_empty(&new) {
@@ -1737,8 +1757,8 @@ impl Filesystem for HostFs {
         // `/project/src/**/*.bin` is `hide`); moving another directory
         // *into* such a subtree is denied as well, so content cannot be
         // planted there and carried back out with the same effect.
-        let dir_rename = self.is_host_dir(&self.patterns.redirect(&old)).await
-            || self.is_host_dir(&self.patterns.redirect(&new)).await;
+        let dir_rename = self.is_host_dir(&self.patterns.redirect(&old))
+            || self.is_host_dir(&self.patterns.redirect(&new));
         if dir_rename
             && (self.patterns.subtree_restricted(&old) || self.patterns.subtree_restricted(&new))
         {
@@ -1751,8 +1771,7 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        if let Err(e) =
-            tokio_fs::rename(self.patterns.redirect(&old), self.patterns.redirect(&new)).await
+        if let Err(e) = std::fs::rename(self.patterns.redirect(&old), self.patterns.redirect(&new))
         {
             log_op_err("rename", &old, Some(&self.patterns.redirect(&new)), &e).await;
             return Err(e.into());
@@ -1764,7 +1783,7 @@ impl Filesystem for HostFs {
         // nodeid — dropping the overwritten target's mapping, which the
         // kernel is about to forget — so every operation arriving on the
         // moved dentry still resolves (see `FINDINGS.md`).
-        let mut map = self.inodes.write().await;
+        let mut map = self.inodes.write().expect("hostfs inode map poisoned");
         let source_inode = map.inode_of(&old);
         let old_target = map.inode_of(&new);
         fuselog::event!(
@@ -1795,7 +1814,7 @@ impl Filesystem for HostFs {
         _link: &std::ffi::OsStr,
     ) -> Result<ReplyEntry> {
         perf::fuse_op!("symlink");
-        let parent_path = self.resolve(parent).await?;
+        let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         log_op_err(
             "symlink",
@@ -1831,8 +1850,8 @@ impl Filesystem for HostFs {
         new_name: &OsStr,
     ) -> Result<ReplyEntry> {
         perf::fuse_op!("link");
-        let source_path = self.resolve(inode).await?;
-        let new_parent_path = self.resolve(new_parent).await?;
+        let source_path = self.resolve(inode)?;
+        let new_parent_path = self.resolve(new_parent)?;
         let old = source_path;
         let new = new_parent_path.join(new_name);
         if self.patterns.is_empty(&old) || self.patterns.is_empty(&new) {
@@ -1872,14 +1891,18 @@ impl Filesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         if let Err(e) =
-            tokio_fs::hard_link(self.patterns.redirect(&old), self.patterns.redirect(&new)).await
+            std::fs::hard_link(self.patterns.redirect(&old), self.patterns.redirect(&new))
         {
             log_op_err("link", &new, Some(&self.patterns.redirect(&new)), &e).await;
             return Err(e.into());
         }
         log_op_ok("link", &new, &self.patterns.redirect(&new)).await;
-        let inode = self.inodes.write().await.get_or_insert(&new, new_parent);
-        let mut attr = self.attr(&new).await?;
+        let inode = self
+            .inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .get_or_insert(&new, new_parent);
+        let mut attr = self.attr(&new)?;
         attr.ino = inode;
         Ok(ReplyEntry {
             ttl: TTL,
@@ -1897,7 +1920,7 @@ impl Filesystem for HostFs {
         flags: u32,
     ) -> Result<ReplyCreated> {
         perf::fuse_op!("create");
-        let parent_path = self.resolve(parent).await?;
+        let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         let writable = self.patterns.writable(&mirrored);
         if !writable {
@@ -1914,9 +1937,7 @@ impl Filesystem for HostFs {
         // a plain O_CREAT (without O_EXCL) opens an existing file like the
         // host filesystem would. A path merely matched by a wildcard
         // pattern may not exist yet.
-        let existing = tokio_fs::symlink_metadata(self.patterns.redirect(&mirrored))
-            .await
-            .ok();
+        let existing = std::fs::symlink_metadata(self.patterns.redirect(&mirrored)).ok();
         let excl = flags & libc::O_EXCL as u32 != 0;
         let truncate = flags & libc::O_TRUNC as u32 != 0;
         let append = flags & libc::O_APPEND as u32 != 0;
@@ -1951,7 +1972,7 @@ impl Filesystem for HostFs {
                 .await;
                 return Err(libc::EISDIR.into());
             }
-            let mut opts = tokio_fs::OpenOptions::new();
+            let mut opts = std::fs::OpenOptions::new();
             opts.write(true).custom_flags(libc::O_NOFOLLOW);
             if truncate {
                 opts.truncate(true);
@@ -1959,7 +1980,7 @@ impl Filesystem for HostFs {
             if append {
                 opts.append(true);
             }
-            let file = match opts.open(self.patterns.redirect(&mirrored)).await {
+            let file = match opts.open(self.patterns.redirect(&mirrored)) {
                 Ok(f) => f,
                 Err(e) => {
                     log_op_err(
@@ -1972,10 +1993,17 @@ impl Filesystem for HostFs {
                     return Err(e.into());
                 }
             };
-            let md = file.metadata().await?;
+            let md = file.metadata()?;
             log_op_ok("create", &mirrored, &self.patterns.redirect(&mirrored)).await;
-            let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
-            self.inodes.write().await.open_handle(inode);
+            let inode = self
+                .inodes
+                .write()
+                .expect("hostfs inode map poisoned")
+                .get_or_insert(&mirrored, parent);
+            self.inodes
+                .write()
+                .expect("hostfs inode map poisoned")
+                .open_handle(inode);
             let fh = self.insert_handle(file, mirrored, append, writable);
             let mut attr = attr_from_metadata(&md);
             attr.ino = inode;
@@ -1987,7 +2015,7 @@ impl Filesystem for HostFs {
                 flags: 0,
             });
         }
-        let mut opts = tokio_fs::OpenOptions::new();
+        let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         if flags & libc::O_RDWR as u32 != 0 {
             opts.read(true);
@@ -1998,7 +2026,6 @@ impl Filesystem for HostFs {
         let file = match opts
             .mode(mode & 0o7777)
             .open(self.patterns.redirect(&mirrored))
-            .await
         {
             Ok(f) => f,
             Err(e) => {
@@ -2012,11 +2039,18 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
-        let md = file.metadata().await?;
+        let md = file.metadata()?;
         let mut attr = attr_from_metadata(&md);
         log_op_ok("create-new", &mirrored, &self.patterns.redirect(&mirrored)).await;
-        let inode = self.inodes.write().await.get_or_insert(&mirrored, parent);
-        self.inodes.write().await.open_handle(inode);
+        let inode = self
+            .inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .get_or_insert(&mirrored, parent);
+        self.inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .open_handle(inode);
         let fh = self.insert_handle(file, mirrored, append, writable);
         attr.ino = inode;
         Ok(ReplyCreated {
@@ -2044,13 +2078,19 @@ impl Filesystem for HostFs {
         // Drop the cached host file (closing it); the handle bookkeeping
         // is all that remains — IO is stateful but needs no flush.
         self.remove_handle(fh);
-        self.inodes.write().await.close_handle(inode);
+        self.inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .close_handle(inode);
         Err(libc::ENOSYS.into())
     }
 
     async fn releasedir(&self, _req: Request, inode: Inode, _fh: u64, _flags: u32) -> Result<()> {
         perf::fuse_op!("releasedir");
-        self.inodes.write().await.close_handle(inode);
+        self.inodes
+            .write()
+            .expect("hostfs inode map poisoned")
+            .close_handle(inode);
         Ok(())
     }
 }
@@ -2252,7 +2292,7 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
                 // child of the sandboxed command that outlived it. Fall back
                 // to a *lazy* unmount so the mount is detached regardless.
                 fuselog::event!("SERVER unmount failed ({e}), trying lazy unmount");
-                outcome = lazy_unmount(&server_mountpoint).await;
+                outcome = lazy_unmount(&server_mountpoint);
             }
             fuselog::event!("SERVER unmount outcome={outcome:?}");
             // Give the audit writer a chance to flush the last batch
@@ -2317,47 +2357,28 @@ async fn mount_with_fallback(
 /// available). A lazy unmount detaches the mount immediately even while
 /// busy; it disappears for good once the last user is gone — better than a
 /// mount left dangling until the next reboot.
-async fn lazy_unmount(mountpoint: &Path) -> std::io::Result<()> {
-    let mountpoint = mountpoint.to_path_buf();
-    blocking(move || {
-        let via_fusermount = match std::process::Command::new("fusermount3")
-            .args(["-uz"])
-            .arg(&mountpoint)
-            .status()
-        {
-            Ok(status) if status.success() => Ok(()),
-            Ok(_) => Err(std::io::Error::other("fusermount3 -uz failed")),
-            Err(e) => Err(e),
-        };
-        via_fusermount.or_else(|_| {
-            let c = CString::new(mountpoint.as_os_str().as_bytes()).expect("no NUL in mountpoint");
-            if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        })
+fn lazy_unmount(mountpoint: &Path) -> std::io::Result<()> {
+    let via_fusermount = match std::process::Command::new("fusermount3")
+        .args(["-uz"])
+        .arg(mountpoint)
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(std::io::Error::other("fusermount3 -uz failed")),
+        Err(e) => Err(e),
+    };
+    via_fusermount.or_else(|_| {
+        let c = CString::new(mountpoint.as_os_str().as_bytes()).expect("no NUL in mountpoint");
+        if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     })
-    .await
 }
 
 fn die(msg: &str) -> ! {
     crate::sandbox::die(msg)
-}
-
-/// Run a raw libc call (which has no tokio wrapper) on tokio's blocking
-/// pool, so the FUSE session's event loop is never stalled by host IO. The
-/// `HostFs` itself is cloned in: it holds only the compiled patterns, so
-/// cloning is cheap. Everything that has a `tokio::fs` equivalent uses
-/// that directly instead.
-async fn blocking<T, F>(f: F) -> T
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .expect("blocking hostfs task panicked")
 }
 
 #[cfg(test)]
