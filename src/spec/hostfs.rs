@@ -785,7 +785,7 @@ impl HostFsConfig {
     /// filesystem). A multi-glob mapping contributes one entry per glob,
     /// in listed order — exactly like separate mappings.
     pub fn patterns(&self) -> Patterns {
-        Patterns(
+        Patterns::new(
             self.mappings
                 .iter()
                 .flat_map(|m| {
@@ -940,7 +940,7 @@ mod tests {
         );
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![
+            Patterns::new(vec![
                 ("/etc/*.conf".to_string(), Permission::Ro),
                 ("/home/me/project".to_string(), Permission::Rw)
             ])
@@ -958,7 +958,7 @@ mod tests {
         );
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![
+            Patterns::new(vec![
                 ("/etc".to_string(), Permission::Rw),
                 ("/etc/passwd".to_string(), Permission::Hide),
                 ("/dev".to_string(), Permission::Empty)
@@ -1016,7 +1016,7 @@ mod tests {
         );
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![
+            Patterns::new(vec![
                 ("/etc".to_string(), Permission::Rw),
                 ("/etc/passwd".to_string(), Permission::Rw),
                 ("/etc/passwd".to_string(), Permission::Hide),
@@ -1148,7 +1148,7 @@ mod tests {
         );
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![
+            Patterns::new(vec![
                 ("/dev".to_string(), Permission::Empty),
                 ("/tmp".to_string(), Permission::Empty)
             ])
@@ -1183,7 +1183,7 @@ mod tests {
         // at its sandbox destination.
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![
+            Patterns::new(vec![
                 ("/dev".to_string(), Permission::Empty),
                 ("/tmp".to_string(), Permission::Empty),
                 ("/var/tmp".to_string(), Permission::Empty),
@@ -1245,7 +1245,7 @@ mod tests {
         );
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![("/usr".to_string(), Permission::Empty)])
+            Patterns::new(vec![("/usr".to_string(), Permission::Empty)])
         );
         assert_eq!(
             spec.hostfs.ops(),
@@ -1273,7 +1273,7 @@ mod tests {
             parse(r#"{ "hostfs": { "mappings": [ { "type": "dev" }, { "type": "proc" } ] } }"#);
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![
+            Patterns::new(vec![
                 ("/dev".to_string(), Permission::Empty),
                 ("/proc".to_string(), Permission::Empty)
             ])
@@ -1300,7 +1300,7 @@ mod tests {
         );
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![(
+            Patterns::new(vec![(
                 "/etc/resolv.conf".to_string(),
                 Permission::Inject {
                     content: "nameserver 127.0.0.2\n".to_string()
@@ -1352,8 +1352,13 @@ mod tests {
         // Before preparation the mappings are pure FUSE (no ops), backed
         // by writable redirects with a not-yet-resolved source.
         assert!(spec.hostfs.ops().is_empty());
-        for (_, permission) in spec.hostfs.patterns().0 {
-            assert!(permission.is_writable());
+        for path in ["/home/me/.cache", "/home/other/.local", "/home/me/.local"] {
+            assert!(
+                spec.hostfs
+                    .patterns()
+                    .permission_of(Path::new(path))
+                    .is_some_and(|p| p.is_writable())
+            );
         }
         assert!(spec.hostfs.has_session_caches());
         assert_eq!(
@@ -1438,7 +1443,7 @@ mod tests {
         );
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![
+            Patterns::new(vec![
                 (
                     "/bla".to_string(),
                     Permission::Redirect {
@@ -1614,7 +1619,7 @@ mod tests {
         );
         assert_eq!(
             spec.hostfs.patterns(),
-            Patterns(vec![("/etc".to_string(), Permission::Empty)])
+            Patterns::new(vec![("/etc".to_string(), Permission::Empty)])
         );
         // A relative `path` is rejected just like a relative `src`.
         assert!(

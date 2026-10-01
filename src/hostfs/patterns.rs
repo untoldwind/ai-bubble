@@ -95,17 +95,43 @@ impl std::fmt::Display for Permission {
 /// (glob pattern, permission) pairs — the compiled-down form of the
 /// spec's [`crate::spec::hostfs::Mapping`] list. That order matters: when
 /// a path matches several patterns, the **last** matching pattern decides.
+///
+/// The globs are compiled once, at construction ([`Patterns::new`]): an
+/// invalid pattern is a hard error there, not a silently ignored entry.
+/// The type is opaque — permission questions go through
+/// [`Patterns::permission_of`]; the compiled patterns stay inside.
 #[derive(Debug, Default, PartialEq, Clone)]
-pub struct Patterns(pub Vec<(String, Permission)>);
+pub struct Patterns {
+    patterns: Vec<(Pattern, Permission)>,
+}
 
 impl Patterns {
-    /// The pattern/permission pairs, in spec order.
-    pub fn iter(&self) -> impl Iterator<Item = &(String, Permission)> {
-        self.0.iter()
+    /// Compile the pattern → permission list. Invalid patterns are a hard
+    /// error: a spec that cannot be compiled must not run at all.
+    pub fn new(patterns: Vec<(String, Permission)>) -> Patterns {
+        Patterns {
+            patterns: patterns
+                .into_iter()
+                .map(|(pattern, permission)| {
+                    let compiled = Pattern::new(&pattern).unwrap_or_else(|e| {
+                        crate::sandbox::die(&format!("Invalid hostfs pattern: {e}"))
+                    });
+                    (compiled, permission)
+                })
+                .collect(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.patterns.is_empty()
+    }
+
+    /// Whether any pattern grants write access: the FUSE mount is mounted
+    /// read-only unless it does.
+    pub fn any_writable(&self) -> bool {
+        self.patterns
+            .iter()
+            .any(|(_, permission)| permission.is_writable())
     }
 
     /// The permission governing the path in the sandbox: the single source
@@ -128,18 +154,12 @@ impl Patterns {
     ///   everything below,
     /// * otherwise the path is not visible in the sandbox at all (`None`).
     pub fn permission_of(&self, path: &Path) -> Option<&Permission> {
-        // `*` must not cross directory separators, like in a shell.
-        let compiled: Vec<(Pattern, &Permission)> = self
-            .0
-            .iter()
-            .filter_map(|(pattern, permission)| Pattern::new(pattern).ok().map(|p| (p, permission)))
-            .collect();
         let direct = |p: &Path| {
-            compiled
+            self.patterns
                 .iter()
                 .rev()
                 .find(|(pattern, _)| pattern.matches(p))
-                .map(|(_, permission)| *permission)
+                .map(|(_, permission)| permission)
         };
         // Everything strictly below an empty or an injected path is
         // invisible: an empty path is covered by a mount inside the
@@ -158,11 +178,11 @@ impl Patterns {
         // naming the path itself or a strict ancestor, before any direct
         // permission), so the last-match rule below only applies among
         // the non-`hide` patterns.
-        if compiled.iter().any(|(pattern, permission)| {
-            **permission == Permission::Hide
+        if let Some((_, permission)) = self.patterns.iter().find(|(pattern, permission)| {
+            *permission == Permission::Hide
                 && (pattern.matches(path) || pattern.walk(path) == Walk::Ancestor)
         }) {
-            return Some(&Permission::Hide);
+            return Some(permission);
         }
         // The last pattern naming the path itself decides.
         if let Some(permission) = direct(path) {
@@ -174,6 +194,215 @@ impl Patterns {
             .skip(1)
             .find_map(|a| direct(a).filter(|p| p.is_mirrored()))
     }
+
+    /// Whether the path is hidden because a pattern hides it directly, or
+    /// a hidden pattern names one of its strict ancestors (a hidden
+    /// directory hides its whole subtree).
+    pub fn hidden(&self, mirrored: &Path) -> bool {
+        self.patterns.iter().any(|(pattern, permission)| {
+            *permission == Permission::Hide
+                && (pattern.matches(mirrored) || pattern.walk(mirrored) == Walk::Ancestor)
+        })
+    }
+
+    /// Whether some `empty` pattern could still match something *strictly
+    /// below* the given path — i.e. the path acts as a (possibly purely
+    /// virtual) directory leading to empty paths, and must stay navigable
+    /// even when the mirror knows nothing about it.
+    pub fn is_empty_prefix(&self, mirrored: &Path) -> bool {
+        self.patterns.iter().any(|(pattern, permission)| {
+            *permission == Permission::Empty && self.pattern_reaches(pattern, mirrored)
+        })
+    }
+
+    /// Whether some `inject` pattern could still match something *strictly
+    /// below* the given path — i.e. the path acts as a (possibly purely
+    /// virtual) directory leading to injected files, and must stay
+    /// navigable (and listable) even when the mirror knows nothing about
+    /// it otherwise.
+    pub fn is_inject_prefix(&self, mirrored: &Path) -> bool {
+        self.patterns.iter().any(|(pattern, permission)| {
+            matches!(permission, Permission::Inject { .. })
+                && pattern.walk(mirrored) == Walk::CouldReach
+        })
+    }
+
+    /// Whether some **mirrored** pattern could still match something
+    /// *strictly below* the given path — i.e. the path acts as a
+    /// (possibly virtual) directory of the mirror, leading to matches
+    /// deeper down. Denied patterns never make a path navigable.
+    pub fn dir_prefix(&self, mirrored: &Path) -> bool {
+        if mirrored == Path::new("/") {
+            return self.patterns.iter().any(|(_, permission)| {
+                matches!(
+                    permission,
+                    Permission::Ro | Permission::Rw | Permission::Empty | Permission::Inject { .. }
+                )
+            });
+        }
+        self.patterns
+            .iter()
+            .any(|(pattern, permission)| match permission {
+                // An injected pattern is an exact file: only paths
+                // *strictly above* it (CouldReach) are navigable as its
+                // virtual parent directories — a path below the injected
+                // file (Ancestor) exists just as little as the file's
+                // non-existent children.
+                Permission::Inject { .. } => pattern.walk(mirrored) == Walk::CouldReach,
+                _ => permission.is_mirrored() && self.pattern_reaches(pattern, mirrored),
+            })
+            || self.is_empty_prefix(mirrored)
+    }
+
+    /// The **real host path** the given **mirrored path** resolves to:
+    /// the mirrored path itself — unless a redirect permission remaps it.
+    /// The **last** pattern
+    /// naming the path decides (as everywhere else); when no pattern names
+    /// the path itself, the nearest *directly matched* mirrored ancestor
+    /// does: a redirected directory shows its whole subtree, so everything
+    /// below it is remapped onto the source plus the remaining path
+    /// components. Redirects only ever map literal paths, so the remap is a
+    /// simple prefix replacement.
+    pub fn redirect(&self, mirrored: &Path) -> PathBuf {
+        let direct = |p: &Path| {
+            self.patterns
+                .iter()
+                .rev()
+                .find(|(pattern, _)| pattern.matches(p))
+        };
+        // The path itself: the last matching pattern says whether (and
+        // where) it is redirected.
+        if let Some((_, permission)) = direct(mirrored) {
+            if let Some(source) = permission.redirect_source() {
+                return source.to_path_buf();
+            }
+            return mirrored.to_path_buf();
+        }
+        // Otherwise the nearest directly matched mirrored ancestor decides
+        // (the mirror is recursive, so its redirect extends to everything
+        // below it). Non-mirrored ancestors are skipped, exactly like in
+        // `permission_of`.
+        for ancestor in mirrored.ancestors().skip(1) {
+            if let Some((_, permission)) = direct(ancestor)
+                && permission.is_mirrored()
+            {
+                if let Some(source) = permission.redirect_source()
+                    && let Ok(rest) = mirrored.strip_prefix(ancestor)
+                {
+                    return source.join(rest);
+                }
+                return mirrored.to_path_buf();
+            }
+        }
+        mirrored.to_path_buf()
+    }
+
+    /// Whether some `hide` or `ro` pattern might apply to a path strictly
+    /// below the given directory — without being uniformly shadowed there
+    /// by a writable pattern that covers the whole subtree.
+    ///
+    /// This is the rename-restriction check: a directory rename carries
+    /// every child from one pattern context to another, so a `hide` or
+    /// `ro` rule that might govern a child must block the move — moving
+    /// the directory out of such a rule's reach would expose (or make
+    /// writable) content that the spec hides or keeps read-only, and
+    /// moving *into* such a subtree would plant content that a later
+    /// move back out could expose the same way. Checked for both the
+    /// source and the destination of a directory rename.
+    pub fn subtree_restricted(&self, dir: &Path) -> bool {
+        for (idx, (pattern, permission)) in self.patterns.iter().enumerate() {
+            if !matches!(permission, Permission::Ro | Permission::Hide) {
+                continue;
+            }
+            let Some((walk, depth)) = pattern.walk_depth(dir) else {
+                continue;
+            };
+            // How the pattern might govern a strictly-below path:
+            //
+            // * `StarStar`/`CouldReach`: the pattern matches — or could
+            //   match — paths below the directory *directly*, so the
+            //   last-match rule applies and only a **later** pattern
+            //   naming every possible child can shadow it (`**` covers
+            //   the directory and everything below it).
+            // * `Exact`: the pattern names the directory itself — a `hide`
+            //   hides the whole subtree (never shadowable), an `ro` mirror
+            //   is recursive, so its permission reaches every child.
+            // * `Ancestor`: the pattern names a strict ancestor — it
+            //   governs children only through the hide-ancestor rule
+            //   (`hide`, never shadowable) or the nearest-mirrored-
+            //   ancestor fallback (`ro`), which a *deeper* mirrored
+            //   writable ancestor replaces regardless of list order.
+            let shadowed = if matches!(walk, Walk::StarStar | Walk::CouldReach) {
+                self.patterns[idx + 1..].iter().any(|(q, q_permission)| {
+                    q_permission.is_writable() && matches!(q.walk(dir), Walk::StarStar)
+                })
+            } else if walk == Walk::Exact {
+                // The last pattern naming the directory itself decides
+                // the children's fallback permission; a writable one
+                // replaces the `ro` (a `hide` there would have hidden
+                // the directory, and the rename is rejected before this
+                // check even runs).
+                self.patterns[idx + 1..]
+                    .iter()
+                    .rev()
+                    .find(|(q, _)| q.matches(dir))
+                    .is_some_and(|(_, q)| q.is_writable())
+            } else {
+                // Walk::Ancestor: any writable mirrored pattern that
+                // covers the directory itself (or reaches deeper than
+                // this pattern does) is the nearer mirrored ancestor of
+                // every child.
+                self.patterns.iter().any(|(q, q_permission)| {
+                    q_permission.is_writable()
+                        && q.walk_depth(dir).is_some_and(|(w, d)| match w {
+                            Walk::StarStar | Walk::Exact => true,
+                            Walk::Ancestor => d > depth,
+                            Walk::CouldReach | Walk::Fail => false,
+                        })
+                })
+            };
+            if !shadowed {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The path components the patterns could name **directly** below the
+    /// given directory with a purely literal next component — the virtual
+    /// directory entries the real host directory cannot provide: `empty`
+    /// paths, injected files and redirect destinations. Deduplicated, in
+    /// pattern order. The mirror still decides visibility (it checks the
+    /// child's existence and, for redirects, whether the target is there).
+    pub fn virtual_children(&self, dir: &Path) -> Vec<(String, &Permission)> {
+        let mut out = Vec::new();
+        for (pattern, permission) in &self.patterns {
+            if !matches!(
+                permission,
+                Permission::Empty | Permission::Inject { .. } | Permission::Redirect { .. }
+            ) {
+                continue;
+            }
+            if let Some(name) = pattern.next_literal(dir)
+                && out.iter().all(|(n, _)| *n != name)
+            {
+                out.push((name, permission));
+            }
+        }
+        out
+    }
+
+    /// Whether the pattern could make the path visible as a directory
+    /// leading to content: it has components left after the path is
+    /// consumed, or the path hit (or ends at) a `**`, or the pattern names
+    /// a strict ancestor of the path — an exactly-named directory is
+    /// mirrored recursively, so everything below it is visible.
+    fn pattern_reaches(&self, pattern: &Pattern, mirrored: &Path) -> bool {
+        matches!(
+            pattern.walk(mirrored),
+            Walk::CouldReach | Walk::StarStar | Walk::Ancestor
+        )
+    }
 }
 
 #[cfg(test)]
@@ -183,7 +412,7 @@ mod tests {
     #[test]
     fn permission_of_follows_hostfs_semantics() {
         // Direct matches: the last pattern naming the path decides.
-        let patterns = Patterns(vec![
+        let patterns = Patterns::new(vec![
             ("/etc".to_string(), Permission::Ro),
             ("/etc/*.conf".to_string(), Permission::Rw),
             ("/etc/passwd".to_string(), Permission::Hide),
@@ -208,13 +437,13 @@ mod tests {
 
         // No direct match: mirrored directories are recursive, so their
         // permission is inherited by everything below them.
-        let patterns = Patterns(vec![("/home/me/project".to_string(), Permission::Rw)]);
+        let patterns = Patterns::new(vec![("/home/me/project".to_string(), Permission::Rw)]);
         assert_eq!(
             patterns.permission_of(Path::new("/home/me/project/src/main.rs")),
             Some(&Permission::Rw)
         );
         // ...and the nearest mirrored ancestor wins over a farther one.
-        let patterns = Patterns(vec![
+        let patterns = Patterns::new(vec![
             ("/home/me".to_string(), Permission::Rw),
             ("/home/me/project".to_string(), Permission::Ro),
         ]);
@@ -224,7 +453,7 @@ mod tests {
         );
 
         // A hidden directory hides its whole subtree.
-        let patterns = Patterns(vec![
+        let patterns = Patterns::new(vec![
             ("/home/me".to_string(), Permission::Rw),
             ("/home/me/project/target".to_string(), Permission::Hide),
         ]);
@@ -234,7 +463,7 @@ mod tests {
         );
 
         // Everything strictly below an empty path is invisible.
-        let patterns = Patterns(vec![
+        let patterns = Patterns::new(vec![
             ("/etc".to_string(), Permission::Ro),
             ("/dev".to_string(), Permission::Empty),
         ]);
@@ -293,5 +522,174 @@ mod tests {
             Some(&Permission::Rw)
         );
         std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// A `Patterns` from (pattern, permission) pairs, like the mirror's
+    /// spec lists — but without involving the FUSE filesystem.
+    fn ps(entries: &[(&str, Permission)]) -> Patterns {
+        Patterns::new(
+            entries
+                .iter()
+                .map(|(p, perm)| (p.to_string(), perm.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn redirect_resolves_to_the_source_path() {
+        let patterns = ps(&[
+            (
+                "/bla",
+                Permission::Redirect {
+                    source: PathBuf::from("/otherdir"),
+                    writable: false,
+                },
+            ),
+            ("/etc/passwd", Permission::Ro),
+        ]);
+
+        // The redirect destination maps exactly onto the source.
+        assert_eq!(
+            patterns.redirect(Path::new("/bla")),
+            PathBuf::from("/otherdir")
+        );
+        // ...and everything below it onto the source plus the rest.
+        assert_eq!(
+            patterns.redirect(Path::new("/bla/sub/file.txt")),
+            PathBuf::from("/otherdir/sub/file.txt")
+        );
+        // Non-redirected paths resolve to themselves.
+        assert_eq!(
+            patterns.redirect(Path::new("/etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        assert_eq!(patterns.redirect(Path::new("/")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn redirect_obeys_last_match_wins() {
+        // A later plain mapping naming the redirected path (or something
+        // below it) wins over the redirect, like with every mapping.
+        let patterns = ps(&[
+            (
+                "/bla",
+                Permission::Redirect {
+                    source: PathBuf::from("/otherdir"),
+                    writable: false,
+                },
+            ),
+            ("/bla/plain", Permission::Ro),
+        ]);
+        // /bla itself is still redirected...
+        assert_eq!(
+            patterns.redirect(Path::new("/bla")),
+            PathBuf::from("/otherdir")
+        );
+        // ...but /bla/plain is mirrored plainly (its own last match), and
+        // /bla/plain/x inherits the *plain* mirror, not the redirect.
+        assert_eq!(
+            patterns.redirect(Path::new("/bla/plain")),
+            PathBuf::from("/bla/plain")
+        );
+        assert_eq!(
+            patterns.redirect(Path::new("/bla/plain/x")),
+            PathBuf::from("/bla/plain/x")
+        );
+        // Everything else below /bla follows the redirect.
+        assert_eq!(
+            patterns.redirect(Path::new("/bla/other/x")),
+            PathBuf::from("/otherdir/other/x")
+        );
+    }
+
+    #[test]
+    fn restricted_subtrees_block_directory_renames() {
+        // The motivating case: `/project/src` is rw, but a followup hide
+        // glob might apply to one of its children — the directory must
+        // not be renamable (out of, or into, its pattern context).
+        let patterns = ps(&[
+            ("/project/src", Permission::Rw),
+            ("/project/src/**/*.bin", Permission::Hide),
+        ]);
+        assert_eq!(
+            patterns.permission_of(Path::new("/project/src")),
+            Some(&Permission::Rw)
+        );
+        assert!(patterns.subtree_restricted(Path::new("/project/src")));
+        // Moving some other directory to /project/src is restricted, too:
+        // the *destination* subtree carries the hide rule.
+        assert!(patterns.subtree_restricted(Path::new("/project/src")));
+        assert!(!patterns.subtree_restricted(Path::new("/elsewhere")));
+        // Unrelated directories are not restricted.
+        assert!(!patterns.subtree_restricted(Path::new("/other/place")));
+
+        // The same holds for an ro glob below a writable directory.
+        let patterns = ps(&[
+            ("/project/src", Permission::Rw),
+            ("/project/src/**/*.bin", Permission::Ro),
+        ]);
+        assert!(patterns.subtree_restricted(Path::new("/project/src")));
+
+        // An exactly-named ro directory is a recursive mirror: its
+        // children are read-only, so it must not be renamable either.
+        let patterns = ps(&[
+            ("/project", Permission::Rw),
+            ("/project/src", Permission::Ro),
+        ]);
+        assert!(patterns.subtree_restricted(Path::new("/project/src")));
+        // ...and the writable parent is restricted, too: the ro child
+        // (and its subtree) would travel with the rename.
+        assert!(patterns.subtree_restricted(Path::new("/project")));
+        // A sibling subtree without the ro rule inside stays free.
+        assert!(!patterns.subtree_restricted(Path::new("/project/other")));
+    }
+
+    #[test]
+    fn a_writable_recursive_mirror_shadows_ro_ancestors() {
+        // A broad ro pattern above a deeper rw mirror: the rw mirror is
+        // the nearer mirrored ancestor of everything below it, so the ro
+        // pattern never governs the children — renames inside stay free.
+        let patterns = ps(&[("/", Permission::Ro), ("/home/me/work", Permission::Rw)]);
+        assert!(!patterns.subtree_restricted(Path::new("/home/me/work/sub")));
+        // Outside the rw mirror the ro ancestor still governs.
+        assert!(patterns.subtree_restricted(Path::new("/home/elsewhere")));
+
+        // A `**` rw pattern shadows equally (it names every child).
+        let patterns = ps(&[("/home", Permission::Ro), ("/home/me/**", Permission::Rw)]);
+        assert!(!patterns.subtree_restricted(Path::new("/home/me/work")));
+        // ...but only from below the `**`: /home itself is still ro-governed.
+        assert!(patterns.subtree_restricted(Path::new("/home/other")));
+
+        // Shadowing needs the shadowing pattern to come *after* the
+        // restrictive one: here the later ro re-restricts the subtree.
+        let patterns = ps(&[
+            ("/home", Permission::Ro),
+            ("/home/me/**", Permission::Rw),
+            ("/home/me/work/*.key", Permission::Ro),
+        ]);
+        assert!(patterns.subtree_restricted(Path::new("/home/me/work")));
+    }
+
+    #[test]
+    fn an_rw_dir_named_after_the_ro_rule_shadows_it() {
+        // The ro pattern names the directory itself; a later rw pattern
+        // naming it too hands the children's fallback permission to the
+        // writable mirror — renames stay allowed.
+        let patterns = ps(&[
+            ("/project/src", Permission::Ro),
+            ("/project/src", Permission::Rw),
+        ]);
+        assert!(!patterns.subtree_restricted(Path::new("/project/src")));
+        // Without the later rw, the ro governs: restricted.
+        let patterns = ps(&[("/project/src", Permission::Ro)]);
+        assert!(patterns.subtree_restricted(Path::new("/project/src")));
+    }
+
+    #[test]
+    fn hidden_directories_are_always_restricted_subtrees() {
+        let patterns = ps(&[("/project/src", Permission::Hide)]);
+        assert!(patterns.subtree_restricted(Path::new("/project/src")));
+        assert!(patterns.subtree_restricted(Path::new("/project")));
+        assert!(!patterns.subtree_restricted(Path::new("/other")));
     }
 }

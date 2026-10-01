@@ -1,4 +1,3 @@
-
 use super::file::Spec;
 use super::internal::{Op, SandboxConfig};
 use super::tmpfs::TmpfsPerms;
@@ -551,6 +550,8 @@ fn unset_env_vars_are_an_error_and_refs_expand() {
 
 #[test]
 fn env_expansion_applies_only_to_path_like_mapping_fields() {
+    use crate::hostfs::patterns::{Patterns, Permission};
+
     unsafe { std::env::set_var("RS_BUBBLE_TEST_HOME", "/home/me") };
     // The path-like mapping fields are expanded...
     let spec = parse(
@@ -565,24 +566,23 @@ fn env_expansion_applies_only_to_path_like_mapping_fields() {
             { "type": "symlink", "src": "${RS_BUBBLE_TEST_HOME}/target", "dest": "/link" }
         ] } }"#,
     );
-    let patterns: Vec<_> = spec
-        .hostfs
-        .patterns()
-        .0
-        .iter()
-        .map(|(p, _)| p.clone())
-        .collect();
     assert_eq!(
-        patterns,
-        vec![
-            "/home/me/project",
-            "/home/me/empty",
-            "/home/me/dev",
-            "/home/me/tmp",
-            "/home/me/proc",
-            "/home/me/dest",
-            "/home/me/at",
-        ]
+        spec.hostfs.patterns(),
+        Patterns::new(vec![
+            ("/home/me/project".to_string(), Permission::Ro),
+            ("/home/me/empty".to_string(), Permission::Empty),
+            ("/home/me/dev".to_string(), Permission::Empty),
+            ("/home/me/tmp".to_string(), Permission::Empty),
+            ("/home/me/proc".to_string(), Permission::Empty),
+            ("/home/me/dest".to_string(), Permission::Empty),
+            (
+                "/home/me/at".to_string(),
+                Permission::Redirect {
+                    source: PathBuf::from("/home/me/src"),
+                    writable: true
+                }
+            ),
+        ])
     );
     let ops = spec.hostfs.ops();
     if let [

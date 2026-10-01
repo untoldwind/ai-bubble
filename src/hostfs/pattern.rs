@@ -62,7 +62,7 @@ enum ClassItem {
 }
 
 /// One path component of a compiled pattern.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Comp {
     /// `**`: spans directories.
     DoubleStar,
@@ -73,7 +73,7 @@ enum Comp {
 
 /// A compiled mirror pattern: a sequence of path components, each either
 /// literal-with-wildcards or a `**`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pattern {
     comps: Vec<Comp>,
 }
