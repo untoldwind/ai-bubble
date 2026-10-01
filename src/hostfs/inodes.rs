@@ -96,11 +96,17 @@ impl InodeMap {
         map
     }
 
-    /// The path of a nodeid, falling back to the last known path while open
-    /// handles remain on a node that lost its lookup references. `None` means
-    /// the kernel dentry is unknown to the map — ENOENT for the caller.
-    pub(crate) fn path_of(&self, inode: Inode) -> Option<PathBuf> {
-        let path = self.inodes.get(&inode).map(|entry| entry.path.clone());
+    /// The mirrored path of a nodeid, falling back to the last known path
+    /// while open handles remain on a node that lost its lookup references.
+    /// `None` means the kernel dentry is unknown to the map — ENOENT for the
+    /// caller.
+    ///
+    /// Borrowed, so the caller decides whether to clone it. Every path in the
+    /// map is built from an already-mirrored path (see [`InodeMap::new`] and
+    /// [`InodeMap::get_or_insert`]), so the result needs no further mapping:
+    /// it is directly usable as the *mirrored* path for pattern matching.
+    pub(crate) fn path_of(&self, inode: Inode) -> Option<&Path> {
+        let path = self.inodes.get(&inode).map(|entry| entry.path.as_path());
         if path.is_none() {
             fuselog::event(&format!("INODE no-path inode={inode}"));
         }
@@ -315,7 +321,7 @@ mod tests {
     #[test]
     fn root_is_inode_one_and_its_own_parent() {
         let map = InodeMap::new();
-        assert_eq!(map.path_of(ROOT_INODE).as_deref(), Some(Path::new("/")));
+        assert_eq!(map.path_of(ROOT_INODE), Some(Path::new("/")));
         assert_eq!(map.parent_of(ROOT_INODE), Some(ROOT_INODE));
     }
 
@@ -340,7 +346,7 @@ mod tests {
         map.rename(Path::new("/old"), Path::new("/new"), ROOT_INODE);
 
         // The kernel's moved dentry (nodeid `src`) now resolves at /new...
-        assert_eq!(map.path_of(src).as_deref(), Some(Path::new("/new")));
+        assert_eq!(map.path_of(src), Some(Path::new("/new")));
         assert_eq!(map.path_to_inode.get(Path::new("/new")), Some(&src));
         assert_eq!(map.inode_of(Path::new("/new")), Some(src));
         // ...and the overwritten target's mapping is gone: its `forget`
@@ -359,7 +365,7 @@ mod tests {
 
         map.rename(Path::new("/old"), Path::new("/moved"), ROOT_INODE);
 
-        assert_eq!(map.path_of(src).as_deref(), Some(Path::new("/moved")));
+        assert_eq!(map.path_of(src), Some(Path::new("/moved")));
         assert_eq!(map.inode_of(Path::new("/old")), None);
     }
 
@@ -375,10 +381,10 @@ mod tests {
 
         // The kernel keeps the child dentries (with their nodeids) and
         // rehashes them under the new parent without re-looking them up.
-        assert_eq!(map.path_of(dir).as_deref(), Some(Path::new("/d-final")));
-        assert_eq!(map.path_of(file).as_deref(), Some(Path::new("/d-final/f")));
+        assert_eq!(map.path_of(dir), Some(Path::new("/d-final")));
+        assert_eq!(map.path_of(file), Some(Path::new("/d-final/f")));
         assert_eq!(
-            map.path_of(deep).as_deref(),
+            map.path_of(deep),
             Some(Path::new("/d-final/sub/deep"))
         );
         assert_eq!(map.inode_of(Path::new("/d-final/f")), Some(file));
@@ -398,9 +404,9 @@ mod tests {
 
         map.rename(Path::new("/d"), Path::new("/e"), ROOT_INODE);
 
-        assert_eq!(map.path_of(file).as_deref(), Some(Path::new("/e/f")));
+        assert_eq!(map.path_of(file), Some(Path::new("/e/f")));
         assert_eq!(
-            map.path_of(sibling_file).as_deref(),
+            map.path_of(sibling_file),
             Some(Path::new("/d-other/f"))
         );
         assert_eq!(map.inode_of(Path::new("/e/f")), Some(file));
@@ -419,7 +425,7 @@ mod tests {
         map.release_path(Path::new("/d-working/f"));
         map.rename(Path::new("/d-working"), Path::new("/d-final"), ROOT_INODE);
 
-        assert_eq!(map.path_of(file).as_deref(), Some(Path::new("/d-final/f")));
+        assert_eq!(map.path_of(file), Some(Path::new("/d-final/f")));
 
         map.close_handle(file);
         assert_eq!(map.path_of(file), None);
@@ -444,7 +450,7 @@ mod tests {
         assert_eq!(map.path_of(a), None);
 
         map.forget(ROOT_INODE);
-        assert_eq!(map.path_of(ROOT_INODE).as_deref(), Some(Path::new("/")));
+        assert_eq!(map.path_of(ROOT_INODE), Some(Path::new("/")));
     }
 
     #[test]
@@ -455,7 +461,7 @@ mod tests {
 
         map.forget(a);
         // The handle keeps the nodeid (and its last path) alive...
-        assert_eq!(map.path_of(a).as_deref(), Some(Path::new("/a")));
+        assert_eq!(map.path_of(a), Some(Path::new("/a")));
 
         // ...but a fresh node is mapped at the same path independently.
         let b = map.get_or_insert(Path::new("/a"), ROOT_INODE);
@@ -475,7 +481,7 @@ mod tests {
         map.open_handle(a);
 
         map.release_path(Path::new("/a"));
-        assert_eq!(map.path_of(a).as_deref(), Some(Path::new("/a")));
+        assert_eq!(map.path_of(a), Some(Path::new("/a")));
         assert_eq!(map.inode_of(Path::new("/a")), None);
 
         map.close_handle(a);
@@ -498,8 +504,8 @@ mod tests {
         // the path mapping that now belongs to another nodeid. The zombie
         // keeps its last path for the still-open handle.
         assert_eq!(map.inode_of(Path::new("/p")), Some(src));
-        assert_eq!(map.path_of(src).as_deref(), Some(Path::new("/p")));
-        assert_eq!(map.path_of(old).as_deref(), Some(Path::new("/p")));
+        assert_eq!(map.path_of(src), Some(Path::new("/p")));
+        assert_eq!(map.path_of(old), Some(Path::new("/p")));
 
         map.close_handle(old);
         assert_eq!(map.path_of(old), None);

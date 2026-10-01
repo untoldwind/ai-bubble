@@ -437,11 +437,16 @@ impl HostFs {
     /// Resolve a nodeid to its mirrored path (falling back to a zombie's
     /// last path while open handles remain), or ENOENT when the kernel
     /// dentry is unknown to the map.
+    ///
+    /// The map stores mirrored paths already, so the result is used directly:
+    /// there is no second `mirror_path` parse on the hot path. The lock guard
+    /// is dropped before returning, hence the single owned clone.
     async fn resolve(&self, inode: Inode) -> std::io::Result<PathBuf> {
         self.inodes
             .read()
             .await
             .path_of(inode)
+            .map(Path::to_path_buf)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))
     }
 
@@ -506,21 +511,6 @@ impl HostFs {
                 && tokio_fs::symlink_metadata(self.redirect(mirrored))
                     .await
                     .is_err()
-    }
-
-    /// Map a sandbox-relative path (as passed by the FUSE bridge, without a
-    /// leading slash) to the **mirrored** path: the path as the mirror — and
-    /// thus the sandboxed child — sees it. The mirror reproduces full host
-    /// paths, so `/host/etc/passwd` maps to `/etc/passwd`. (Only a redirect
-    /// makes the mirrored path differ from the real host path; see
-    /// [`HostFs::redirect`].)
-    fn mirror_path(&self, path: &OsStr) -> PathBuf {
-        let rel = Path::new(path);
-        let mut mirrored = PathBuf::from("/");
-        for component in rel.components() {
-            mirrored.push(component);
-        }
-        mirrored
     }
 
     /// The **real host path** the given **mirrored path** resolves to:
@@ -1115,7 +1105,7 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
-        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
+        let mirrored = parent_path.join(name);
         if self.exists(&mirrored) {
             match self.attr(&mirrored).await {
                 Ok(mut attr) => {
@@ -1157,19 +1147,18 @@ impl Filesystem for HostFs {
         _fh: Option<u64>,
         _flags: u32,
     ) -> Result<ReplyAttr> {
-        let p = match self.resolve(inode).await {
+        let mirrored = match self.resolve(inode).await {
             Ok(p) => p,
             Err(e) => {
                 fuselog::event(&format!("INODE getattr no-path inode={inode}"));
                 return Err(e.into());
             }
         };
-        if is_root(p.as_os_str()) {
+        if is_root(mirrored.as_os_str()) {
             let mut attr = root_attr(self.uid, self.gid);
             attr.ino = inode;
             return Ok(ReplyAttr { ttl: TTL, attr });
         }
-        let mirrored = self.mirror_path(p.as_os_str());
         if self.exists(&mirrored) {
             match self.attr(&mirrored).await {
                 Ok(mut attr) => {
@@ -1193,8 +1182,7 @@ impl Filesystem for HostFs {
     }
 
     async fn readlink(&self, _req: Request, inode: Inode) -> Result<ReplyData> {
-        let p = self.resolve(inode).await?;
-        let mirrored = self.mirror_path(p.as_os_str());
+        let mirrored = self.resolve(inode).await?;
         if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
@@ -1205,8 +1193,7 @@ impl Filesystem for HostFs {
     }
 
     async fn open(&self, _req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
-        let p = self.resolve(inode).await?;
-        let mirrored = self.mirror_path(p.as_os_str());
+        let mirrored = self.resolve(inode).await?;
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
         if !self.exists(&mirrored) {
@@ -1334,7 +1321,7 @@ impl Filesystem for HostFs {
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
-        let p = match self.resolve(inode).await {
+        let mirrored = match self.resolve(inode).await {
             Ok(p) => p,
             Err(e) => {
                 log_op_err(
@@ -1347,7 +1334,6 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
-        let mirrored = self.mirror_path(p.as_os_str());
         if !self.exists(&mirrored) {
             log_op_err(
                 "read",
@@ -1428,7 +1414,7 @@ impl Filesystem for HostFs {
         _write_flags: u32,
         flags: u32,
     ) -> Result<ReplyWrite> {
-        let p = match self.resolve(inode).await {
+        let mirrored = match self.resolve(inode).await {
             Ok(p) => p,
             Err(e) => {
                 log_op_err(
@@ -1441,7 +1427,6 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
-        let mirrored = self.mirror_path(p.as_os_str());
         if !self.exists(&mirrored) {
             log_op_err(
                 "write",
@@ -1534,8 +1519,7 @@ impl Filesystem for HostFs {
         // the root), so tools like `df` behave sensibly. The path is opened
         // with `O_NOFOLLOW` and `fstatvfs` runs on the descriptor: symlinks
         // are never followed to a filesystem outside the mirror.
-        let p = self.resolve(inode).await?;
-        let mirrored = self.mirror_path(p.as_os_str());
+        let mirrored = self.resolve(inode).await?;
         // An injected path has no host counterpart: report a minimal,
         // self-consistent statfs instead of opening anything. The same
         // holds for a purely virtual ancestor of an injected (or empty)
@@ -1558,10 +1542,10 @@ impl Filesystem for HostFs {
                 frsize: 512,
             });
         }
-        let mirrored = if is_root(p.as_os_str()) {
+        let mirrored = if is_root(mirrored.as_os_str()) {
             PathBuf::from("/")
         } else {
-            self.redirect(&self.mirror_path(p.as_os_str()))
+            self.redirect(&mirrored)
         };
         let cpath =
             CString::new(mirrored.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
@@ -1595,10 +1579,9 @@ impl Filesystem for HostFs {
     }
 
     async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
-        let p = self.resolve(inode).await?;
-        let mirrored = self.mirror_path(p.as_os_str());
+        let mirrored = self.resolve(inode).await?;
         if !self.exists(&mirrored)
-            || !is_root(p.as_os_str()) && !self.is_listable_dir(&mirrored).await
+            || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored).await
         {
             return Err(libc::ENOENT.into());
         }
@@ -1614,10 +1597,9 @@ impl Filesystem for HostFs {
         offset: i64,
     ) -> Result<ReplyDirectory<impl futures_util::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
-        let p = self.resolve(parent).await?;
-        let mirrored = self.mirror_path(p.as_os_str());
+        let mirrored = self.resolve(parent).await?;
         if !self.exists(&mirrored)
-            || !is_root(p.as_os_str()) && !self.is_listable_dir(&mirrored).await
+            || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored).await
         {
             return Err(libc::ENOENT.into());
         }
@@ -1667,10 +1649,9 @@ impl Filesystem for HostFs {
             impl futures_util::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a,
         >,
     > {
-        let p = self.resolve(parent).await?;
-        let mirrored = self.mirror_path(p.as_os_str());
+        let mirrored = self.resolve(parent).await?;
         if !self.exists(&mirrored)
-            || !is_root(p.as_os_str()) && !self.is_listable_dir(&mirrored).await
+            || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored).await
         {
             return Err(libc::ENOENT.into());
         }
@@ -1721,8 +1702,7 @@ impl Filesystem for HostFs {
     }
 
     async fn access(&self, _req: Request, inode: Inode, mask: u32) -> Result<()> {
-        let p = self.resolve(inode).await?;
-        let mirrored = self.mirror_path(p.as_os_str());
+        let mirrored = self.resolve(inode).await?;
         if !self.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
@@ -1782,8 +1762,7 @@ impl Filesystem for HostFs {
         _fh: Option<u64>,
         set_attr: SetAttr,
     ) -> Result<ReplyAttr> {
-        let p = self.resolve(inode).await?;
-        let mirrored = self.mirror_path(p.as_os_str());
+        let mirrored = self.resolve(inode).await?;
         if self.is_empty(&mirrored) {
             // Empty paths are virtual: nothing to change.
             return Err(libc::EACCES.into());
@@ -1861,7 +1840,7 @@ impl Filesystem for HostFs {
         _umask: u32,
     ) -> Result<ReplyEntry> {
         let parent_path = self.resolve(parent).await?;
-        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
+        let mirrored = parent_path.join(name);
         if !self.writable(&mirrored) {
             log_op_err(
                 "mkdir",
@@ -1914,7 +1893,7 @@ impl Filesystem for HostFs {
 
     async fn unlink(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<()> {
         let parent_path = self.resolve(parent).await?;
-        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
+        let mirrored = parent_path.join(name);
         if self.is_empty(&mirrored) {
             // Empty paths are virtual mount points; they cannot be removed.
             return Err(libc::EACCES.into());
@@ -1957,7 +1936,7 @@ impl Filesystem for HostFs {
     }
     async fn rmdir(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<()> {
         let parent_path = self.resolve(parent).await?;
-        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
+        let mirrored = parent_path.join(name);
         if self.is_empty(&mirrored) {
             return Err(libc::EACCES.into());
         }
@@ -2008,10 +1987,8 @@ impl Filesystem for HostFs {
     ) -> Result<()> {
         let origin_parent_path = self.resolve(origin_parent).await?;
         let new_parent_path = self.resolve(parent).await?;
-        let old = self
-            .mirror_path(origin_parent_path.as_os_str())
-            .join(origin_name);
-        let new = self.mirror_path(new_parent_path.as_os_str()).join(name);
+        let old = origin_parent_path.join(origin_name);
+        let new = new_parent_path.join(name);
         if self.is_empty(&old) || self.is_empty(&new) {
             return Err(libc::EACCES.into());
         }
@@ -2098,7 +2075,7 @@ impl Filesystem for HostFs {
         _link: &std::ffi::OsStr,
     ) -> Result<ReplyEntry> {
         let parent_path = self.resolve(parent).await?;
-        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
+        let mirrored = parent_path.join(name);
         log_op_err(
             "symlink",
             &mirrored,
@@ -2134,8 +2111,8 @@ impl Filesystem for HostFs {
     ) -> Result<ReplyEntry> {
         let source_path = self.resolve(inode).await?;
         let new_parent_path = self.resolve(new_parent).await?;
-        let old = self.mirror_path(source_path.as_os_str());
-        let new = self.mirror_path(new_parent_path.as_os_str()).join(new_name);
+        let old = source_path;
+        let new = new_parent_path.join(new_name);
         if self.is_empty(&old) || self.is_empty(&new) {
             return Err(libc::EACCES.into());
         }
@@ -2196,7 +2173,7 @@ impl Filesystem for HostFs {
         flags: u32,
     ) -> Result<ReplyCreated> {
         let parent_path = self.resolve(parent).await?;
-        let mirrored = self.mirror_path(parent_path.as_os_str()).join(name);
+        let mirrored = parent_path.join(name);
         if !self.writable(&mirrored) {
             log_op_err(
                 "create",
@@ -2923,22 +2900,6 @@ mod tests {
         assert_eq!(names, ["dev", "etc"]);
         assert!(f.exists(Path::new("/etc/passwd")));
         assert!(!f.exists(Path::new("/dev/whatever")));
-    }
-
-    #[test]
-    fn mirror_path_maps_sandbox_paths_to_absolute_mirrored_paths() {
-        let f = fs(&[]);
-        assert_eq!(
-            f.mirror_path(OsStr::new("/etc/passwd")),
-            PathBuf::from("/etc/passwd")
-        );
-        // The bridge may omit the leading slash.
-        assert_eq!(
-            f.mirror_path(OsStr::new("etc/passwd")),
-            PathBuf::from("/etc/passwd")
-        );
-        assert_eq!(f.mirror_path(OsStr::new("")), PathBuf::from("/"));
-        assert_eq!(f.mirror_path(OsStr::new("/")), PathBuf::from("/"));
     }
 
     #[test]
