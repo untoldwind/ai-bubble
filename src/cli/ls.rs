@@ -34,13 +34,16 @@ pub fn ls(spec_dir: Option<&Path>, path: &Path) {
         Err(err) => sandbox::die(&format!("cannot list {}: {err}", path.display())),
     };
     let patterns = spec.hostfs.patterns();
-    let permission_of = |p: &Path| hostfs::permission_of(&patterns, p);
 
-    let label = |permission: Option<hostfs::patterns::Permission>| match permission {
+    let label = |permission: Option<&hostfs::patterns::Permission>| match permission {
         Some(p) => format!("{p}"),
         None => "-".to_string(),
     };
-    println!("{} ({}):", target.display(), label(permission_of(&target)));
+    println!(
+        "{} ({}):",
+        target.display(),
+        label(patterns.permission_of(&target))
+    );
 
     let mut entries: Vec<_> = match std::fs::read_dir(&target) {
         Ok(entries) => entries.filter_map(|e| e.ok()).collect(),
@@ -52,7 +55,7 @@ pub fn ls(spec_dir: Option<&Path>, path: &Path) {
         println!(
             "  {} ({})",
             entry.file_name().to_string_lossy(),
-            label(permission_of(&full))
+            label(patterns.permission_of(&full))
         );
     }
 }

@@ -135,105 +135,6 @@ async fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
     .await;
 }
 
-/// The effective permission of a path under compiled patterns — the one
-/// piece of semantics both the standalone [`permission_of`] (spec side:
-/// `ls`, tests) and the running mirror ([`HostFs`], which keeps its
-/// patterns pre-compiled) must agree on.
-///
-/// `direct` answers which permission the **last** pattern naming the path
-/// itself (exactly, or via a `**` that covers it) carries, and `hidden`
-/// whether a `hide` pattern names the path itself or a strict ancestor of
-/// it (see [`HostFs::hidden`] for the mirror side).
-///
-/// The semantics, identical on both sides:
-///
-/// * everything strictly below an `empty` or `inject` path is invisible —
-///   an empty path is meant to be covered by a mount inside the sandbox
-///   and an injected path is a virtual file, so neither has content below
-///   it (`None`),
-/// * a `hide` pattern naming the path itself or a strict ancestor wins
-///   over everything else — a hidden path is not visible, no matter which
-///   pattern comes last (`hide`),
-/// * otherwise the **last** pattern naming the path itself decides —
-///   including `empty` and `inject`,
-/// * otherwise the permission of the **nearest** mirrored (`ro`/`rw`/
-///   redirect) ancestor is inherited: an exactly-named or `**`-covered
-///   directory is a recursive mirror, so its permission governs
-///   everything below,
-/// * otherwise the path is not visible in the sandbox at all (`None`).
-///
-/// This lives with the matcher rather than with [`Patterns`] because the
-/// glob engine is hostfs-internal (and the build-time schema generation
-/// compiles `spec` without it).
-const HIDE: Permission = Permission::Hide;
-
-fn effective_permission<'p>(
-    path: &Path,
-    direct: impl Fn(&Path) -> Option<&'p Permission>,
-    hidden: impl Fn(&Path) -> bool,
-) -> Option<&'p Permission> {
-    // Everything strictly below an empty or an injected path is invisible:
-    // an empty path is covered by a mount inside the sandbox, an injected
-    // path is a virtual file — neither has content below it, whatever
-    // pattern matches below.
-    if path.ancestors().skip(1).any(|a| {
-        matches!(
-            direct(a),
-            Some(Permission::Empty) | Some(Permission::Inject { .. })
-        )
-    }) {
-        return None;
-    }
-
-    // A hidden path is never visible — the mirror enforces this
-    // unconditionally (`HostFs::hidden` checks every `hide` pattern,
-    // naming the path itself or a strict ancestor, before any direct
-    // permission), so the last-match rule below only applies among the
-    // non-`hide` patterns.
-    if hidden(path) {
-        return Some(&HIDE);
-    }
-
-    // The last pattern naming the path itself decides.
-    if let Some(permission) = direct(path) {
-        return Some(permission);
-    }
-
-    // Otherwise the nearest mirrored ancestor governs: the mirror is
-    // recursive, so its permission extends to everything below it.
-    path.ancestors()
-        .skip(1)
-        .find_map(|a| direct(a).filter(|p| p.is_mirrored()))
-}
-
-pub fn permission_of(patterns: &Patterns, path: &Path) -> Option<Permission> {
-    let compiled: Vec<(Pattern, Permission)> = patterns
-        .iter()
-        .filter_map(|(pattern, permission)| {
-            Pattern::new(pattern)
-                .ok()
-                .map(|compiled| (compiled, permission.clone()))
-        })
-        .collect();
-    effective_permission(
-        path,
-        |p| {
-            compiled
-                .iter()
-                .rev()
-                .find(|(compiled, _)| compiled.matches(p))
-                .map(|(_, permission)| permission)
-        },
-        |p| {
-            compiled.iter().any(|(compiled, permission)| {
-                *permission == Permission::Hide
-                    && (compiled.matches(p) || compiled.walk(p) == Walk::Ancestor)
-            })
-        },
-    )
-    .cloned()
-}
-
 /// Whether any pattern grants write access: the FUSE mount is mounted
 /// read-only unless it does.
 fn has_writable_patterns(patterns: &Patterns) -> bool {
@@ -370,6 +271,11 @@ impl MirrorPattern {
 struct HostFs {
     uid: u32,
     gid: u32,
+    /// The spec's pattern list, in order — the source of every permission
+    /// decision (see [`Patterns::permission_of`]).
+    raw: Patterns,
+    /// The same patterns, pre-compiled — for the walk-based helpers
+    /// (`hidden`, `dir_prefix`, …) that run on every operation.
     patterns: Vec<MirrorPattern>,
     /// The nodeid ↔ mirrored-path map (see [`inodes`]). There is exactly one
     /// map per FUSE session: the filesystem is *moved* into the mount, and
@@ -422,6 +328,7 @@ impl HostFs {
         HostFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            raw: patterns.clone(),
             patterns: compiled,
             inodes: tokio::sync::RwLock::new(InodeMap::new()),
             handles: std::sync::Mutex::new(HashMap::new()),
@@ -499,7 +406,7 @@ impl HostFs {
     /// directory when it is (or would be) a directory, an empty file when
     /// it matches a real file.
     fn is_empty(&self, mirrored: &Path) -> bool {
-        matches!(self.permission_of(mirrored), Some(Permission::Empty))
+        matches!(self.raw.permission_of(mirrored), Some(Permission::Empty))
     }
 
     /// The in-memory content of the mirrored path when it is matched with
@@ -508,7 +415,7 @@ impl HostFs {
     /// host counterpart at all. Borrowed: this is consulted on every
     /// operation touching the path.
     fn is_inject(&self, mirrored: &Path) -> Option<&str> {
-        match self.permission_of(mirrored) {
+        match self.raw.permission_of(mirrored) {
             Some(Permission::Inject { content }) => Some(content.as_str()),
             _ => None,
         }
@@ -530,37 +437,6 @@ impl HostFs {
     /// shadowed by the empty path's precedence and never visible).
     fn under_empty(&self, mirrored: &Path) -> bool {
         mirrored.ancestors().skip(1).any(|a| self.is_empty(a))
-    }
-
-    /// Whether the mirrored path lies strictly *below* an injected path: an
-    /// injected path is a virtual file with no content below it, so such
-    /// paths are never visible — not even when another pattern matches them.
-    fn under_inject(&self, mirrored: &Path) -> bool {
-        mirrored
-            .ancestors()
-            .skip(1)
-            .any(|a| self.is_inject(a).is_some())
-    }
-
-    /// The effective permission of a mirrored path — exactly the semantics
-    /// of the standalone [`permission_of`] (see [`effective_permission`]),
-    /// applied to the mirror's pre-compiled patterns (borrowed: this runs
-    /// on every operation, often several times per path).
-    ///
-    /// One deliberate exception to the shared semantics: a path with a
-    /// non-UTF-8 component fails closed (see [`Pattern::matches`]) — the
-    /// mirror answers "not visible, not writable" for it, while the
-    /// standalone function (which only *annotates*) still inherits the
-    /// nearest mirrored ancestor.
-    fn effective(&self, mirrored: &Path) -> Option<&Permission> {
-        // Fail closed: a non-UTF-8 component can never match a pattern, so
-        // its permission could never be derived from the spec — a hidden
-        // name spelled with invalid UTF-8 bytes must not become visible or
-        // writable (or creatable) through the mirror.
-        if Pattern::has_non_utf8_component(mirrored) {
-            return None;
-        }
-        effective_permission(mirrored, |p| self.permission_of(p), |p| self.hidden(p))
     }
 
     /// Whether some `empty` pattern could still match something *strictly
@@ -626,6 +502,19 @@ impl HostFs {
         mirrored.to_path_buf()
     }
 
+    /// The spec-level permission governing the mirrored path: the shared
+    /// semantics of [`Patterns::permission_of`] — with one deliberate
+    /// fail-closed exception: a path with a non-UTF-8 component can never
+    /// match a pattern, so its permission could never be derived from the
+    /// spec — a hidden name spelled with invalid UTF-8 bytes must not
+    /// become visible or writable (or creatable) through the mirror.
+    fn effective(&self, mirrored: &Path) -> Option<&Permission> {
+        if Pattern::has_non_utf8_component(mirrored) {
+            return None;
+        }
+        self.raw.permission_of(mirrored)
+    }
+
     /// Whether a mirrored path matches one of the patterns directly (as a file,
     /// symlink, or a directory named by the pattern itself), with the
     /// **last** matching pattern mirroring it. Empty paths and everything
@@ -640,7 +529,6 @@ impl HostFs {
     /// names it directly — the permission of the *nearest* mirrored
     /// ancestor (an exactly-named or `**`-covered directory is a recursive
     /// mirror, so its permission governs everything below it). Empty paths
-    /// and everything below them, injected paths and everything below them,
     /// and hidden paths are never writable.
     ///
     /// The result is only the *spec* side: the real host filesystem may
@@ -661,20 +549,6 @@ impl HostFs {
             .is_some_and(|p| p.is_writable())
     }
 
-    /// The permission of the **last** pattern that names the path itself
-    /// (exactly, or via a `**` that covers it), or `None` when no pattern
-    /// names it. Borrowed from the compiled pattern list: this runs on
-    /// every operation (often several times per path), and a clone would
-    /// copy an `Inject` permission's whole content each time.
-    fn permission_of(&self, mirrored: &Path) -> Option<&Permission> {
-        // `*` must not cross directory separators, like in a shell.
-        self.patterns
-            .iter()
-            .rev()
-            .find(|p| p.names(mirrored))
-            .map(|p| &p.permission)
-    }
-
     /// Whether the path is hidden because a pattern hides it directly, or
     /// a hidden pattern names one of its strict ancestors (a hidden
     /// directory hides its whole subtree).
@@ -692,7 +566,7 @@ impl HostFs {
     /// ancestor leading to an empty path — and nothing hides it directly
     /// or via an ancestor.
     fn exists(&self, mirrored: &Path) -> bool {
-        if self.under_empty(mirrored) || self.under_inject(mirrored) || self.hidden(mirrored) {
+        if self.under_empty(mirrored) {
             return false;
         }
         if self.is_empty(mirrored) {
@@ -700,6 +574,9 @@ impl HostFs {
         }
         if self.is_inject(mirrored).is_some() {
             return true;
+        }
+        if self.hidden(mirrored) {
+            return false;
         }
         self.matches(mirrored) || self.dir_prefix(mirrored) || self.is_empty_prefix(mirrored)
     }
@@ -2755,69 +2632,6 @@ mod tests {
         fs(entries)
     }
 
-    #[test]
-    fn permission_of_follows_hostfs_semantics() {
-        // Direct matches: the last pattern naming the path decides.
-        let patterns = Patterns(vec![
-            ("/etc".to_string(), Permission::Ro),
-            ("/etc/*.conf".to_string(), Permission::Rw),
-            ("/etc/passwd".to_string(), Permission::Hide),
-            ("/dev".to_string(), Permission::Empty),
-        ]);
-        assert_eq!(
-            permission_of(&patterns, Path::new("/etc")),
-            Some(Permission::Ro)
-        );
-        assert_eq!(
-            permission_of(&patterns, Path::new("/etc/hosts.conf")),
-            Some(Permission::Rw)
-        );
-        assert_eq!(
-            permission_of(&patterns, Path::new("/etc/passwd")),
-            Some(Permission::Hide)
-        );
-        assert_eq!(
-            permission_of(&patterns, Path::new("/dev")),
-            Some(Permission::Empty)
-        );
-
-        // No direct match: mirrored directories are recursive, so their
-        // permission is inherited by everything below them.
-        let patterns = Patterns(vec![("/home/me/project".to_string(), Permission::Rw)]);
-        assert_eq!(
-            permission_of(&patterns, Path::new("/home/me/project/src/main.rs")),
-            Some(Permission::Rw)
-        );
-        // ...and the nearest mirrored ancestor wins over a farther one.
-        let patterns = Patterns(vec![
-            ("/home/me".to_string(), Permission::Rw),
-            ("/home/me/project".to_string(), Permission::Ro),
-        ]);
-        assert_eq!(
-            permission_of(&patterns, Path::new("/home/me/project/src/main.rs")),
-            Some(Permission::Ro)
-        );
-
-        // A hidden directory hides its whole subtree.
-        let patterns = Patterns(vec![
-            ("/home/me".to_string(), Permission::Rw),
-            ("/home/me/project/target".to_string(), Permission::Hide),
-        ]);
-        assert_eq!(
-            permission_of(&patterns, Path::new("/home/me/project/target/debug")),
-            Some(Permission::Hide)
-        );
-
-        // Everything strictly below an empty path is invisible.
-        let patterns = Patterns(vec![
-            ("/etc".to_string(), Permission::Ro),
-            ("/dev".to_string(), Permission::Empty),
-        ]);
-        assert_eq!(permission_of(&patterns, Path::new("/dev/null")), None);
-        // Unrelated paths stay invisible, too.
-        assert_eq!(permission_of(&patterns, Path::new("/opt")), None);
-    }
-
     /// The async HostFs methods (`attr`, `dir_entries`, …) run their host
     /// syscalls via `tokio::fs` on the blocking pool; the synchronous tests
     /// await them on a throwaway current-thread runtime.
@@ -2911,15 +2725,13 @@ mod tests {
         // Nothing below the injected path is visible at all.
         assert!(!f.exists(Path::new("/etc/resolv.conf/x")));
         assert_eq!(
-            permission_of(
-                &Patterns(vec![(
-                    "/etc/resolv.conf".to_string(),
-                    Permission::Inject {
-                        content: "x".to_string()
-                    }
-                )]),
-                Path::new("/etc/resolv.conf/x"),
-            ),
+            Patterns(vec![(
+                "/etc/resolv.conf".to_string(),
+                Permission::Inject {
+                    content: "x".to_string()
+                }
+            )])
+            .permission_of(Path::new("/etc/resolv.conf/x")),
             None
         );
     }
@@ -3425,61 +3237,6 @@ mod tests {
         assert!(!f.writable(Path::new("/a/h/x")));
         assert!(!f.writable(Path::new("/a/e")));
         assert!(!f.writable(Path::new("/a/e/x")));
-    }
-
-    #[test]
-    fn nothing_below_an_injected_path_is_visible() {
-        // An injected path is a virtual file: even a pattern matching below
-        // it must not resurrect its subtree (the standalone `permission_of`
-        // and the mirror must agree on this).
-        let f = fs(&[
-            (
-                "/etc/resolv.conf",
-                Permission::Inject {
-                    content: "nameserver 1.1.1.1".into(),
-                },
-            ),
-            ("/etc/resolv.conf/extra", Permission::Rw),
-        ]);
-        assert!(f.exists(Path::new("/etc/resolv.conf")));
-        assert!(!f.exists(Path::new("/etc/resolv.conf/extra")));
-        assert!(!f.writable(Path::new("/etc/resolv.conf/extra")));
-    }
-
-    #[test]
-    fn hide_beats_a_direct_empty_or_inject_match() {
-        // A later `empty`/`inject` pattern must not override an earlier
-        // `hide` naming the same path.
-        let f = fs(&[
-            ("/etc/passwd", Permission::Hide),
-            ("/etc/passwd", Permission::Empty),
-        ]);
-        assert!(!f.exists(Path::new("/etc/passwd")));
-
-        let f = fs(&[
-            ("/etc/hosts", Permission::Hide),
-            (
-                "/etc/hosts",
-                Permission::Inject {
-                    content: "planted".into(),
-                },
-            ),
-        ]);
-        assert!(!f.exists(Path::new("/etc/hosts")));
-    }
-
-    #[test]
-    fn nothing_below_an_empty_path_is_visible_even_with_a_matching_pattern() {
-        // `/dev/null` matching an `rw` pattern must not make it (or anything
-        // below it) visible inside the empty `/dev` mount point.
-        let f = fs(&[
-            ("/dev", Permission::Empty),
-            ("/dev/null/**", Permission::Rw),
-        ]);
-        assert!(f.is_empty(Path::new("/dev")));
-        assert!(!f.matches(Path::new("/dev/null/deep")));
-        assert!(!f.exists(Path::new("/dev/null/deep")));
-        assert!(!f.writable(Path::new("/dev/null/deep")));
     }
 
     #[test]
