@@ -108,7 +108,7 @@ impl InodeMap {
     pub(crate) fn path_of(&self, inode: Inode) -> Option<&Path> {
         let path = self.inodes.get(&inode).map(|entry| entry.path.as_path());
         if path.is_none() {
-            fuselog::event(&format!("INODE no-path inode={inode}"));
+            fuselog::event!("INODE no-path inode={inode}");
         }
         path
     }
@@ -181,10 +181,10 @@ impl InodeMap {
             }
 
             None => {
-                fuselog::event(&format!(
+                fuselog::event!(
                     "INODE rename UNMAPPED-SOURCE {}",
                     fuselog::path_string(old.as_os_str())
-                ));
+                );
                 self.get_or_insert(new, new_parent);
             }
         }

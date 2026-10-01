@@ -88,7 +88,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::sandbox::die_with_error;
 use crate::spec::internal::{Patterns, Permission};
 
-mod fuselog;
+pub(crate) mod fuselog;
 mod inodes;
 use inodes::InodeMap;
 
@@ -96,12 +96,12 @@ use inodes::InodeMap;
 /// helper, only active with `RS_BUBBLE_FUSE_LOG` set) and turn it into an
 /// audit event.
 async fn log_op_err(op: &str, mirrored: &Path, real: Option<&Path>, err: &std::io::Error) {
-    fuselog::event(&format!(
+    fuselog::event!(
         "FS {op} err={err} mirrored={} real={}",
         mirrored.display(),
         real.map(|p| p.display().to_string())
             .unwrap_or_else(|| "-".into()),
-    ));
+    );
     crate::audit::record(
         "hostfs",
         op,
@@ -115,11 +115,11 @@ async fn log_op_err(op: &str, mirrored: &Path, real: Option<&Path>, err: &std::i
 /// Log a successful structural op (create/mkdir/…) with its paths, and
 /// turn it into an audit event.
 async fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
-    fuselog::event(&format!(
+    fuselog::event!(
         "FS {op} ok mirrored={} real={}",
         mirrored.display(),
         real.display()
-    ));
+    );
     crate::audit::record(
         "hostfs",
         op,
@@ -1073,22 +1073,22 @@ impl Filesystem for HostFs {
     /// dentry); a nodeid with open handles keeps its last path as a zombie.
     async fn forget(&self, _req: Request, inode: Inode, nlookup: u64) {
         let path = self.inodes.write().await.forget(inode);
-        fuselog::event(&format!(
+        fuselog::event!(
             "INODE forget inode={inode} nlookup={nlookup} path={}",
             path.map(|p| fuselog::path_string(p.as_os_str()))
                 .unwrap_or_else(|| "<gone>".into())
-        ));
+        );
     }
 
     async fn batch_forget(&self, _req: Request, inodes: &[Inode]) {
         let mut map = self.inodes.write().await;
         for &inode in inodes {
             let path = map.forget(inode);
-            fuselog::event(&format!(
+            fuselog::event!(
                 "INODE batch-forget inode={inode} path={}",
                 path.map(|p| fuselog::path_string(p.as_os_str()))
                     .unwrap_or_else(|| "<gone>".into())
-            ));
+            );
         }
     }
 
@@ -1098,10 +1098,10 @@ impl Filesystem for HostFs {
         let parent_path = match self.resolve(parent).await {
             Ok(p) => p,
             Err(e) => {
-                fuselog::event(&format!(
+                fuselog::event!(
                     "INODE lookup no-parent inode={parent} name={}",
                     fuselog::path_string(name)
-                ));
+                );
                 return Err(e.into());
             }
         };
@@ -2047,7 +2047,7 @@ impl Filesystem for HostFs {
         let mut map = self.inodes.write().await;
         let source_inode = map.inode_of(&old);
         let old_target = map.inode_of(&new);
-        fuselog::event(&format!(
+        fuselog::event!(
             "INODE rename src_inode={} new={} old_target_inode={}",
             source_inode
                 .map(|i| i.to_string())
@@ -2056,7 +2056,7 @@ impl Filesystem for HostFs {
             old_target
                 .map(|i| i.to_string())
                 .unwrap_or_else(|| "-".into()),
-        ));
+        );
         map.rename(&old, &new, parent);
         Ok(())
     }
@@ -2472,7 +2472,7 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let outcome = {
         let mp = mountpoint.clone();
         let server_mountpoint = mountpoint.clone();
-        fuselog::event(&format!("SERVER start mountpoint={}", mountpoint.display()));
+        fuselog::event!("SERVER start mountpoint={}", mountpoint.display());
         runtime.block_on(async move {
             let handle = match mount_with_fallback(
                 &mp,
@@ -2487,7 +2487,7 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
                 Err(e) => return Err(e),
             };
 
-            fuselog::event("SERVER mounted");
+            fuselog::event!("SERVER mounted");
 
             // Signal readiness to the parent.
             let byte: u8 = 1;
@@ -2505,11 +2505,11 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
                 }
                 heartbeat += 1;
                 if heartbeat.is_multiple_of(10) {
-                    fuselog::event("SERVER alive");
+                    fuselog::event!("SERVER alive");
                 }
             }
 
-            fuselog::event("SERVER parent-gone, unmounting");
+            fuselog::event!("SERVER parent-gone, unmounting");
             let mut outcome = handle.unmount().await;
             if let Err(e) = &outcome {
                 // fuse3's unmount is a single attempt (`fusermount3 -u`, or
@@ -2517,10 +2517,10 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
                 // EBUSY when anything still holds the mount — e.g. a daemon
                 // child of the sandboxed command that outlived it. Fall back
                 // to a *lazy* unmount so the mount is detached regardless.
-                fuselog::event(&format!("SERVER unmount failed ({e}), trying lazy unmount"));
+                fuselog::event!("SERVER unmount failed ({e}), trying lazy unmount");
                 outcome = lazy_unmount(&server_mountpoint).await;
             }
-            fuselog::event(&format!("SERVER unmount outcome={outcome:?}"));
+            fuselog::event!("SERVER unmount outcome={outcome:?}");
             // Give the audit writer a chance to flush the last batch
             // before this process exits.
             crate::audit::drain().await;
