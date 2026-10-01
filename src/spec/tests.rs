@@ -1,3 +1,5 @@
+use crate::hostfs::patterns::Permission;
+
 use super::file::Spec;
 use super::internal::{Op, SandboxConfig};
 use super::tmpfs::TmpfsPerms;
@@ -379,7 +381,7 @@ fn schema_key_is_accepted_but_ignored() {
     assert_eq!(spec.schema.as_deref(), Some("./ai-bubble.spec.schema.json"));
     // It must be advertised in the generated schema (it's a real
     // field with skip_serializing), so editors accept it.
-    let schema: serde_json::Value = serde_json::from_str(crate::SPEC_SCHEMA).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&crate::spec_schema()).unwrap();
     assert!(schema["properties"]["$schema"].is_object());
 }
 
@@ -420,7 +422,7 @@ fn redirect_sources_are_resolved_relative_to_the_spec_dir() {
 
 #[test]
 fn embedded_schema_is_valid_json_and_covers_all_mapping_types() {
-    let schema: serde_json::Value = serde_json::from_str(crate::SPEC_SCHEMA).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&crate::spec_schema()).unwrap();
     assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
     assert_eq!(schema["title"], "ai-bubble sandbox spec");
     // The mappings are a "type"-tagged enum: every variant's tag must
@@ -441,7 +443,7 @@ fn embedded_schema_is_valid_json_and_covers_all_mapping_types() {
         "project-cache",
     ] {
         assert!(
-            crate::SPEC_SCHEMA.contains(&format!("\"{tag}\"")),
+            crate::spec_schema().contains(&format!("\"{tag}\"")),
             "{tag} mapping missing from schema"
         );
     }
@@ -449,7 +451,7 @@ fn embedded_schema_is_valid_json_and_covers_all_mapping_types() {
     assert_eq!(schema["additionalProperties"], false);
     // The hand-written TmpfsPerms schema: number or octal string.
     // The hand-written TmpfsPerms schema is inlined, not a $ref.
-    assert!(crate::SPEC_SCHEMA.contains(r#""pattern": "^[0-7]{1,4}$""#));
+    assert!(crate::spec_schema().contains(r#""pattern": "^[0-7]{1,4}$""#));
     assert_eq!(schema["$defs"], serde_json::Value::Null);
 }
 
@@ -457,7 +459,6 @@ fn embedded_schema_is_valid_json_and_covers_all_mapping_types() {
 fn spec_dir_is_always_hidden() {
     use crate::hostfs::permission_of;
     use crate::spec::hostfs::Mapping;
-    use crate::spec::internal::Permission;
     use std::path::Path;
 
     // A spec that mirrors everything — including the directory the

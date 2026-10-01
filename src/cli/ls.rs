@@ -36,7 +36,7 @@ pub fn ls(spec_dir: Option<&Path>, path: &Path) {
     let patterns = spec.hostfs.patterns();
     let permission_of = |p: &Path| hostfs::permission_of(&patterns, p);
 
-    let label = |permission: Option<spec::internal::Permission>| match permission {
+    let label = |permission: Option<hostfs::patterns::Permission>| match permission {
         Some(p) => format!("{p}"),
         None => "-".to_string(),
     };

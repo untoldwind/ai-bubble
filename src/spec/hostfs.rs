@@ -19,8 +19,11 @@ use serde::Deserialize;
 
 use schemars::JsonSchema;
 
-use super::internal::{Op, Patterns, Permission};
 use super::tmpfs::TmpfsPerms;
+use crate::{
+    hostfs::patterns::{Patterns, Permission},
+    spec::internal::Op,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Globs(pub Vec<String>);

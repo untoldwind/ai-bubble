@@ -15,12 +15,12 @@
 //!   [`internal::SandboxConfig::compile`]. Internal code never touches
 //!   the config-file types.
 //!
-//! A JSON Schema for the config file is generated from these very files
-//! at build time (see `build.rs`): all the serde attributes are honored,
-//! and `TmpfsPerms`' hand-written deserializer is described manually in
-//! its `JsonSchema` impl. The main crate embeds the generated schema as
-//! `crate::SPEC_SCHEMA` and prints it via `--print-schema`, so editors
-//! can validate and auto-complete spec files against it.
+//! A JSON Schema for the config file is generated at runtime from these
+//! very files (`crate::spec_schema()`): all the serde attributes are
+//! honored, and `TmpfsPerms`' hand-written deserializer is described
+//! manually in its `JsonSchema` impl. The main crate prints it via
+//! `--print-schema`, so editors can validate and auto-complete spec files
+//! against it.
 
 pub mod audit;
 pub mod env;

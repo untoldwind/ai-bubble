@@ -114,27 +114,32 @@ fn spawn_dump_thread() {
     let mut started = Instant::now();
     std::thread::Builder::new()
         .name("fuse-stats-dump".into())
-        .spawn(move || loop {
-            std::thread::sleep(DUMP_INTERVAL);
-            let elapsed = started.elapsed();
-            started = Instant::now();
-            // Swap out the interval's counters and fold them into the
-            // cumulative totals.
-            let Ok(mut stats) = stats().lock() else {
-                continue;
-            };
-            let Some(path) = file() else { continue };
-            let interval = std::mem::take(&mut *stats);
-            drop(stats);
-            for (op, s) in &interval {
-                cumulative.entry(op).or_default().add(s.real_ns, s.cpu_ns);
+        .spawn(move || {
+            loop {
+                std::thread::sleep(DUMP_INTERVAL);
+                let elapsed = started.elapsed();
+                started = Instant::now();
+                // Swap out the interval's counters and fold them into the
+                // cumulative totals.
+                let Ok(mut stats) = stats().lock() else {
+                    continue;
+                };
+                let Some(path) = file() else { continue };
+                let interval = std::mem::take(&mut *stats);
+                drop(stats);
+                for (op, s) in &interval {
+                    cumulative.entry(op).or_default().add(s.real_ns, s.cpu_ns);
+                }
+                let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                else {
+                    continue;
+                };
+                let _ = write_table(&mut f, "interval", elapsed, &interval);
+                let _ = write_table(&mut f, "cumulative", elapsed, &cumulative);
             }
-            let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
-            else {
-                continue;
-            };
-            let _ = write_table(&mut f, "interval", elapsed, &interval);
-            let _ = write_table(&mut f, "cumulative", elapsed, &cumulative);
         })
         .ok();
 }

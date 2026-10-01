@@ -383,10 +383,7 @@ mod tests {
         // rehashes them under the new parent without re-looking them up.
         assert_eq!(map.path_of(dir), Some(Path::new("/d-final")));
         assert_eq!(map.path_of(file), Some(Path::new("/d-final/f")));
-        assert_eq!(
-            map.path_of(deep),
-            Some(Path::new("/d-final/sub/deep"))
-        );
+        assert_eq!(map.path_of(deep), Some(Path::new("/d-final/sub/deep")));
         assert_eq!(map.inode_of(Path::new("/d-final/f")), Some(file));
         assert_eq!(map.inode_of(Path::new("/d-final/sub/deep")), Some(deep));
         assert_eq!(map.inode_of(Path::new("/d-working/f")), None);
@@ -405,10 +402,7 @@ mod tests {
         map.rename(Path::new("/d"), Path::new("/e"), ROOT_INODE);
 
         assert_eq!(map.path_of(file), Some(Path::new("/e/f")));
-        assert_eq!(
-            map.path_of(sibling_file),
-            Some(Path::new("/d-other/f"))
-        );
+        assert_eq!(map.path_of(sibling_file), Some(Path::new("/d-other/f")));
         assert_eq!(map.inode_of(Path::new("/e/f")), Some(file));
         assert_eq!(map.inode_of(Path::new("/d-other/f")), Some(sibling_file));
     }

@@ -272,9 +272,7 @@ impl Spec {
         let expanded = expand_str(raw).map_err(|e| format!("Invalid cwd {raw:?}: {e}"))?;
         let path = Path::new(&expanded);
         if !path.is_absolute() {
-            return Err(format!(
-                "cwd {expanded:?} is not an absolute sandbox path"
-            ));
+            return Err(format!("cwd {expanded:?} is not an absolute sandbox path"));
         }
         if path
             .components()
@@ -296,12 +294,10 @@ impl Spec {
 /// fields (see [`Spec::expand_cwd`]); unset variables are errors, so
 /// typos don't silently produce bogus paths.
 pub(crate) fn expand_str(s: &str) -> Result<String, String> {
-    shellexpand::env(s)
-        .map(Cow::into_owned)
-        .map_err(|e| {
-            format!(
-                "environment variable {:?} referenced as {s:?} is not set",
-                e.var_name
-            )
-        })
+    shellexpand::env(s).map(Cow::into_owned).map_err(|e| {
+        format!(
+            "environment variable {:?} referenced as {s:?} is not set",
+            e.var_name
+        )
+    })
 }

@@ -36,17 +36,28 @@ mod waf;
 
 use cli::Command;
 
-/// The JSON Schema for the spec file, generated from `src/spec/mod.rs` by
-/// `build.rs` at compile time. Printed by `--print-schema`; point an
-/// editor (e.g. VS Code's `json.schemas`) at it to get completion and
-/// validation for `.ai-bubble/spec.json`.
-pub const SPEC_SCHEMA: &str = include_str!(concat!(env!("OUT_DIR"), "/ai-bubble-schema.json"));
+/// The JSON Schema for the spec file, generated on demand from the
+/// `schemars` derive impls on the config-file types in `src/spec/`.
+/// Printed by `--print-schema`; point an editor (e.g. VS Code's
+/// `json.schemas`) at it to get completion and validation for
+/// `.ai-bubble/spec.json`.
+pub fn spec_schema() -> String {
+    let mut schema = schemars::generate::SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<spec::Spec>();
+    schema
+        .ensure_object()
+        .insert("title".to_string(), "ai-bubble sandbox spec".into());
+    let mut json = serde_json::to_string_pretty(&schema).unwrap();
+    json.push('\n');
+    json
+}
 
 fn main() {
     let cli = cli::Cli::parse();
 
     if cli.print_schema {
-        print!("{}", SPEC_SCHEMA);
+        print!("{}", spec_schema());
         return;
     }
 

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{SPEC_SCHEMA, sandbox, spec};
+use crate::{sandbox, spec};
 
 /// The starter spec written by `init`, as a template. The
 /// `{{PROJECT_DIR}}` placeholder is replaced with the JSON-quoted absolute
@@ -87,7 +87,7 @@ pub fn init(spec_dir: Option<&Path>) {
     }
 
     let schema_path = dir.join(SCHEMA_FILE);
-    if let Err(e) = std::fs::write(&schema_path, SPEC_SCHEMA) {
+    if let Err(e) = std::fs::write(&schema_path, crate::spec_schema()) {
         sandbox::die(&format!("Can't write {}: {e}", schema_path.display()));
     }
 

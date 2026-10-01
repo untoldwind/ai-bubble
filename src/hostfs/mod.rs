@@ -86,12 +86,16 @@ use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::sandbox::die_with_error;
-use crate::spec::internal::{Patterns, Permission};
 
 pub(crate) mod fuselog;
 mod inodes;
+pub(crate) mod pattern;
+pub(crate) mod patterns;
 mod perf;
+
 use inodes::InodeMap;
+use pattern::{Pattern, Walk};
+use patterns::{Patterns, Permission};
 
 /// Log a failed FUSE op with the mirrored and the real host path (debug
 /// helper, only active with `RS_BUBBLE_FUSE_LOG` set) and turn it into an
@@ -130,9 +134,6 @@ async fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
     )
     .await;
 }
-
-pub(crate) mod pattern;
-use pattern::{Pattern, Walk};
 
 /// The effective permission of a mirrored path under the given pattern list,
 /// with the same semantics the FUSE mirror applies:
@@ -426,12 +427,15 @@ impl HostFs {
         self.handles
             .lock()
             .expect("hostfs handle table poisoned")
-            .insert(fh, std::sync::Arc::new(OpenHandle {
-                file: tokio::sync::Mutex::new(file),
-                path,
-                append,
-                writable,
-            }));
+            .insert(
+                fh,
+                std::sync::Arc::new(OpenHandle {
+                    file: tokio::sync::Mutex::new(file),
+                    path,
+                    append,
+                    writable,
+                }),
+            );
         fh
     }
 
@@ -1369,8 +1373,13 @@ impl Filesystem for HostFs {
             let n = match file.read(&mut buf).await {
                 Ok(n) => n,
                 Err(e) => {
-                    log_op_err("read-io", &handle.path, Some(&self.redirect(&handle.path)), &e)
-                        .await;
+                    log_op_err(
+                        "read-io",
+                        &handle.path,
+                        Some(&self.redirect(&handle.path)),
+                        &e,
+                    )
+                    .await;
                     return Err(e.into());
                 }
             };
@@ -2457,7 +2466,7 @@ unsafe fn disarm_signals() {
 ///
 /// On success the mountpoint path is stored in `HOST_MOUNT_POINT` (inherited
 /// by every later fork). On any failure the process dies.
-pub fn start_host_fs(patterns: &crate::spec::internal::Patterns) {
+pub fn start_host_fs(patterns: &Patterns) {
     // Create the mountpoint directory in the parent so both the server and the
     // sandbox (and its children) can agree on a stable path.
     let mut tmpl: Vec<u8> = b"/tmp/ai-bubble.host.XXXXXX".to_vec();

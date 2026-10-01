@@ -1,19 +1,19 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ai-bubble sandbox spec",
-  "description": "The whole sandbox specification, as written by the user. Parsing only — no side effects beyond reading the file. The sandbox machinery never sees this type; it runs with the compiled-down `internal::SandboxConfig`.",
+  "description": "The whole sandbox specification, as written by the user. Parsing\nonly — no side effects beyond reading the file. The sandbox machinery\nnever sees this type; it runs with the compiled-down\n`internal::SandboxConfig`.",
   "type": "object",
   "properties": {
     "$schema": {
-      "description": "Accepted for editor tooling only: it names the JSON schema (`--print-schema`) so the spec file can get completion and validation. Never serialized back out.",
-      "writeOnly": true,
+      "description": "Accepted for editor tooling only: it names the JSON schema\n(`--print-schema`) so the spec file can get completion and\nvalidation. Never serialized back out.",
       "type": [
         "string",
         "null"
-      ]
+      ],
+      "writeOnly": true
     },
     "audit": {
-      "description": "Audit logging: where the audit event stream (filesystem access through the hostfs mirror, waf allow/deny decisions, proxy CONNECT attempts) is written. Without a `log` path the audit subsystem is disabled (see [`super::audit::AuditConfig`]).",
+      "description": "Audit logging: where the audit event stream (filesystem access\nthrough the hostfs mirror, waf allow/deny decisions, proxy\nCONNECT attempts) is written. Without a `log` path the audit\nsubsystem is disabled (see [`super::audit::AuditConfig`]).",
       "allOf": [
         {
           "$ref": "#/definitions/AuditConfig"
@@ -21,14 +21,14 @@
       ]
     },
     "cwd": {
-      "description": "The working directory of the sandboxed command, *inside* the sandbox (default: `/`). Like the path-like mapping fields the value may reference host environment variables as `${VAR}`; it must be an absolute sandbox path without `..` components. The directory must exist inside the sandbox — in hostfs-root mode through a mapping, on the tmpfs root because a mount or symlink created it. Nothing is created automatically: a missing directory is a hard error right before exec.",
+      "description": "The working directory of the sandboxed command, *inside* the\nsandbox (default: `/`). The value is kept exactly as written while\nthe file is parsed and may reference host environment variables as\n`${VAR}`; the references are expanded — and the result validated as\nan absolute sandbox path without `..` components — when the spec is\ncompiled down to the internal config (see [`Spec::expand_cwd`]).\nThe directory must exist inside the sandbox — in hostfs-root mode\nthrough a mapping, on the tmpfs root because a mount or symlink\ncreated it. Nothing is created automatically: a missing directory\nis a hard error right before exec.",
       "type": [
         "string",
         "null"
       ]
     },
     "env": {
-      "description": "The isolated environment: the *complete* set of environment variables the sandboxed command sees. Nothing is inherited from the host; use `${VAR}` in the values to copy host variables in explicitly, and `env_file` to load dotenv-style entries from a file (see [`super::env`]).",
+      "description": "The isolated environment: the *complete* set of environment\nvariables the sandboxed command sees. Nothing is inherited from\nthe host; use `${VAR}` in the values to copy host variables in\nexplicitly, and `env_file` to load dotenv-style entries from a\nfile (see [`super::env`]). The values are kept as written and the\n`${VAR}` references are expanded when the spec is compiled down to\nthe internal config.",
       "allOf": [
         {
           "$ref": "#/definitions/EnvConfig"
@@ -36,7 +36,7 @@
       ]
     },
     "hostfs": {
-      "description": "The host filesystem: it is always the sandbox root, exposing the paths selected by its mappings.",
+      "description": "The host filesystem: it is always the sandbox root, exposing the\npaths selected by its mappings.",
       "allOf": [
         {
           "$ref": "#/definitions/HostFsConfig"
@@ -52,7 +52,7 @@
       ]
     },
     "seccomp": {
-      "description": "The syscall filter installed for the sandboxed command right before exec (see [`super::seccomp`]). Either an `allow` or a `block` list of syscall names (mutually exclusive, enforced at parse time), a `preset` blocklist baseline (`block` adds to it, `allow` takes exceptions back out); without any of these no filter is installed.",
+      "description": "The syscall filter installed for the sandboxed command right\nbefore exec (see [`super::seccomp`]). Either an `allow` or a\n`block` list of syscall names (mutually exclusive, enforced at\nparse time), a `preset` blocklist baseline (`block` adds to it,\n`allow` takes exceptions back out); without any of these no\nfilter is installed.",
       "allOf": [
         {
           "$ref": "#/definitions/SeccompConfig"
@@ -63,33 +63,33 @@
   "additionalProperties": false,
   "definitions": {
     "AuditConfig": {
-      "description": "Audit logging configuration. Without a `log` path (the default) the audit subsystem is disabled entirely: no events are collected and no file is written.",
+      "description": "Audit logging configuration. Without a `log` path (the default) the\naudit subsystem is disabled entirely: no events are collected and no\nfile is written.",
       "type": "object",
       "properties": {
         "log": {
-          "description": "The audit log file, as a host path. Audit events (filesystem operations through the hostfs mirror, waf allow/deny decisions, proxy CONNECT attempts) are appended as JSON lines; the file is created if it does not exist. The value may reference host environment variables as `${VAR}`.",
-          "default": null,
+          "description": "The audit log file, as a host path. Audit events (filesystem\noperations through the hostfs mirror, waf allow/deny decisions,\nproxy CONNECT attempts) are appended as JSON lines; the file is\ncreated if it does not exist. The value may reference host\nenvironment variables as `${VAR}`.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
     },
     "EnvConfig": {
-      "description": "The `env` section: the variables of the sandbox's isolated environment.",
+      "description": "The `env` section: the variables of the sandbox's isolated\nenvironment.",
       "type": "object",
       "properties": {
         "env_file": {
-          "description": "An optional dotenv-style file (relative to the spec directory) whose `KEY=VALUE` lines are loaded into the environment. Entries already present in [`EnvConfig::values`] win over the file.",
+          "description": "An optional dotenv-style file (relative to the spec directory)\nwhose `KEY=VALUE` lines are loaded into the environment. Entries\nalready present in [`EnvConfig::values`] win over the file.\n\nThe path itself may reference host environment variables as\n`${VAR}`; it is expanded when the file is loaded (see\n[`EnvConfig::load_env_file`]).",
           "type": [
             "string",
             "null"
           ]
         },
         "values": {
-          "description": "The environment variables, name → value. A `BTreeMap` keeps the iteration order deterministic.\n\nThe variable names are used as-is (they become the names the sandboxed command sees); only the values are `${VAR}`-expanded.",
+          "description": "The environment variables, name → value. A `BTreeMap` keeps the\niteration order deterministic.\n\nThe variable names are used as-is (they become the names the\nsandboxed command sees); only the values are `${VAR}`-expanded.\nThe expansion happens at compile time (see\n[`EnvConfig::expand_values`]), not while the file is parsed.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/definitions/EnvVar"
@@ -99,15 +99,15 @@
       "additionalProperties": false
     },
     "EnvVar": {
-      "description": "One environment value: a string whose `${VAR}` references are expanded from the **host** environment while the spec is read (see [`super::file::expand_str`]), so everything downstream only ever sees the fully expanded text.",
+      "description": "One environment value, exactly as written in the spec file. The\n`${VAR}` references are expanded from the **host** environment when\nthe config is compiled down (see [`EnvConfig::expand_values`]), so the\nspec-file view keeps the raw text and the sandbox machinery only ever\nsees the fully expanded text.",
       "type": "string"
     },
     "HostFsConfig": {
-      "description": "The spec file's `hostfs` section: what the FUSE filesystem — which is always the sandbox root — exposes of the host.",
+      "description": "The spec file's `hostfs` section: what the FUSE filesystem — which is\nalways the sandbox root — exposes of the host.",
       "type": "object",
       "properties": {
         "mappings": {
-          "description": "An ordered list of mappings. `ro`, `rw` and `hide` select paths with glob patterns (`glob`: a string or a list of strings — the list also spellable `globs`) of absolute host paths: matched paths are mirrored into the sandbox — read-only (`ro`) or read-write (`rw`, as far as the underlying host permissions allow) — or hidden (`hide`). `empty`, `tmpfs`, `session-cache` and `project-cache` likewise take one absolute path (`path`) or several (`paths`): `empty` exposes it empty (an empty, unwritable directory, or an empty file when the path matches a real file), `tmpfs` stacks a fresh tmpfs on it, and the cache mappings back it with a session or project cache. Order matters — when a path matches several mappings, the **last** matching mapping decides, and the mount/symlink ops the mappings generate are applied in mapping order. Matched paths appear at the same absolute path inside the sandbox (`/etc/passwd` → `/etc/passwd`); matched directories are mirrored recursively (or, when hidden, disappear with their whole subtree). Nothing below an empty path is visible, and empty paths are shown even when a mirror mapping (or the real host path) covers them. Missing or empty mappings expose nothing.",
+          "description": "An ordered list of mappings. `ro`, `rw` and `hide` select paths\nwith glob patterns (`glob`: a string or a list of strings — the\nlist also spellable `globs`) of absolute host paths: matched paths\nare mirrored into the sandbox — read-only (`ro`) or read-write\n(`rw`, as far as the underlying host permissions allow) — or\nhidden (`hide`). `empty`, `tmpfs`, `session-cache` and\n`project-cache` likewise take one absolute path (`path`) or\nseveral (`paths`): `empty` exposes it empty (an empty, unwritable\ndirectory, or an empty file when the path matches a real file),\n`tmpfs` stacks a fresh tmpfs on it, and the cache mappings back it\nwith a session or project cache. Order matters — when a path\nmatches several mappings, the **last** matching mapping decides,\nand the mount/symlink ops the mappings generate are applied in\nmapping order. Matched paths appear at the same absolute path\ninside the sandbox (`/etc/passwd` → `/etc/passwd`); matched\ndirectories are mirrored recursively (or, when hidden, disappear\nwith their whole subtree). Nothing below an empty path is visible,\nand empty paths are shown even when a mirror mapping (or the real\nhost path) covers them. Missing or empty mappings expose nothing.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/Mapping"
@@ -117,18 +117,14 @@
       "additionalProperties": false
     },
     "Mapping": {
-      "description": "The spec's `hostfs.mappings` setting: an *ordered* list of mappings, each selecting host paths for one treatment.\n\nA `ro`, `rw` or `hide` mapping selects paths with **glob** patterns of absolute host paths — either one (`\"glob\": \"/usr\"`) or several (`\"globs\": [\"/usr\", \"/lib\"]`); `empty`, `tmpfs`, `session-cache` and `project-cache` likewise take one absolute path (`\"path\": \"/dev\"`) or several (`\"paths\": [\"/tmp\", \"/var/tmp\"]`); every other mapping names one absolute path exactly (it makes no sense to glob a mount point). The `dev` and `proc` mappings default their path to `/dev` and `/proc`. The list order matters: when a path matches several mappings, the **last** matching mapping decides — and the mount ops the mappings generate are applied in mapping order, too. A mapping with several globs (or paths) behaves exactly like separate mappings in the listed order.\n\nThe mount-point mappings (`dev`, `tmpfs`, `proc`, `bind`) are shorthand for an `empty` mapping *plus* the corresponding mount op (see [`Mapping::op`]): the FUSE filesystem exposes the path empty so it can be mounted on, and the sandbox stacks the real mount on top of it. `symlink` is the odd one out: it only produces a symlink op (see [`Mapping::op`]) and does not touch the host filesystem at all.",
+      "description": "The spec's `hostfs.mappings` setting: an *ordered* list of mappings,\neach selecting host paths for one treatment.\n\nA `ro`, `rw` or `hide` mapping selects paths with **glob** patterns of\nabsolute host paths — either one (`\"glob\": \"/usr\"`) or several\n(`\"globs\": [\"/usr\", \"/lib\"]`); `empty`, `tmpfs`, `session-cache` and\n`project-cache` likewise take one absolute path (`\"path\": \"/dev\"`) or\nseveral (`\"paths\": [\"/tmp\", \"/var/tmp\"]`); every other mapping names\none absolute path exactly (it makes no sense to glob a mount point).\nThe `dev` and `proc` mappings default their path to `/dev` and `/proc`.\nThe list order matters: when a path matches several mappings, the\n**last** matching mapping decides — and the mount ops the mappings\ngenerate are applied in mapping order, too. A mapping with several\nglobs (or paths) behaves exactly like separate mappings in the listed\norder.\n\nThe mount-point mappings (`dev`, `tmpfs`, `proc`, `bind`) are\nshorthand for an `empty` mapping *plus* the corresponding mount op\n(see [`Mapping::op`]): the FUSE filesystem exposes the path empty so\nit can be mounted on, and the sandbox stacks the real mount on top of\nit. `symlink` is the odd one out: it only produces a symlink op (see\n[`Mapping::op`]) and does not touch the host filesystem at all.",
       "oneOf": [
         {
           "description": "The matched paths are mirrored **read-only**.",
           "type": "object",
-          "required": [
-            "glob",
-            "type"
-          ],
           "properties": {
             "glob": {
-              "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`), either as a single string or as a list of them (a list behaves like separate mappings in the listed order). Also accepted under the alias `globs`.",
+              "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`),\neither as a single string or as a list of them (a list behaves\nlike separate mappings in the listed order). Also accepted\nunder the alias `globs`.",
               "oneOf": [
                 {
                   "type": "string"
@@ -143,23 +139,21 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "ro"
-              ]
+              "const": "ro"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "glob"
+          ]
         },
         {
-          "description": "The matched paths are mirrored **read-write** (as far as the real host permissions allow).",
+          "description": "The matched paths are mirrored **read-write** (as far as the real\nhost permissions allow).",
           "type": "object",
-          "required": [
-            "glob",
-            "type"
-          ],
           "properties": {
             "glob": {
-              "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`), either as a single string or as a list of them (a list behaves like separate mappings in the listed order). Also accepted under the alias `globs`.",
+              "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`),\neither as a single string or as a list of them (a list behaves\nlike separate mappings in the listed order). Also accepted\nunder the alias `globs`.",
               "oneOf": [
                 {
                   "type": "string"
@@ -174,23 +168,21 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "rw"
-              ]
+              "const": "rw"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "glob"
+          ]
         },
         {
-          "description": "The matched paths are hidden (a hidden directory hides its whole subtree).\n\nGlob semantics: `**` spans directory levels only as a **whole** component; inside a longer component (`**secret**`) it degrades to `*` and matches only direct children of the named directory. Use `dir/**/*secret*` to hide every entry named `*secret*` anywhere below `dir`. Matching is case-sensitive.",
+          "description": "The matched paths are hidden (a hidden directory hides its whole\nsubtree).\n\nGlob semantics: `**` spans directory levels only as a **whole**\ncomponent; inside a longer component (`**secret**`) it degrades to\n`*` and matches only direct children of the named directory. Use\n`dir/**/*secret*` to hide every entry named `*secret*` anywhere\nbelow `dir`. Matching is case-sensitive.",
           "type": "object",
-          "required": [
-            "glob",
-            "type"
-          ],
           "properties": {
             "glob": {
-              "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`), either as a single string or as a list of them (a list behaves like separate mappings in the listed order). Also accepted under the alias `globs`.",
+              "description": "A glob pattern of absolute host paths (`*`, `?`, `[...]`, `**`),\neither as a single string or as a list of them (a list behaves\nlike separate mappings in the listed order). Also accepted\nunder the alias `globs`.",
               "oneOf": [
                 {
                   "type": "string"
@@ -205,23 +197,21 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "hide"
-              ]
+              "const": "hide"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "glob"
+          ]
         },
         {
-          "description": "The named paths are exposed **empty** — mount points for the sandbox's ops.",
+          "description": "The named paths are exposed **empty** — mount points for the\nsandbox's ops.",
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
-              "description": "An absolute host path, named exactly (no wildcards) — either as a single string or as a list of them (a list behaves like separate mappings in the listed order). Also accepted under the alias `paths`.",
+              "description": "An absolute host path, named exactly (no wildcards) — either\nas a single string or as a list of them (a list behaves like\nseparate mappings in the listed order). Also accepted under\nthe alias `paths`.",
               "oneOf": [
                 {
                   "type": "string"
@@ -236,44 +226,40 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "empty"
-              ]
+              "const": "empty"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
-          "description": "Shorthand for `empty` at `path` **plus** a minimal `/dev` mount (like bwrap's `--dev`) on top of it. `path` defaults to `/dev`.",
+          "description": "Shorthand for `empty` at `path` **plus** a minimal `/dev` mount\n(like bwrap's `--dev`) on top of it. `path` defaults to `/dev`.",
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "path": {
               "description": "An absolute host path, named exactly (no wildcards).",
-              "default": "/dev",
-              "type": "string"
+              "type": "string",
+              "default": "/dev"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "dev"
-              ]
+              "const": "dev"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
         },
         {
-          "description": "Shorthand for `empty` at `path` **plus** a fresh tmpfs (like bwrap's `--tmpfs`) on top of it — one per named path.",
+          "description": "Shorthand for `empty` at `path` **plus** a fresh tmpfs (like\nbwrap's `--tmpfs`) on top of it — one per named path.",
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
-              "description": "An absolute host path, named exactly (no wildcards) — either as a single string or as a list of them (each gets its own tmpfs). Also accepted under the alias `paths`.",
+              "description": "An absolute host path, named exactly (no wildcards) — either\nas a single string or as a list of them (each gets its own\ntmpfs). Also accepted under the alias `paths`.",
               "oneOf": [
                 {
                   "type": "string"
@@ -287,15 +273,15 @@
               ]
             },
             "perms": {
-              "description": "Octal mode of the tmpfs root, e.g. `\"1777\"` or `1777`. Default: `0755`.",
+              "description": "Octal mode of the tmpfs root, e.g. `\"1777\"` or `1777`.\nDefault: `0755`.",
               "anyOf": [
                 {
-                  "description": "An octal permission mode like bwrap's `--perms`: a JSON number (`755`) or string (`\"0755\"`), both interpreted as *octal*.",
+                  "description": "An octal permission mode like bwrap's `--perms`: a JSON number (`755`) or string (\"0755\"), both interpreted as *octal*.",
                   "oneOf": [
                     {
                       "type": "integer",
-                      "maximum": 4095.0,
-                      "minimum": 0.0
+                      "maximum": 4095,
+                      "minimum": 0
                     },
                     {
                       "type": "string",
@@ -315,134 +301,124 @@
                 "null"
               ],
               "format": "uint64",
-              "minimum": 0.0
+              "minimum": 0
             },
             "type": {
               "type": "string",
-              "enum": [
-                "tmpfs"
-              ]
+              "const": "tmpfs"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
-          "description": "Shorthand for `empty` at `path` **plus** a fresh procfs instance (showing only the sandbox's own processes) on top of it. `path` defaults to `/proc`.",
+          "description": "Shorthand for `empty` at `path` **plus** a fresh procfs instance\n(showing only the sandbox's own processes) on top of it. `path`\ndefaults to `/proc`.",
           "type": "object",
-          "required": [
-            "type"
-          ],
           "properties": {
             "path": {
               "description": "An absolute host path, named exactly (no wildcards).",
-              "default": "/proc",
-              "type": "string"
+              "type": "string",
+              "default": "/proc"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "proc"
-              ]
+              "const": "proc"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
         },
         {
-          "description": "Shorthand for `empty` at `dest` **plus** a bind mount of the host path `src` on top of it. `dest` defaults to `src` — the plain \"bind the real host path at the same path\" case. The field is also accepted under its old name `path` (deprecated alias for `src`).\n\nBind mounts bypass the FUSE mirror entirely: the host path appears in the sandbox with its real permissions and no pattern-based write policy. They are therefore mounted **read-only** by default; set `rw: true` to expose the host path read-write (as far as the real host permissions allow).",
+          "description": "Shorthand for `empty` at `dest` **plus** a bind mount of the host\npath `src` on top of it. `dest` defaults to `src` — the plain\n\"bind the real host path at the same path\" case. The field is\nalso accepted under its old name `path` (deprecated alias for\n`src`).\n\nBind mounts bypass the FUSE mirror entirely: the host path appears\nin the sandbox with its real permissions and no pattern-based\nwrite policy. They are therefore mounted **read-only** by default;\nset `rw: true` to expose the host path read-write (as far as the\nreal host permissions allow).",
           "type": "object",
-          "required": [
-            "src",
-            "type"
-          ],
           "properties": {
             "dest": {
               "description": "An absolute sandbox path to bind it at. Defaults to `src`.",
-              "default": null,
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "default": null
             },
             "rw": {
-              "description": "Whether the bind mount is writable. Defaults to `false`: bind mounts are read-only unless explicitly asked for.",
-              "default": false,
-              "type": "boolean"
+              "description": "Whether the bind mount is writable. Defaults to `false`:\nbind mounts are read-only unless explicitly asked for.",
+              "type": "boolean",
+              "default": false
             },
             "src": {
-              "description": "An absolute host path to bind (named exactly, no wildcards). Also accepted under its old name `path` (deprecated alias, meaning \"bind at the same path\").",
+              "description": "An absolute host path to bind (named exactly, no wildcards).\nAlso accepted under its old name `path` (deprecated alias,\nmeaning \"bind at the same path\").",
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "bind"
-              ]
+              "const": "bind"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "src"
+          ]
         },
         {
-          "description": "A **lightweight bind** routed through the host filesystem: the host file or directory `source` is shown *in the FUSE mirror* at the sandbox path `dest` — like a bind mount, but no mount at all happens, so it works without mount privileges and is monitored (and permission-checked) by the host filesystem like any mirrored path. A redirected directory shows its whole subtree, redirected paths may be files or directories. A relative `source` is resolved relative to the directory the spec file lives in.\n\nProduces no mount op: the redirect lives entirely in the FUSE filesystem (see [`Mapping::pattern`]).",
+          "description": "A **lightweight bind** routed through the host filesystem: the\nhost file or directory `source` is shown *in the FUSE mirror* at\nthe sandbox path `dest` — like a bind mount, but no mount at all\nhappens, so it works without mount privileges and is monitored\n(and permission-checked) by the host filesystem like any mirrored\npath. A redirected directory shows its whole subtree, redirected\npaths may be files or directories. A relative `source` is\nresolved relative to the directory the spec file lives in.\n\nProduces no mount op: the redirect lives entirely in the FUSE\nfilesystem (see [`Mapping::pattern`]).",
           "type": "object",
-          "required": [
-            "dest",
-            "source",
-            "type"
-          ],
           "properties": {
             "dest": {
-              "description": "An absolute sandbox path to show the source at (named exactly, no wildcards).",
+              "description": "An absolute sandbox path to show the source at (named\nexactly, no wildcards).",
               "type": "string"
             },
             "source": {
-              "description": "The host path to show there; absolute, or relative to the spec file's directory.",
+              "description": "The host path to show there; absolute, or relative to the\nspec file's directory.",
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "redirect-ro"
-              ]
+              "const": "redirect-ro"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "dest",
+            "source"
+          ]
         },
         {
-          "description": "Like [`Mapping::RedirectRo`], but the redirected path is also writable (as far as the real host permissions allow).",
+          "description": "Like [`Mapping::RedirectRo`], but the redirected path is also\nwritable (as far as the real host permissions allow).",
           "type": "object",
-          "required": [
-            "dest",
-            "source",
-            "type"
-          ],
           "properties": {
             "dest": {
-              "description": "An absolute sandbox path to show the source at (named exactly, no wildcards).",
+              "description": "An absolute sandbox path to show the source at (named\nexactly, no wildcards).",
               "type": "string"
             },
             "source": {
-              "description": "The host path to show there; absolute, or relative to the spec file's directory.",
+              "description": "The host path to show there; absolute, or relative to the\nspec file's directory.",
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "redirect-rw"
-              ]
+              "const": "redirect-rw"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "dest",
+            "source"
+          ]
         },
         {
-          "description": "The named path is backed by a **per-run temporary directory**: a fresh, empty host directory (created under `/tmp` when the sandbox starts) is shown at the path — writable, like `redirect-rw`, but nothing it contains outlives the run. Several `session-cache` mappings share *one* tmp directory: each path maps onto the tmp directory plus its own relative sub-path (e.g. `/home/a/.cache` → `<tmpdir>/home/a/.cache`), so unrelated cache directories never collide. The tmp directory is wiped once ai-bubble terminates (see [`HostFsConfig::prepare_caches`] and `crate::hostfs::set_session_cache_root`).\n\nPurely a FUSE redirect (see [`Mapping::op`]); the mapping is rewritten into a `redirect-rw` at startup — [`Mapping::SessionCache`] mappings only exist in the unresolved config view.",
+          "description": "The named path is backed by a **per-run temporary directory**: a\nfresh, empty host directory (created under `/tmp` when the sandbox\nstarts) is shown at the path — writable, like `redirect-rw`, but\nnothing it contains outlives the run. Several `session-cache`\nmappings share *one* tmp directory: each path maps onto the tmp\ndirectory plus its own relative sub-path (e.g. `/home/a/.cache` →\n`<tmpdir>/home/a/.cache`), so unrelated cache directories never\ncollide. The tmp directory is wiped once ai-bubble terminates (see\n[`HostFsConfig::prepare_caches`] and\n`crate::hostfs::set_session_cache_root`).\n\nPurely a FUSE redirect (see [`Mapping::op`]); the mapping is\nrewritten into a `redirect-rw` at startup — [`Mapping::SessionCache`]\nmappings only exist in the unresolved config view.",
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
-              "description": "An absolute sandbox path, named exactly (no wildcards) — either as a single string or as a list of them (a list behaves like separate mappings in the listed order). Also accepted under the alias `paths`.",
+              "description": "An absolute sandbox path, named exactly (no wildcards) —\neither as a single string or as a list of them (a list\nbehaves like separate mappings in the listed order). Also\naccepted under the alias `paths`.",
               "oneOf": [
                 {
                   "type": "string"
@@ -457,23 +433,21 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "session-cache"
-              ]
+              "const": "session-cache"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
-          "description": "Like [`Mapping::SessionCache`], but backed by the **project cache** instead of a tmp directory: the path maps onto `cache/<path>` below the directory the spec file lives in (`.ai-bubble/cache/...` by default), so the content persists across runs — and is shared by every sandbox using that spec directory.",
+          "description": "Like [`Mapping::SessionCache`], but backed by the **project cache**\ninstead of a tmp directory: the path maps onto `cache/<path>` below\nthe directory the spec file lives in (`.ai-bubble/cache/...` by\ndefault), so the content persists across runs — and is shared by\nevery sandbox using that spec directory.",
           "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
           "properties": {
             "path": {
-              "description": "An absolute sandbox path, named exactly (no wildcards) — either as a single string or as a list of them (a list behaves like separate mappings in the listed order). Also accepted under the alias `paths`.",
+              "description": "An absolute sandbox path, named exactly (no wildcards) —\neither as a single string or as a list of them (a list\nbehaves like separate mappings in the listed order). Also\naccepted under the alias `paths`.",
               "oneOf": [
                 {
                   "type": "string"
@@ -488,21 +462,18 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "project-cache"
-              ]
+              "const": "project-cache"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "path"
+          ]
         },
         {
-          "description": "Create a symlink at `dest` pointing to `src`, like bwrap's `--symlink`. `src` is relative to the sandbox root (`usr/lib`, like bwrap's relative symlink targets) or absolute. This mapping does not expose anything in the host filesystem — it only generates the symlink op (applied in mapping order, together with the other mount ops).",
+          "description": "Create a symlink at `dest` pointing to `src`, like bwrap's\n`--symlink`. `src` is relative to the sandbox root (`usr/lib`,\nlike bwrap's relative symlink targets) or absolute. This mapping\ndoes not expose anything in the host filesystem — it only\ngenerates the symlink op (applied in mapping order, together with\nthe other mount ops).",
           "type": "object",
-          "required": [
-            "dest",
-            "src",
-            "type"
-          ],
           "properties": {
             "dest": {
               "description": "An absolute sandbox path for the new symlink.",
@@ -514,70 +485,65 @@
             },
             "type": {
               "type": "string",
-              "enum": [
-                "symlink"
-              ]
+              "const": "symlink"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "src",
+            "dest"
+          ]
         },
         {
-          "description": "Show a **purely virtual, in-memory file** at the path: `content` (a small file, e.g. an `/etc/resolv.conf`) is served from the mirror's memory — the host filesystem is not consulted at all, and the file leaves no trace on the host. The injected file is read-only and nothing below its path is visible. Like the redirects, this is purely a FUSE feature (see [`Mapping::pattern`]): it produces no op.",
+          "description": "Show a **purely virtual, in-memory file** at the path: `content`\n(a small file, e.g. an `/etc/resolv.conf`) is served from the\nmirror's memory — the host filesystem is not consulted at all,\nand the file leaves no trace on the host. The injected file is\nread-only and nothing below its path is visible. Like the\nredirects, this is purely a FUSE feature (see\n[`Mapping::pattern`]): it produces no op.",
           "type": "object",
-          "required": [
-            "content",
-            "path",
-            "type"
-          ],
           "properties": {
             "content": {
               "description": "The content of the injected file (text, served as UTF-8).",
               "type": "string"
             },
             "path": {
-              "description": "An absolute sandbox path for the injected file (named exactly, no wildcards).",
+              "description": "An absolute sandbox path for the injected file (named\nexactly, no wildcards).",
               "type": "string"
             },
             "type": {
               "type": "string",
-              "enum": [
-                "inject"
-              ]
+              "const": "inject"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "path",
+            "content"
+          ]
         }
       ]
     },
     "NetConfig": {
-      "description": "Network-related configuration for the sandboxed command: how it reaches the network.\n\n- `{\"mode\": \"host\"}` (the default): the command shares the host network. - `{\"mode\": \"proxy\", \"allow\": [...]}`: the command runs in a fresh network namespace and its connections are proxied from the host side, gated by `allow`. - `{\"mode\": \"waf\", \"allow\": [...]}`: like proxy, but the sandbox gets DNS/HTTP/HTTPS servers on 127.0.0.2 (ports 53, 80, 443) that resolve allow-listed names to 127.0.0.2 and forward the traffic from the host side over a Unix socket.",
+      "description": "Network-related configuration for the sandboxed command: how it\nreaches the network.\n\n- `{\"mode\": \"host\"}` (the default): the command shares the host\n  network.\n- `{\"mode\": \"proxy\", \"allow\": [...]}`: the command runs in a fresh\n  network namespace and its connections are proxied from the host\n  side, gated by `allow`.\n- `{\"mode\": \"waf\", \"allow\": [...]}`: like proxy, but the sandbox\n  gets DNS/HTTP/HTTPS servers on 127.0.0.2 (ports 53, 80, 443) that\n  resolve allow-listed names to 127.0.0.2 and forward the traffic\n  from the host side over a Unix socket.",
       "oneOf": [
         {
           "description": "Share the host network (the default).",
           "type": "object",
-          "required": [
-            "mode"
-          ],
           "properties": {
             "mode": {
               "type": "string",
-              "enum": [
-                "host"
-              ]
+              "const": "host"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ]
         },
         {
-          "description": "Run the command in a fresh network namespace and proxy its connections from the host side.",
+          "description": "Run the command in a fresh network namespace and proxy its\nconnections from the host side.",
           "type": "object",
-          "required": [
-            "allow",
-            "mode"
-          ],
           "properties": {
             "allow": {
-              "description": "Allow-list of `host`, `host:port`, or `*.domain[:port]` targets for the proxy. A `*.domain` entry matches subdomains of `domain` at any depth, but not `domain` itself. Required in proxy mode. Empty means: nothing is proxied — every target must be listed explicitly.",
+              "description": "Allow-list of `host`, `host:port`, or `*.domain[:port]` targets\nfor the proxy. A `*.domain` entry matches subdomains of `domain`\nat any depth, but not `domain` itself.\nRequired in proxy mode. Empty means: nothing is proxied — every\ntarget must be listed explicitly.",
               "type": "array",
               "items": {
                 "type": "string"
@@ -585,23 +551,21 @@
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "proxy"
-              ]
+              "const": "proxy"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "allow"
+          ]
         },
         {
-          "description": "Run the command in a fresh network namespace behind the in-sandbox DNS/HTTP/HTTPS servers on 127.0.0.2 (see `crate::waf`).",
+          "description": "Run the command in a fresh network namespace behind the in-sandbox\nDNS/HTTP/HTTPS servers on 127.0.0.2 (see `crate::waf`).",
           "type": "object",
-          "required": [
-            "allow",
-            "mode"
-          ],
           "properties": {
             "allow": {
-              "description": "Allow-list of `host`, `host:port`, or `*.domain[:port]` targets. A bare `host` entry (no port) is both resolved by the DNS server (to 127.0.0.2) and connectable. Empty means: nothing is allowed.",
+              "description": "Allow-list of `host`, `host:port`, or `*.domain[:port]` targets.\nA bare `host` entry (no port) is both resolved by the DNS server\n(to 127.0.0.2) and connectable. Empty means: nothing is allowed.",
               "type": "array",
               "items": {
                 "type": "string"
@@ -609,50 +573,43 @@
             },
             "mode": {
               "type": "string",
-              "enum": [
-                "waf"
-              ]
+              "const": "waf"
             }
           },
-          "additionalProperties": false
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "allow"
+          ]
         }
       ]
     },
     "Preset": {
-      "description": "The built-in blocklist presets (the spec's `seccomp.preset` field).\n\nA preset is a curated list of syscalls that a sandboxed command has no business issuing — each entry is a known sandbox-escape vector, a host-state manipulation, or an attack surface that is only ever needed by the *host*, never by a process inside a sandbox. Writing such a list from scratch is exactly the complicated part of configuring seccomp, so the presets ship it; `block` and `allow` adjust it.",
+      "description": "The built-in blocklist presets (the spec's `seccomp.preset` field).\n\nA preset is a curated list of syscalls that a sandboxed command has\nno business issuing — each entry is a known sandbox-escape vector,\na host-state manipulation, or an attack surface that is only ever\nneeded by the *host*, never by a process inside a sandbox. Writing\nsuch a list from scratch is exactly the complicated part of\nconfiguring seccomp, so the presets ship it; `block` and `allow`\nadjust it.",
       "oneOf": [
         {
-          "description": "An **empty** baseline. The filter is still a blocklist — `block` and `allow` edit an empty list — but nothing is denied by the preset itself. Useful to start from scratch while keeping the blocklist mode (e.g. to later subtract exceptions from a `block` list rather than enumerate a whole allowlist).",
+          "description": "An **empty** baseline. The filter is still a blocklist — `block`\nand `allow` edit an empty list — but nothing is denied by the\npreset itself. Useful to start from scratch while keeping the\nblocklist mode (e.g. to later subtract exceptions from a `block`\nlist rather than enumerate a whole allowlist).",
           "type": "string",
-          "enum": [
-            "none"
-          ]
+          "const": "none"
         },
         {
-          "description": "The **default** blocklist: the syscalls no sandboxed command should ever need, each of them a known danger in a sandbox:\n\n- `init_module`, `finit_module`, `delete_module`: load and unload **kernel code**. Loading a module is unconditional compromise of the host — nothing inside a sandbox ever needs it. - `kexec_load`, `kexec_file_load`: replace the **running kernel** with another image. The ultimate host takeover primitive. - `reboot`, `acct`: host-wide state changes. `reboot` is self- explanatory; `acct` turns on kernel process accounting into an arbitrary file (host disk fill, and a window into every other process on the host). - `swapon`, `swapoff`: add/remove swap devices. Swapping host memory into a sandbox-controlled file would leak other processes' memory contents. - `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`, `fsmount`, `fspick`, `mount_setattr`: the mount table is part of the sandbox's isolation — rearranging it (detach what it is confined to, re-mount something over a sensitive path, change mount propagation to make host mounts appear) is a classic escape vector. Both the classic interface (`mount`, `umount2`) and the new mount-API syscalls are blocked. All sandbox mounts are set up *before* the filter is installed, so the command never needs these. - `userfaultfd`: user-space page-fault handling. Its fine-grained control over fault timing is a staple of kernel use-after-free exploits (it reliably widens race windows), and it is a recognized sandbox-escape primitive. - `bpf`: load and inspect eBPF programs. In the presence of historic verifier bugs this is kernel code execution; even without capabilities it leaks kernel internals (KASLR) and other-process data. - `perf_event_open`: the kernel profiling interface — historically rich in CVEs, a well-known side-channel (and thus KASLR/secret- leak) source, and a reconnaissance tool against other processes. - `io_uring_setup`, `io_uring_enter`, `io_uring_register`: a huge, fast-moving, hard-to-audit kernel subsystem that bypasses the usual syscall path; a disproportionate share of recent kernel LPEs and sandbox escapes involve it (major sandboxes such as Docker and gVisor block it by default for exactly this reason). Nothing a sandboxed build/test command does needs it. - `open_by_handle_at`: open a file **by inode handle**, skipping the path-based permission checks the FUSE mirror's policy is built on. With `CAP_DAC_READ_SEARCH` this is the classic \"Shocker\"-style escape; without it there is still no reason to allow an interface designed to bypass path checks. - `unshare`, `setns`: create or join namespaces. The sandbox's isolation rests on the namespaces it sets up before exec; letting the command create new ones (unprivileged user/mount namespaces) or join others mid-flight undermines exactly that. - `personality`: change the execution domain — notably disable ASLR (`ADDR_NO_RANDOMIZE`) and select alternate syscall behaviors, both useful for exploitation and none needed by a normal command. - `pidfd_getfd`: steal a **file descriptor from another process** in the sandbox (its files, sockets, pipes) purely by PID — lateral movement between the sandbox's processes. - `settimeofday`, `clock_settime`, `adjtimex`: the kernel clock is shared with the host; changing it falsifies the host's time and every audit/log timestamp on the machine. - `add_key`, `keyctl`, `request_key`: the kernel **keyring**. Keys persist in the host session across sandbox runs — both a cross-sandbox data channel and a way to poison host lookups. - `quotactl`: manipulate disk quotas of host filesystems (and learn host usage numbers the sandbox has no business seeing). - `lookup_dcookie`: a kernel-profiling cookie lookup that only profiling daemons on the host ever need (and that requires capabilities anyway). - `ioperm`, `iopl`, `modify_ldt` (x86_64 only): the legacy x86 privilege interfaces. `ioperm`/`iopl` grant user space direct **I/O port access** — raw hardware I/O that by bypasses every driver, with arbitrary host device access; `modify_ldt` writes the local descriptor table, a classic exploit primitive (its grant-on-use handling has shipped multiple kernel CVEs, and it historically bypassed seccomp's own checks). The syscalls only exist on x86_64, so they are blocked only there.",
+          "description": "The **default** blocklist: the syscalls no sandboxed command\nshould ever need, each of them a known danger in a sandbox:\n\n- `init_module`, `finit_module`, `delete_module`: load and\n  unload **kernel code**. Loading a module is unconditional\n  compromise of the host — nothing inside a sandbox ever needs it.\n- `kexec_load`, `kexec_file_load`: replace the **running kernel**\n  with another image. The ultimate host takeover primitive.\n- `reboot`, `acct`: host-wide state changes. `reboot` is self-\n  explanatory; `acct` turns on kernel process accounting into an\n  arbitrary file (host disk fill, and a window into every other\n  process on the host).\n- `swapon`, `swapoff`: add/remove swap devices. Swapping host\n  memory into a sandbox-controlled file would leak other\n  processes' memory contents.\n- `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`,\n  `fsmount`, `fspick`, `mount_setattr`: the mount table is part\n  of the sandbox's isolation — rearranging it (detach what it is\n  confined to, re-mount something over a sensitive path, change\n  mount propagation to make host mounts appear) is a classic\n  escape vector. Both the classic interface (`mount`, `umount2`)\n  and the new mount-API syscalls are blocked. All sandbox mounts\n  are set up *before* the filter is installed, so the command\n  never needs these.\n- `userfaultfd`: user-space page-fault handling. Its fine-grained\n  control over fault timing is a staple of kernel use-after-free\n  exploits (it reliably widens race windows), and it is a\n  recognized sandbox-escape primitive.\n- `bpf`: load and inspect eBPF programs. In the presence of\n  historic verifier bugs this is kernel code execution; even\n  without capabilities it leaks kernel internals (KASLR) and\n  other-process data.\n- `perf_event_open`: the kernel profiling interface — historically\n  rich in CVEs, a well-known side-channel (and thus KASLR/secret-\n  leak) source, and a reconnaissance tool against other processes.\n- `io_uring_setup`, `io_uring_enter`, `io_uring_register`: a huge,\n  fast-moving, hard-to-audit kernel subsystem that bypasses the\n  usual syscall path; a disproportionate share of recent kernel\n  LPEs and sandbox escapes involve it (major sandboxes such as\n  Docker and gVisor block it by default for exactly this reason).\n  Nothing a sandboxed build/test command does needs it.\n- `open_by_handle_at`: open a file **by inode handle**, skipping\n  the path-based permission checks the FUSE mirror's policy is\n  built on. With `CAP_DAC_READ_SEARCH` this is the classic\n  \"Shocker\"-style escape; without it there is still no reason to\n  allow an interface designed to bypass path checks.\n- `unshare`, `setns`: create or join namespaces. The sandbox's\n  isolation rests on the namespaces it sets up before exec;\n  letting the command create new ones (unprivileged user/mount\n  namespaces) or join others mid-flight undermines exactly that.\n- `personality`: change the execution domain — notably disable\n  ASLR (`ADDR_NO_RANDOMIZE`) and select alternate syscall\n  behaviors, both useful for exploitation and none needed by a\n  normal command.\n- `pidfd_getfd`: steal a **file descriptor from another process**\n  in the sandbox (its files, sockets, pipes) purely by PID —\n  lateral movement between the sandbox's processes.\n- `settimeofday`, `clock_settime`, `adjtimex`: the kernel clock is\n  shared with the host; changing it falsifies the host's time and\n  every audit/log timestamp on the machine.\n- `add_key`, `keyctl`, `request_key`: the kernel **keyring**.\n  Keys persist in the host session across sandbox runs — both a\n  cross-sandbox data channel and a way to poison host lookups.\n- `quotactl`: manipulate disk quotas of host filesystems (and\n  learn host usage numbers the sandbox has no business seeing).\n- `lookup_dcookie`: a kernel-profiling cookie lookup that only\n  profiling daemons on the host ever need (and that requires\n  capabilities anyway).\n- `ioperm`, `iopl`, `modify_ldt` (x86_64 only): the legacy x86\n  privilege interfaces. `ioperm`/`iopl` grant user space direct\n  **I/O port access** — raw hardware I/O that by bypasses every\n  driver, with arbitrary host device access; `modify_ldt` writes\n  the local descriptor table, a classic exploit primitive (its\n  grant-on-use handling has shipped multiple kernel CVEs, and it\n  historically bypassed seccomp's own checks). The syscalls only\n  exist on x86_64, so they are blocked only there.",
           "type": "string",
-          "enum": [
-            "default"
-          ]
+          "const": "default"
         },
         {
-          "description": "The `default` blocklist plus the **NUMA memory policy** and **host identity** syscalls, for environments that want the extra margin:\n\n- `mbind`, `set_mempolicy`, `move_pages`: NUMA memory policy is shared kernel state; a sandboxed process can degrade host memory placement for every other workload (DoS), and `move_pages` is a documented physical-memory probing oracle (side-channel reconnaissance). - `sethostname`, `setdomainname`: rename the machine. When the UTS namespace is not isolated (e.g. in hostfs-root or `net: host` setups) this renames it *for the host* too, corrupting the identity other programs and logs rely on.",
+          "description": "The `default` blocklist plus the **NUMA memory policy** and\n**host identity** syscalls, for environments that want the extra\nmargin:\n\n- `mbind`, `set_mempolicy`, `move_pages`: NUMA memory policy is\n  shared kernel state; a sandboxed process can degrade host\n  memory placement for every other workload (DoS), and\n  `move_pages` is a documented physical-memory probing oracle\n  (side-channel reconnaissance).\n- `sethostname`, `setdomainname`: rename the machine. When the\n  UTS namespace is not isolated (e.g. in hostfs-root or `net:\n  host` setups) this renames it *for the host* too, corrupting\n  the identity other programs and logs rely on.",
           "type": "string",
-          "enum": [
-            "strict"
-          ]
+          "const": "strict"
         }
       ]
     },
     "SeccompConfig": {
-      "description": "The spec file's `seccomp` section (see the module docs).\n\nThe custom `Deserialize` impl (backed by a derived internal struct) enforces the mutual exclusions at parse time, so a contradictory spec is rejected like any other spec error: without a `preset`, `allow` and `block` are mutually exclusive; with one, a name in both is ambiguous and rejected.",
+      "description": "The spec file's `seccomp` section (see the module docs).\n\nThe custom `Deserialize` impl (backed by a derived internal struct)\nenforces the mutual exclusions at parse time, so a contradictory\nspec is rejected like any other spec error: without a `preset`,\n`allow` and `block` are mutually exclusive; with one, a name in both\nis ambiguous and rejected.",
       "type": "object",
-      "required": [
-        "on_violation"
-      ],
       "properties": {
         "allow": {
-          "description": "Syscall allowlist: when present (without a `preset`), *only* these syscalls may be executed by the sandboxed command (everything else is denied per `on_violation`). An allowlist must be complete — including `execve`, `exit_group`, `mmap` and friends — or the command cannot run at all.\n\nWith a `preset`, this is instead the list of **exceptions**: syscalls taken back out of the preset's blocklist.",
+          "description": "Syscall allowlist: when present (without a `preset`), *only*\nthese syscalls may be executed by the sandboxed command\n(everything else is denied per `on_violation`). An allowlist must\nbe complete — including `execve`, `exit_group`, `mmap` and\nfriends — or the command cannot run at all.\n\nWith a `preset`, this is instead the list of **exceptions**:\nsyscalls taken back out of the preset's blocklist.",
           "type": [
             "array",
             "null"
@@ -662,7 +619,7 @@
           }
         },
         "block": {
-          "description": "Syscall blocklist: when present, exactly these syscalls are denied; everything else stays allowed. Useful to forbid specific dangerous entry points (`ptrace`, `mount`, `keyctl`, `bpf`, ...) without enumerating the whole syscall surface.\n\nWith a `preset`, these are **added** to the preset's blocklist.",
+          "description": "Syscall blocklist: when present, exactly these syscalls are\ndenied; everything else stays allowed. Useful to forbid specific\ndangerous entry points (`ptrace`, `mount`, `keyctl`, `bpf`, ...)\nwithout enumerating the whole syscall surface.\n\nWith a `preset`, these are **added** to the preset's blocklist.",
           "type": [
             "array",
             "null"
@@ -680,7 +637,7 @@
           ]
         },
         "preset": {
-          "description": "The built-in blocklist baseline (see [`Preset`]). When present, the filter is a blocklist seeded by the preset: `block` adds entries to it, `allow` takes exceptions back out. Absent, the section is a plain allowlist (`allow`) or blocklist (`block`).",
+          "description": "The built-in blocklist baseline (see [`Preset`]). When present,\nthe filter is a blocklist seeded by the preset: `block` adds\nentries to it, `allow` takes exceptions back out. Absent, the\nsection is a plain allowlist (`allow`) or blocklist (`block`).",
           "anyOf": [
             {
               "$ref": "#/definitions/Preset"
@@ -690,24 +647,23 @@
             }
           ]
         }
-      }
+      },
+      "required": [
+        "on_violation"
+      ]
     },
     "Violation": {
-      "description": "What happens to a syscall the filter denies (the spec's `on_violation` field, default `errno`).",
+      "description": "What happens to a syscall the filter denies (the spec's\n`on_violation` field, default `errno`).",
       "oneOf": [
         {
-          "description": "The denied syscall simply fails with `EPERM`. Lets the command observe (and perhaps work around) the restriction.",
+          "description": "The denied syscall simply fails with `EPERM`. Lets the command\nobserve (and perhaps work around) the restriction.",
           "type": "string",
-          "enum": [
-            "errno"
-          ]
+          "const": "errno"
         },
         {
-          "description": "The sandboxed process is killed with `SIGSYS` the moment it issues a denied syscall.",
+          "description": "The sandboxed process is killed with `SIGSYS` the moment it\nissues a denied syscall.",
           "type": "string",
-          "enum": [
-            "kill"
-          ]
+          "const": "kill"
         }
       ]
     }
