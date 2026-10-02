@@ -76,6 +76,10 @@ enum Comp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pattern {
     comps: Vec<Comp>,
+    /// Whether any component is a `**`. When it is not, a full match
+    /// requires the path to have exactly `comps.len()` components — a cheap
+    /// pre-filter `matches` applies before any allocation.
+    has_doublestar: bool,
 }
 
 impl Pattern {
@@ -95,7 +99,11 @@ impl Pattern {
                 })?));
             }
         }
-        Ok(Pattern { comps })
+        let has_doublestar = comps.iter().any(|c| matches!(c, Comp::DoubleStar));
+        Ok(Pattern {
+            comps,
+            has_doublestar,
+        })
     }
 
     /// The path's components as strings, or `None` when any of them is not
@@ -123,27 +131,46 @@ impl Pattern {
     /// Whether the pattern names the path exactly (a `**` may span any
     /// number of directories). `*` never crosses `/`, like in a shell.
     pub fn matches(&self, path: &Path) -> bool {
+        // Cheap pre-filter: without a `**`, the pattern can only match a
+        // path with exactly as many components as it has — reject those
+        // *before* building the (allocating) component list. In the hot
+        // paths (permission/ancestor scans over every pattern) most calls
+        // are such rejections, so this avoids nearly all of the work.
+        if !self.has_doublestar {
+            let depth = path
+                .components()
+                .filter(|c| matches!(c, Component::Normal(_)))
+                .count();
+            if depth != self.comps.len() {
+                return false;
+            }
+        }
         let Some(comps) = Self::path_comps(path) else {
             return false;
         };
-        self.match_from(0, &comps)
+        // One reusable buffer for all components' characters instead of a
+        // fresh allocation per component (and per `**` attempt).
+        let mut chars = Vec::new();
+        self.match_from(0, &comps, &mut chars)
     }
 
-    fn match_from(&self, pi: usize, comps: &[&str]) -> bool {
+    fn match_from(&self, pi: usize, comps: &[&str], chars: &mut Vec<char>) -> bool {
         match self.comps.get(pi) {
             None => comps.is_empty(),
             Some(Comp::DoubleStar) => {
                 // Consume zero components (the `**` ends here) or one
                 // (it spans another directory level).
-                self.match_from(pi + 1, comps)
-                    || (!comps.is_empty() && self.match_from(pi, &comps[1..]))
+                self.match_from(pi + 1, comps, chars)
+                    || (!comps.is_empty() && self.match_from(pi, &comps[1..], chars))
             }
             Some(Comp::Chars(tokens)) => {
                 let Some(name) = comps.first() else {
                     return false;
                 };
-                let chars: Vec<char> = name.chars().collect();
-                match_component(tokens, &chars) && self.match_from(pi + 1, &comps[1..])
+                chars.clear();
+                chars.extend(name.chars());
+                match_component(tokens, &chars[..])
+                    && self.match_from(pi + 1, &comps[1..], chars)
             }
         }
     }
@@ -153,6 +180,7 @@ impl Pattern {
     /// matches are answered by [`Pattern::matches`].
     pub fn walk(&self, path: &Path) -> Walk {
         let mut pi = 0;
+        let mut chars = Vec::new();
         for c in path.components() {
             let Component::Normal(name) = c else {
                 continue;
@@ -178,8 +206,9 @@ impl Pattern {
                     return Walk::StarStar;
                 }
                 Comp::Chars(tokens) => {
-                    let chars: Vec<char> = name.chars().collect();
-                    if !match_component(tokens, &chars) {
+                    chars.clear();
+                    chars.extend(name.chars());
+                    if !match_component(tokens, &chars[..]) {
                         return Walk::Fail;
                     }
                 }
@@ -207,6 +236,7 @@ impl Pattern {
     pub fn walk_depth(&self, path: &Path) -> Option<(Walk, usize)> {
         let mut pi = 0;
         let mut matched = 0usize;
+        let mut chars = Vec::new();
         for c in path.components() {
             let Component::Normal(name) = c else {
                 continue;
@@ -226,8 +256,9 @@ impl Pattern {
                     return Some((Walk::StarStar, pi));
                 }
                 Comp::Chars(tokens) => {
-                    let chars: Vec<char> = name.chars().collect();
-                    if !match_component(tokens, &chars) {
+                    chars.clear();
+                    chars.extend(name.chars());
+                    if !match_component(tokens, &chars[..]) {
                         return None;
                     }
                 }
@@ -250,6 +281,7 @@ impl Pattern {
     /// directory the host does not (or only partially) provide.
     pub fn next_literal(&self, path: &Path) -> Option<String> {
         let mut pi = 0;
+        let mut chars = Vec::new();
         for c in path.components() {
             let Component::Normal(name) = c else {
                 continue;
@@ -261,8 +293,9 @@ impl Pattern {
             match &self.comps[pi] {
                 Comp::DoubleStar => return None,
                 Comp::Chars(tokens) => {
-                    let chars: Vec<char> = name.chars().collect();
-                    if !match_component(tokens, &chars) {
+                    chars.clear();
+                    chars.extend(name.chars());
+                    if !match_component(tokens, &chars[..]) {
                         return None;
                     }
                 }

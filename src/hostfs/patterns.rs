@@ -103,22 +103,50 @@ impl std::fmt::Display for Permission {
 #[derive(Debug, Default, PartialEq, Clone)]
 pub struct Patterns {
     patterns: Vec<(Pattern, Permission)>,
+    /// Indices of the `hide` patterns, in list order. A path is hidden
+    /// when any of them names it directly or names a strict ancestor —
+    /// checking only these (typically few) avoids scanning the whole list
+    /// on every operation.
+    hides: Vec<usize>,
+    /// Indices of the `empty` patterns (`is_empty_prefix`).
+    empties: Vec<usize>,
+    /// Indices of the `inject` patterns (`is_inject_prefix`).
+    injects: Vec<usize>,
 }
 
 impl Patterns {
     /// Compile the pattern → permission list. Invalid patterns are a hard
     /// error: a spec that cannot be compiled must not run at all.
     pub fn new(patterns: Vec<(String, Permission)>) -> Patterns {
+        let patterns: Vec<(Pattern, Permission)> = patterns
+            .into_iter()
+            .map(|(pattern, permission)| {
+                let compiled = Pattern::new(&pattern).unwrap_or_else(|e| {
+                    crate::sandbox::die(&format!("Invalid hostfs pattern: {e}"))
+                });
+                (compiled, permission)
+            })
+            .collect();
+        // Partition the list once, at construction, so the per-operation
+        // checks (`hidden`, `is_empty_prefix`, `is_inject_prefix`, the
+        // hide precedence in `permission_of`) only scan their own kind
+        // instead of every entry.
+        let mut hides = Vec::new();
+        let mut empties = Vec::new();
+        let mut injects = Vec::new();
+        for (idx, (_, permission)) in patterns.iter().enumerate() {
+            match permission {
+                Permission::Hide => hides.push(idx),
+                Permission::Empty => empties.push(idx),
+                Permission::Inject { .. } => injects.push(idx),
+                _ => {}
+            }
+        }
         Patterns {
-            patterns: patterns
-                .into_iter()
-                .map(|(pattern, permission)| {
-                    let compiled = Pattern::new(&pattern).unwrap_or_else(|e| {
-                        crate::sandbox::die(&format!("Invalid hostfs pattern: {e}"))
-                    });
-                    (compiled, permission)
-                })
-                .collect(),
+            patterns,
+            hides,
+            empties,
+            injects,
         }
     }
 
@@ -133,6 +161,17 @@ impl Patterns {
         self.patterns
             .iter()
             .any(|(_, permission)| permission.is_writable())
+    }
+
+    /// The last pattern (in list order) naming the path directly — the
+    /// single place the "last match wins" scan lives, so every caller
+    /// benefits from the cheap pre-filters inside `Pattern::matches`.
+    fn direct(&self, path: &Path) -> Option<&Permission> {
+        self.patterns
+            .iter()
+            .rev()
+            .find(|(pattern, _)| pattern.matches(path))
+            .map(|(_, permission)| permission)
     }
 
     /// The permission governing the path in the sandbox: the single source
@@ -155,45 +194,49 @@ impl Patterns {
     ///   everything below,
     /// * otherwise the path is not visible in the sandbox at all (`None`).
     pub fn permission_of(&self, path: &Path) -> Option<&Permission> {
-        let direct = |p: &Path| {
-            self.patterns
-                .iter()
-                .rev()
-                .find(|(pattern, _)| pattern.matches(p))
-                .map(|(_, permission)| permission)
-        };
-        // Everything strictly below an empty or an injected path is
-        // invisible: an empty path is covered by a mount inside the
-        // sandbox, an injected path is a virtual file — neither has
-        // content below it, whatever pattern matches below.
-        if path.ancestors().skip(1).any(|a| {
-            matches!(
-                direct(a),
-                Some(Permission::Empty) | Some(Permission::Inject { .. })
-            )
-        }) {
+        // One walk over the strict ancestors serves both the empty/inject
+        // shadowing check (any such ancestor — the check `any`s over the
+        // whole chain, so the walk can stop at the first) and the nearest
+        // mirrored ancestor for the fallback below (the *deepest* mirrored
+        // one, i.e. the first found walking deepest-first). The original
+        // needed two separate ancestor walks with a full `direct` scan per
+        // ancestor each.
+        let mut shadowed = false;
+        let mut nearest_mirrored: Option<&Permission> = None;
+        for ancestor in path.ancestors().skip(1) {
+            match self.direct(ancestor) {
+                Some(Permission::Empty) | Some(Permission::Inject { .. }) => {
+                    shadowed = true;
+                    break;
+                }
+                Some(p) if p.is_mirrored() && nearest_mirrored.is_none() => {
+                    nearest_mirrored = Some(p);
+                }
+                _ => {}
+            }
+        }
+        if shadowed {
             return None;
         }
         // A hidden path is never visible — the mirror enforces this
         // unconditionally (`Patterns::hidden` checks every `hide` pattern,
         // naming the path itself or a strict ancestor, before any direct
         // permission), so the last-match rule below only applies among
-        // the non-`hide` patterns.
-        if let Some((_, permission)) = self.patterns.iter().find(|(pattern, permission)| {
-            *permission == Permission::Hide
-                && (pattern.matches(path) || pattern.walk(path) == Walk::Ancestor)
+        // the non-`hide` patterns. Only the pre-partitioned `hide` patterns
+        // are consulted.
+        if let Some(&i) = self.hides.iter().find(|&&i| {
+            let pattern = &self.patterns[i].0;
+            pattern.matches(path) || pattern.walk(path) == Walk::Ancestor
         }) {
-            return Some(permission);
+            return Some(&self.patterns[i].1);
         }
         // The last pattern naming the path itself decides.
-        if let Some(permission) = direct(path) {
+        if let Some(permission) = self.direct(path) {
             return Some(permission);
         }
         // Otherwise the nearest mirrored ancestor governs: the mirror is
         // recursive, so its permission extends to everything below it.
-        path.ancestors()
-            .skip(1)
-            .find_map(|a| direct(a).filter(|p| p.is_mirrored()))
+        nearest_mirrored
     }
 
     /// Whether the mirrored path is matched with the `empty` permission (by
@@ -276,28 +319,64 @@ impl Patterns {
     /// ancestor leading to an empty path — and nothing hides it directly
     /// or via an ancestor.
     pub fn exists(&self, mirrored: &Path) -> bool {
-        if self.under_empty(mirrored) {
+        if Pattern::has_non_utf8_component(mirrored) {
             return false;
         }
-        if self.is_empty(mirrored) {
-            return true;
+        // One walk over the strict ancestors replaces the three separate
+        // passes the naive composition needs (`under_empty`, the
+        // empty/inject shadowing inside every `permission_of` call, and
+        // the mirrored-ancestor fallback): the *shallowest* ancestor
+        // directly named by an `empty`/`inject` pattern decides both —
+        // deeper such ancestors are shadowed by it (their permission is
+        // `None`), so only its kind matters.
+        let mut shallowest_shadow: Option<&Permission> = None;
+        let mut nearest_mirrored: Option<&Permission> = None;
+        for ancestor in mirrored.ancestors().skip(1) {
+            match self.direct(ancestor) {
+                Some(p @ (Permission::Empty | Permission::Inject { .. })) => {
+                    shallowest_shadow = Some(p);
+                }
+                Some(p) if p.is_mirrored() && nearest_mirrored.is_none() => {
+                    nearest_mirrored = Some(p);
+                }
+                _ => {}
+            }
         }
-        if self.is_inject(mirrored).is_some() {
-            return true;
+        // Everything strictly below an empty path is invisible: the empty
+        // path is meant to be covered by a mount inside the sandbox. (The
+        // shallowest shadow being `inject` does *not* hide: an injected
+        // path is a virtual file whose parent directories stay navigable
+        // — that is decided by `dir_prefix`/`is_empty_prefix` below.)
+        if matches!(shallowest_shadow, Some(Permission::Empty)) {
+            return false;
         }
+        let shadowed = shallowest_shadow.is_some();
         if self.hidden(mirrored) {
             return false;
         }
-        self.matches(mirrored) || self.dir_prefix(mirrored) || self.is_empty_prefix(mirrored)
+        // With a shadowing empty/inject ancestor the path's own permission
+        // is `None`: neither `empty`, `inject` nor a direct mirror applies.
+        // Otherwise the path's own last match decides — its `empty`/`inject`
+        // permission makes it exist as the (virtual) path itself, a
+        // mirrored one as real content, and otherwise the nearest mirrored
+        // ancestor inherits (the mirror is recursive).
+        if !shadowed {
+            match self.direct(mirrored).or(nearest_mirrored) {
+                Some(Permission::Empty) | Some(Permission::Inject { .. }) => return true,
+                Some(p) if p.is_mirrored() => return true,
+                _ => {}
+            }
+        }
+        self.dir_prefix(mirrored) || self.is_empty_prefix(mirrored)
     }
 
     /// Whether the path is hidden because a pattern hides it directly, or
     /// a hidden pattern names one of its strict ancestors (a hidden
     /// directory hides its whole subtree).
     pub fn hidden(&self, mirrored: &Path) -> bool {
-        self.patterns.iter().any(|(pattern, permission)| {
-            *permission == Permission::Hide
-                && (pattern.matches(mirrored) || pattern.walk(mirrored) == Walk::Ancestor)
+        self.hides.iter().any(|&i| {
+            let pattern = &self.patterns[i].0;
+            pattern.matches(mirrored) || pattern.walk(mirrored) == Walk::Ancestor
         })
     }
 
@@ -306,8 +385,8 @@ impl Patterns {
     /// virtual) directory leading to empty paths, and must stay navigable
     /// even when the mirror knows nothing about it.
     pub fn is_empty_prefix(&self, mirrored: &Path) -> bool {
-        self.patterns.iter().any(|(pattern, permission)| {
-            *permission == Permission::Empty && self.pattern_reaches(pattern, mirrored)
+        self.empties.iter().any(|&i| {
+            self.pattern_reaches(&self.patterns[i].0, mirrored)
         })
     }
 
@@ -317,10 +396,9 @@ impl Patterns {
     /// navigable (and listable) even when the mirror knows nothing about
     /// it otherwise.
     pub fn is_inject_prefix(&self, mirrored: &Path) -> bool {
-        self.patterns.iter().any(|(pattern, permission)| {
-            matches!(permission, Permission::Inject { .. })
-                && pattern.walk(mirrored) == Walk::CouldReach
-        })
+        self.injects
+            .iter()
+            .any(|&i| self.patterns[i].0.walk(mirrored) == Walk::CouldReach)
     }
 
     /// Whether some **mirrored** pattern could still match something
