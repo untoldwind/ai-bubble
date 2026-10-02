@@ -40,8 +40,25 @@
 //!   Write errors are surfaced on stderr (once per process) instead of
 //!   being discarded silently — losing audit events is worth knowing
 //!   about even when the run cannot be stopped for it.
+//! * The file is opened **eagerly, in [`configure`]** — before the
+//!   sandbox and any untrusted command exist — with `O_NOFOLLOW` and a
+//!   regular-file check (AUDIT.md finding H4). The opened descriptor is
+//!   retained for the process lifetime; the writer never opens the path
+//!   again. A sandboxed command can therefore not swap the path for a
+//!   symlink (its appends would land in an operator-chosen target) or a
+//!   FIFO (the writer would hang and, through the bounded channel,
+//!   deadlock every suspending producer) — the descriptor already points
+//!   at the validated regular file, and `O_NOFOLLOW` keeps every later
+//!   (rotation) open from following a swapped-in symlink.
+//! * Residual, by design: if the audit log lives inside a *sandbox-
+//!   writable* mapped directory, the command can open the same file
+//!   through the mirror and append, truncate, or fill it with its own
+//!   content (the eager open protects the writer's descriptor, not the
+//!   file's integrity). Keep the audit log inside the spec directory,
+//!   which the sandbox never sees.
 
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -78,8 +95,18 @@ static WRITE_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 /// intact), large enough to batch a burst.
 const MAX_BYTES: usize = 32 * 1024;
 
-/// The audit log path, configured once before any process forks.
-static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// The audit log path and its eagerly opened descriptor, configured
+/// once before any process forks. `None` when auditing is disabled.
+static LOG: OnceLock<Option<AuditLog>> = OnceLock::new();
+
+/// The configured audit log: its (canonical) path — used only for
+/// rotation — and the file opened in [`configure`], before any untrusted
+/// code runs. Writers clone the descriptor; nothing ever opens the path
+/// again except rotation.
+struct AuditLog {
+    path: PathBuf,
+    file: std::fs::File,
+}
 
 /// The per-process channel to the writer. `None` when auditing is
 /// disabled (no `audit.log` in the spec) — `record` then does nothing.
@@ -87,8 +114,9 @@ static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// inside a runtime); the static is filled then.
 static SENDER: OnceLock<Option<Sender<Event>>> = OnceLock::new();
 
-/// Store the audit log path. Called once by `main`, before any fork;
-/// every forked process sets up its own writer lazily on first use.
+/// Open the audit log eagerly and store path + descriptor. Called once
+/// by `main`, before any fork; every forked process clones the
+/// descriptor for its own writer lazily on first use.
 ///
 /// The path is validated here, with the operator's authority, before any
 /// untrusted work runs: the writer appends with the operator's uid, so
@@ -98,17 +126,41 @@ static SENDER: OnceLock<Option<Sender<Event>>> = OnceLock::new();
 /// is the run's trusted configuration area) or point at a file that
 /// already exists (append-only, nothing new is created). Anything else
 /// is a hard startup error.
+///
+/// The file is opened right here, before the sandbox exists (AUDIT.md
+/// finding H4): with `O_NOFOLLOW` (a path swapped to a symlink is
+/// refused instead of being followed), after a regular-file check (a
+/// FIFO would hang the writer, and through the bounded channel deadlock
+/// every suspending producer), and the descriptor is retained for the
+/// process lifetime — the sandbox cannot influence it afterwards.
 pub fn configure(log: Option<PathBuf>, spec_dir: &Path) {
-    let _ = LOG_PATH.set(log.inspect(|path| {
-        if let Err(e) = validate_path(path, spec_dir) {
-            crate::sandbox::die(&e);
+    let _ = LOG.set(match log {
+        None => None,
+        Some(path) => {
+            // `validate_path` returns the canonical path to open:
+            // symlinks resolved, `..` collapsed — so the `O_NOFOLLOW`
+            // open below races nothing, and rotation operates on the
+            // real file even when the configured path was a link.
+            let path = match validate_path(&path, spec_dir) {
+                Ok(resolved) => resolved,
+                Err(e) => crate::sandbox::die(&e),
+            };
+            let file = match safe_open(&path) {
+                Ok(file) => file,
+                Err(e) => crate::sandbox::die(&format!(
+                    "Can't open audit log {}: {e}",
+                    path.display()
+                )),
+            };
+            Some(AuditLog { path, file })
         }
-    }));
+    });
 }
 
 /// Check the audit log path against the constraint described in
-/// [`configure`]. Returns a human-readable error on violation.
-fn validate_path(path: &Path, spec_dir: &Path) -> Result<(), String> {
+/// [`configure`] and return the canonical path to open (symlinks
+/// resolved as far as the path exists, `..` collapsed).
+fn validate_path(path: &Path, spec_dir: &Path) -> Result<PathBuf, String> {
     // Resolve symlinks and `..` as far as the path exists: an existing
     // file (or one whose parent exists) is judged by what it really is.
     let resolved = match std::fs::canonicalize(path) {
@@ -132,11 +184,11 @@ fn validate_path(path: &Path, spec_dir: &Path) -> Result<(), String> {
     let spec_dir = std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf());
     // Inside the spec directory: fine, the writer may create it there.
     if resolved.starts_with(&spec_dir) {
-        return Ok(());
+        return Ok(resolved);
     }
     // Outside the spec directory: only a pre-existing file is allowed.
     if resolved.exists() {
-        return Ok(());
+        return Ok(resolved);
     }
     Err(format!(
         "audit log {} is not inside the spec directory {} and does not exist; \
@@ -146,6 +198,25 @@ fn validate_path(path: &Path, spec_dir: &Path) -> Result<(), String> {
         path.display(),
         spec_dir.display()
     ))
+}
+
+/// Open the audit log safely: `O_CREAT|O_APPEND` plus `O_NOFOLLOW` (a
+/// swapped-in symlink must never be followed) and `O_NONBLOCK` (an
+/// unfortunately named FIFO must not block the open), then a
+/// regular-file check — anything else (FIFO, device, socket) is refused
+/// with an error instead of being written to or hung on (AUDIT.md H4).
+fn safe_open(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "not a regular file (the audit log must be one)",
+        ));
+    }
+    Ok(file)
 }
 
 /// Record one audit event. When the buffer is full, the producing task
@@ -176,11 +247,19 @@ pub async fn record(
 
 /// Create the channel and spawn the writer task. Must run inside a
 /// tokio runtime (it is only ever called from `record`, which is
-/// async); `None` when auditing is disabled.
+/// async); `None` when auditing is disabled. The writer clones the
+/// descriptor opened in [`configure`] — it never opens the log path
+/// itself.
 fn setup() -> Option<Sender<Event>> {
-    let path = LOG_PATH.get().cloned().flatten()?;
+    let log = LOG.get()?.as_ref()?;
+    // A fresh descriptor per process (`try_clone` dups the fd): forked
+    // processes must not share the mutex guarding the file.
+    let file = match log.file.try_clone() {
+        Ok(file) => file,
+        Err(e) => crate::sandbox::die(&format!("Can't open the audit log for writing: {e}")),
+    };
     let (tx, rx) = mpsc::channel(CAPACITY);
-    tokio::spawn(writer(path, rx));
+    tokio::spawn(writer(log.path.clone(), file, rx));
     Some(tx)
 }
 
@@ -236,21 +315,15 @@ impl Event {
 /// The writer: collect events from the channel and append them to the
 /// log file in batches. Runs as a tokio task for the process's
 /// lifetime; ends when all senders are gone (process exit).
-async fn writer(path: PathBuf, mut rx: mpsc::Receiver<Event>) {
-    // Opened once, shared with the blocking-pool writes below.
-    let open_path = path.clone();
-    let file = match tokio::task::spawn_blocking(move || {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&open_path)
-    })
-    .await
-    {
-        Ok(Ok(file)) => Arc::new(Mutex::new(file)),
-        Ok(Err(e)) => crate::sandbox::die(&format!("Can't open audit log {}: {e}", path.display())),
-        Err(_) => crate::sandbox::die("The audit writer panicked while opening the log"),
-    };
+///
+/// The file arrives already open (from [`configure`], via [`setup`]):
+/// the attacker-influenceable path is never opened here, so a sandboxed
+/// command cannot redirect the writer to a symlink or FIFO mid-run
+/// (AUDIT.md H4). Rotation is the only path-based operation left, and it
+/// opens exclusively through [`safe_open`].
+async fn writer(path: PathBuf, file: std::fs::File, mut rx: mpsc::Receiver<Event>) {
+    // Shared with the blocking-pool writes below.
+    let file = Arc::new(Mutex::new(file));
 
     let mut batch: Vec<Event> = Vec::new();
     loop {
@@ -348,16 +421,19 @@ fn rotate(path: &Path, file: &mut std::fs::File) {
     // (e.g. a concurrent rotation by one of the other forked ai-bubble
     // processes won the race), fall through: the fresh open below either
     // finds the rotated-away file (and creates a new one) or the
-    // original.
-    if std::fs::rename(path, &backup).is_ok()
-        && let Ok(fresh) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    // original. Both re-opens go through `safe_open` (`O_NOFOLLOW`,
+    // regular-file check): a path the sandbox swapped for a symlink or
+    // FIFO must not be followed or hung on — and when the safe open
+    // fails, the writer keeps appending to the descriptor it already
+    // holds, which the sandbox cannot touch (AUDIT.md H4).
+    if std::fs::rename(path, &backup).is_ok() && let Ok(fresh) = safe_open(path) {
             *file = fresh;
             return;
         }
     // Renaming or re-opening failed: try to re-open the original path so
     // `file` at least tracks the canonical location again. When even that
     // fails, keep writing to the old descriptor (the renamed backup).
-    if let Ok(reopened) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(reopened) = safe_open(path) {
         *file = reopened;
     }
 }
@@ -365,7 +441,8 @@ fn rotate(path: &Path, file: &mut std::fs::File) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::FileTypeExt;
 
     /// Without a configured log path the whole subsystem is inert.
     #[tokio::test]
@@ -444,8 +521,13 @@ mod tests {
 
         // A writer on a channel of our own (no fork involved).
         let (tx, rx) = mpsc::channel::<Event>(CAPACITY);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
         let path = log.clone();
-        let handle = tokio::spawn(writer(path, rx));
+        let handle = tokio::spawn(writer(path, file, rx));
 
         for i in 0..3 {
             tx.send(Event {
@@ -482,5 +564,95 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `safe_open` refuses anything that is not a regular file (AUDIT.md
+    /// finding H4): a FIFO renamed over the audit path must not be opened
+    /// (the writer would hang on it and, through the bounded channel,
+    /// deadlock every suspending producer).
+    #[test]
+    fn safe_open_refuses_a_fifo() {
+        let dir = std::env::temp_dir().join(format!("ai-bubble-audit-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("audit.jsonl");
+        nix_fifo(&fifo);
+
+        assert!(safe_open(&fifo).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `safe_open` must not follow a symlink (AUDIT.md finding H4): a
+    /// symlink swapped in over the audit path must be refused, not
+    /// followed to its (operator-chosen) target.
+    #[test]
+    fn safe_open_refuses_a_symlink() {
+        let dir =
+            std::env::temp_dir().join(format!("ai-bubble-audit-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.jsonl");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.join("audit.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(safe_open(&link).is_err());
+        // The target must not have been written (append-only guarantee
+        // applies to the validated file, not to whatever the path points
+        // at when the swap happened).
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rotating must never open the attacker-influenceable path blindly
+/// (AUDIT.md finding H4): with the path swapped for a FIFO and the
+/// rename blocked, both fresh opens fail and the writer keeps appending
+/// to the descriptor it already holds.
+#[test]
+    fn rotation_does_not_follow_a_swapped_in_fifo() {
+        let dir = std::env::temp_dir().join(format!("ai-bubble-audit-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+        let backup = dir.join("audit.jsonl.1");
+
+        std::fs::write(&log, b"first\n").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+
+        // A non-empty directory at the backup path makes the rename fail
+        // (oldpath is not a directory, newpath is): the rotation cannot
+        // get the FIFO at `log` out of the way.
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("blocker"), b"").unwrap();
+        // Simulate the sandbox's swap: the path is now a FIFO.
+        std::fs::remove_file(&log).unwrap();
+        nix_fifo(&log);
+
+        rotate(&log, &mut file);
+        // Writing through the retained descriptor must still work: the
+        // writer never re-opened the (FIFO) path, and it did not hang on
+        // it either (it is O_NONBLOCK + refused before any I/O anyway).
+        file.write_all(b"second\n").unwrap();
+
+        // Nothing followed or opened the FIFO: the path still is the
+        // FIFO the sandbox swapped in, and the rename (blocked by the
+        // non-empty backup directory) did not happen.
+        assert!(std::fs::metadata(&log).unwrap().file_type().is_fifo());
+        assert!(backup.join("blocker").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Create a FIFO for the refusal tests.
+    fn nix_fifo(path: &Path) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(ret, 0, "mkfifo failed");
     }
 }
