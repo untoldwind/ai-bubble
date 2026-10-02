@@ -936,6 +936,34 @@ pub(crate) unsafe fn mount_and_exec(
             ));
         }
 
+        // Detach from the caller's kernel keyrings. The keyring is not
+        // namespaced: permission checks use real kuids, and the command
+        // runs with the caller's kuid (only the in-namespace *view* is
+        // remapped to 65534/65535). Without this, the command would inherit
+        // the caller's session keyring and could read cached credentials
+        // (cifs/NFS/Kerberos session keys) and add keys on the caller's
+        // behalf. Joining a fresh *anonymous* session keyring (name = NULL
+        // → the kernel generates a unique name, so an existing keyring of
+        // the caller can never be matched) gives the command an empty
+        // keyring of its own: keys it adds stay in that run-scoped keyring
+        // and are destroyed when the last reference goes away — they never
+        // reach the session or user keyrings that outlive the run, and the
+        // caller's session keyring is no longer reachable. Needs no
+        // capabilities, and runs before the seccomp filter is installed
+        // (which may deny `keyctl` to the command).
+        const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
+        // `keyctl(KEYCTL_JOIN_SESSION_KEYRING, ...)` returns the serial of
+        // the (new) session keyring — a positive nonzero value — so success
+        // must be checked against the -1 error sentinel, not 0.
+        if libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<libc::c_char>(),
+        ) == -1
+        {
+            die_with_error("Can't join a fresh anonymous session keyring");
+        }
+
         // All privileged work is done; run the command with as little
         // authority as possible: no capabilities at all, and as a uid/gid
         // that does not exist on the host.
@@ -1007,7 +1035,7 @@ fn apply_seccomp(policy: &SeccompPolicy) {
     // One unconditional rule per syscall: the syscall maps to an empty
     // rule vector, which seccompiler treats as "matches regardless of
     // the arguments".
-    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = policy
+    let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = policy
         .syscalls()
         .iter()
         .map(|&nr| (nr, Vec::new()))
@@ -1023,6 +1051,61 @@ fn apply_seccomp(policy: &SeccompPolicy) {
     } else {
         (SeccompAction::Allow, deny)
     };
+
+    // Unix-domain sockets are denied unless the spec opted in via
+    // `net.*.unix_sockets` (AUDIT.md M3: abstract-namespace sockets live
+    // in the network namespace, so host-network mode would otherwise
+    // expose the D-Bus system bus, `systemd --user`, ... to the command).
+    // socket(2) and socketpair(2) take the address family as a *value*
+    // argument, so seccomp can gate them on `domain == AF_UNIX` without
+    // dereferencing anything (unlike connect(2), whose address is behind
+    // a pointer). io_uring_setup is denied outright, because
+    // IORING_OP_SOCKET creates sockets without going through socket(2).
+    if !policy.unix_sockets() {
+        use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
+        let af_unix = libc::AF_UNIX as u64;
+        let af_unix_rule = |op: SeccompCmpOp| {
+            let cond = SeccompCondition::new(0, SeccompCmpArgLen::Qword, op, af_unix)
+                .unwrap_or_else(|e| die(&format!("Can't compile the AF_UNIX condition: {e}")));
+            SeccompRule::new(vec![cond])
+                .unwrap_or_else(|e| die(&format!("Can't compile the AF_UNIX rule: {e}")))
+        };
+        let allowlist = policy.is_allowlist();
+        for nr in [syscalls::Sysno::socket as i64, syscalls::Sysno::socketpair as i64] {
+            match rules.remove(&nr) {
+                Some(existing) => {
+                    if allowlist {
+                        // The allowlist lists the syscall; narrow it to
+                        // "everything but AF_UNIX": a matching rule yields
+                        // Allow, AF_UNIX falls to the mismatch action.
+                        rules.insert(nr, vec![af_unix_rule(SeccompCmpOp::Ne)]);
+                    } else {
+                        // The blocklist denies it unconditionally; that
+                        // stands (and covers AF_UNIX).
+                        rules.insert(nr, existing);
+                    }
+                }
+                None => {
+                    if allowlist {
+                        // Absent from the allowlist: already denied.
+                    } else {
+                        // Deny only AF_UNIX dials; other families fall to
+                        // the mismatch action (Allow).
+                        rules.insert(nr, vec![af_unix_rule(SeccompCmpOp::Eq)]);
+                    }
+                }
+            }
+        }
+        let io_uring = syscalls::Sysno::io_uring_setup as i64;
+        if allowlist {
+            // Absent already means denied; present would allow socket
+            // creation through io_uring, so drop it.
+            rules.remove(&io_uring);
+        } else {
+            // An empty rule vector matches regardless of the arguments.
+            rules.entry(io_uring).or_default();
+        }
+    }
     let arch: TargetArch = match std::env::consts::ARCH.try_into() {
         Ok(arch) => arch,
         Err(_) => die(&format!(
@@ -1112,6 +1195,7 @@ mod tests {
                 let policy = SeccompPolicy::Block {
                     syscalls: vec![syscalls::Sysno::getpid as i64],
                     on_violation: SeccompViolation::Errno,
+                    unix_sockets: true,
                 };
                 apply_seccomp(&policy);
                 // Raw syscalls: the seccomp ERRNO action makes the raw
@@ -1137,6 +1221,7 @@ mod tests {
                         syscalls::Sysno::exit_group as i64,
                     ],
                     on_violation: SeccompViolation::Errno,
+                    unix_sockets: true,
                 };
                 apply_seccomp(&policy);
                 if libc::syscall(libc::SYS_getpid) >= 0 && libc::syscall(libc::SYS_getuid) == -1 {
@@ -1145,6 +1230,88 @@ mod tests {
             })
         };
         assert_eq!(code, 0, "allowlist did not gate syscalls as expected");
+    }
+
+    #[test]
+    fn unix_sockets_are_denied_unless_opted_in() {
+        // The default policy (no seccomp section, no opt-in) denies
+        // socket(2)/socketpair(2) for AF_UNIX and io_uring_setup (which
+        // can create sockets without socket(2)), while AF_INET keeps
+        // working (AUDIT.md M3).
+        let code = unsafe {
+            run_in_child(|| {
+                let policy = SeccompPolicy::Block {
+                    syscalls: vec![],
+                    on_violation: SeccompViolation::Errno,
+                    unix_sockets: false,
+                };
+                apply_seccomp(&policy);
+                let unix_fd =
+                    libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                let inet_fd = libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
+                let mut sv = [0 as libc::c_int; 2];
+                let paired =
+                    libc::syscall(libc::SYS_socketpair, libc::AF_UNIX, libc::SOCK_STREAM, 0,
+                                  sv.as_mut_ptr());
+                let uring = libc::syscall(libc::SYS_io_uring_setup, 4, std::ptr::null::<()>());
+                if unix_fd == -1
+                    && inet_fd >= 0
+                    && paired == -1
+                    && uring == -1
+                {
+                    libc::close(inet_fd as libc::c_int);
+                    libc::_exit(0);
+                }
+            })
+        };
+        assert_eq!(code, 0, "AF_UNIX must be denied while AF_INET keeps working");
+
+        // With the opt-in, AF_UNIX works again.
+        let code = unsafe {
+            run_in_child(|| {
+                let policy = SeccompPolicy::Block {
+                    syscalls: vec![],
+                    on_violation: SeccompViolation::Errno,
+                    unix_sockets: true,
+                };
+                apply_seccomp(&policy);
+                let fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if fd >= 0 {
+                    libc::close(fd as libc::c_int);
+                    libc::_exit(0);
+                }
+            })
+        };
+        assert_eq!(code, 0, "unix_sockets opt-in must allow socket(AF_UNIX)");
+    }
+
+    #[test]
+    fn unix_socket_denial_narrows_an_allowlist() {
+        // An allowlist that lists socket(2) is narrowed: AF_UNIX is
+        // denied even though socket(2) is allowed, and unlisted syscalls
+        // stay denied.
+        let code = unsafe {
+            run_in_child(|| {
+                let policy = SeccompPolicy::Allow {
+                    syscalls: vec![
+                        syscalls::Sysno::socket as i64,
+                        syscalls::Sysno::exit_group as i64,
+                    ],
+                    on_violation: SeccompViolation::Errno,
+                    unix_sockets: false,
+                };
+                apply_seccomp(&policy);
+                let unix_fd =
+                    libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                let inet_fd = libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
+                let getuid = libc::syscall(libc::SYS_getuid);
+                if unix_fd == -1 && inet_fd >= 0 && getuid == -1 {
+                    libc::close(inet_fd as libc::c_int);
+                    libc::_exit(0);
+                }
+            })
+        };
+        assert_eq!(code, 0, "allowlist with socket(2) must still deny AF_UNIX");
     }
 
     #[test]
@@ -1159,6 +1326,7 @@ mod tests {
                 let policy = SeccompPolicy::Block {
                     syscalls: vec![syscalls::Sysno::getpid as i64],
                     on_violation: SeccompViolation::Kill,
+                    unix_sockets: true,
                 };
                 apply_seccomp(&policy);
                 let _ = libc::getpid();

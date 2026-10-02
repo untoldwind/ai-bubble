@@ -522,7 +522,7 @@
       ]
     },
     "NetConfig": {
-      "description": "Network-related configuration for the sandboxed command: how it\nreaches the network.\n\n- `{\"mode\": \"host\"}` (the default): the command shares the host\n  network.\n- `{\"mode\": \"proxy\", \"allow\": [...]}`: the command runs in a fresh\n  network namespace and its connections are proxied from the host\n  side, gated by `allow`.\n- `{\"mode\": \"waf\", \"allow\": [...]}`: like proxy, but the sandbox\n  gets DNS/HTTP/HTTPS servers on 127.0.0.2 (ports 53, 80, 443) that\n  resolve allow-listed names to 127.0.0.2 and forward the traffic\n  from the host side over a Unix socket.",
+      "description": "Network-related configuration for the sandboxed command: how it\nreaches the network.\n\n- `{\"mode\": \"host\"}` (the default): the command shares the host\n  network.\n- `{\"mode\": \"proxy\", \"allow\": [...]}`: the command runs in a fresh\n  network namespace and its connections are proxied from the host\n  side, gated by `allow`.\n- `{\"mode\": \"waf\", \"allow\": [...]}`: like proxy, but the sandbox\n  gets DNS/HTTP/HTTPS servers on 127.0.0.2 (ports 53, 80, 443) that\n  resolve allow-listed names to 127.0.0.2 and forward the traffic\n  from the host side over a Unix socket.\n\nHost mode carries `unix_sockets` (default `false`): whether the\ncommand may create Unix-domain sockets. Off by default — Unix\nsockets are a local-IPC escape hatch (abstract-namespace sockets\nlike the D-Bus system bus live in the *network namespace*, so\nhost-network mode without this default would expose them to an\nuntrusted command; see AUDIT.md M3). Proxy/waf modes run in a fresh\nnetwork namespace, where the abstract-socket exposure does not\nexist, and always allow Unix-domain sockets.",
       "oneOf": [
         {
           "description": "Share the host network (the default).",
@@ -531,6 +531,11 @@
             "mode": {
               "type": "string",
               "const": "host"
+            },
+            "unix_sockets": {
+              "description": "Whether the command may create Unix-domain sockets (abstract\nor filesystem). Off by default: a seccomp filter denies\n`socket(AF_UNIX)`/`socketpair(AF_UNIX)` (and `io_uring_setup`,\nwhich can create sockets without `socket(2)`).",
+              "type": "boolean",
+              "default": false
             }
           },
           "additionalProperties": false,
@@ -548,6 +553,11 @@
               "items": {
                 "type": "string"
               }
+            },
+            "allow_private": {
+              "description": "Let the connector dial resolved addresses in private, loopback\nor link-local ranges (10/8, 172.16/12, 192.168/16, 127/8,\n169.254/16 including the cloud metadata endpoint, ...). Off by\ndefault: an allowed *name* that resolves into such a range would\notherwise become an SSRF primitive dialing from the host's\nnetwork position. Turn this on only if the sandbox legitimately\nneeds LAN/localhost targets — it includes cloud metadata and\nloopback services.",
+              "type": "boolean",
+              "default": false
             },
             "mode": {
               "type": "string",
@@ -570,6 +580,11 @@
               "items": {
                 "type": "string"
               }
+            },
+            "allow_private": {
+              "description": "See the proxy mode's `allow_private`: the same opt-out, applied\nto the waf host's `connect`/`tls-connect` dialing.",
+              "type": "boolean",
+              "default": false
             },
             "mode": {
               "type": "string",

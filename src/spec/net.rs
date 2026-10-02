@@ -16,12 +16,27 @@ use schemars::JsonSchema;
 ///   gets DNS/HTTP/HTTPS servers on 127.0.0.2 (ports 53, 80, 443) that
 ///   resolve allow-listed names to 127.0.0.2 and forward the traffic
 ///   from the host side over a Unix socket.
-#[derive(Debug, Default, PartialEq, Deserialize, Clone, JsonSchema)]
+///
+/// Host mode carries `unix_sockets` (default `false`): whether the
+/// command may create Unix-domain sockets. Off by default — Unix
+/// sockets are a local-IPC escape hatch (abstract-namespace sockets
+/// like the D-Bus system bus live in the *network namespace*, so
+/// host-network mode without this default would expose them to an
+/// untrusted command; see AUDIT.md M3). Proxy/waf modes run in a fresh
+/// network namespace, where the abstract-socket exposure does not
+/// exist, and always allow Unix-domain sockets.
+#[derive(Debug, PartialEq, Deserialize, Clone, JsonSchema)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum NetConfig {
     /// Share the host network (the default).
-    #[default]
-    Host,
+    Host {
+        /// Whether the command may create Unix-domain sockets (abstract
+        /// or filesystem). Off by default: a seccomp filter denies
+        /// `socket(AF_UNIX)`/`socketpair(AF_UNIX)` (and `io_uring_setup`,
+        /// which can create sockets without `socket(2)`).
+        #[serde(default)]
+        unix_sockets: bool,
+    },
     /// Run the command in a fresh network namespace and proxy its
     /// connections from the host side.
     Proxy {
@@ -56,6 +71,26 @@ pub enum NetConfig {
     },
 }
 
+impl Default for NetConfig {
+    /// Host mode, Unix-domain sockets denied (the safe default).
+    fn default() -> Self {
+        NetConfig::Host { unix_sockets: false }
+    }
+}
+
+impl NetConfig {
+    /// Whether the sandboxed command may create Unix-domain sockets.
+    /// Only host mode can deny them (the spec's `net.host.unix_sockets`,
+    /// default `false`); the isolated network-namespace modes always
+    /// allow them.
+    pub fn unix_sockets(&self) -> bool {
+        match self {
+            NetConfig::Host { unix_sockets } => *unix_sockets,
+            NetConfig::Proxy { .. } | NetConfig::Waf { .. } => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::parse;
@@ -83,6 +118,37 @@ mod tests {
     }
 
     #[test]
+    fn unix_sockets_are_denied_by_default_in_host_mode() {
+        // Host mode defaults to denying Unix-domain sockets (AUDIT.md
+        // M3); the user must actively opt in.
+        for json in ["{}", r#"{ "net": { "mode": "host" } }"#] {
+            let spec = parse(json);
+            assert!(!spec.net.unix_sockets(), "spec {json} must default to no AF_UNIX");
+        }
+        let spec = parse(r#"{ "net": { "mode": "host", "unix_sockets": true } }"#);
+        assert!(spec.net.unix_sockets(), "opt-in must allow AF_UNIX");
+        // The isolated modes always allow them (their network namespace
+        // already isolates abstract sockets).
+        for json in [
+            r#"{ "net": { "mode": "proxy", "allow": ["example.com"] } }"#,
+            r#"{ "net": { "mode": "waf", "allow": ["example.com"] } }"#,
+        ] {
+            let spec = parse(json);
+            assert!(spec.net.unix_sockets(), "spec {json} must allow AF_UNIX");
+        }
+        // ...and reject the meaningless flag there.
+        for json in [
+            r#"{ "net": { "mode": "proxy", "allow": [], "unix_sockets": true } }"#,
+            r#"{ "net": { "mode": "waf", "allow": [], "unix_sockets": false } }"#,
+        ] {
+            assert!(
+                super::super::tests::parse_err(json).is_some(),
+                "{json} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn proxy_mode_requires_allow() {
         // `allow` is mandatory: proxy mode without it is a spec error, so
         // there is never an implicit "proxy everything" default.
@@ -95,7 +161,7 @@ mod tests {
     #[test]
     fn host_mode_is_default() {
         let spec = parse("{}");
-        assert_eq!(spec.net, NetConfig::Host);
+        assert_eq!(spec.net, NetConfig::Host { unix_sockets: false });
         assert_eq!(spec.net, NetConfig::default());
     }
 
@@ -138,18 +204,68 @@ mod tests {
             )
             .is_some()
         );
-        // ...but a unit variant like host has no fields to deny (serde's
-        // internally-tagged enums cannot deny unknown fields for unit
-        // variants).
-        let spec = parse(r#"{ "net": { "mode": "host", "allow": ["x"] } }"#);
-        assert_eq!(spec.net, NetConfig::Host);
+        // ...and the host variant, too — now that it is a struct variant with
+        // its own fields (this also fixes the L7 silent-discard for host
+        // mode; the allow list makes no sense there).
+        assert!(
+            super::super::tests::parse_err(r#"{ "net": { "mode": "host", "allow": ["x"] } }"#)
+                .is_some()
+        );
+        // The only host-mode field is unix_sockets.
+        let spec = parse(r#"{ "net": { "mode": "host", "unix_sockets": true } }"#);
+        assert_eq!(spec.net, NetConfig::Host { unix_sockets: true });
+    }
+
+    #[test]
+    fn unix_sockets_compile_into_the_seccomp_policy() {
+        use super::super::internal::{SandboxConfig, SeccompPolicy};
+        use super::super::tests::parse;
+        // Default (denied): a filter exists even without a `seccomp`
+        // section — the AF_UNIX denial is its only content.
+        let compiled = SandboxConfig::compile(&parse("{}"));
+        let policy = compiled.seccomp.expect("default must install a filter");
+        assert!(!policy.unix_sockets());
+        assert_eq!(policy.syscalls(), &[] as &[i64], "no extra denies needed");
+        assert!(!policy.is_allowlist());
+
+        // Opting in with no seccomp section compiles to no filter at all.
+        let compiled = SandboxConfig::compile(&parse(
+            r#"{ "net": { "mode": "host", "unix_sockets": true } }"#,
+        ));
+        assert!(compiled.seccomp.is_none());
+
+        // Opting in with a seccomp section keeps that section's policy
+        // (with the flag recorded for the sandbox to honor).
+        let compiled = SandboxConfig::compile(&parse(
+            r#"{ "net": { "mode": "host", "unix_sockets": true },
+                 "seccomp": { "block": ["ptrace"] } }"#,
+        ));
+        let policy = compiled.seccomp.expect("seccomp section kept");
+        assert!(policy.unix_sockets());
+        assert_eq!(policy.syscalls(), &[syscalls::Sysno::ptrace as i64]);
+
+        // And a seccomp section without the opt-in keeps the denial.
+        let compiled = SandboxConfig::compile(&parse(r#"{ "seccomp": { "block": ["ptrace"] } }"#));
+        let policy = compiled.seccomp.expect("seccomp section kept");
+        assert!(!policy.unix_sockets());
+
+        // The isolated modes always allow AF_UNIX: no flag, no filter
+        // unless the spec configures a seccomp section.
+        let compiled = SandboxConfig::compile(&parse(
+            r#"{ "net": { "mode": "proxy", "allow": ["example.com"] } }"#,
+        ));
+        assert!(compiled.seccomp.is_none());
+        let compiled = SandboxConfig::compile(&parse(
+            r#"{ "net": { "mode": "waf", "allow": ["example.com"] } }"#,
+        ));
+        assert!(compiled.seccomp.is_none());
     }
 
     #[test]
     fn empty_spec_is_default() {
         let spec = parse("{}");
         assert_eq!(spec, crate::spec::Spec::default());
-        assert_eq!(spec.net, NetConfig::Host);
+        assert_eq!(spec.net, NetConfig::Host { unix_sockets: false });
         assert_eq!(spec.hostfs.mappings.len(), 0);
     }
 }

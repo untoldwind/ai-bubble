@@ -340,6 +340,27 @@ is the network namespace, which corresponds to bwrap's `--share-net`:
   brought-up loopback interface — bwrap's `loopback_setup()` — plus
   ai-bubble's proxy or waf servers)
 
+> **⚠️ Host-network mode is full local IPC, not just "host networking".**
+> Without `net` (i.e. `"mode": "host"`) the command keeps the host
+> *network namespace* — and **abstract Unix-domain socket names live in the
+> network namespace**, not the filesystem. The command can therefore connect
+> to abstract-namespace sockets such as `@/run/dbus/system_bus_socket`, the
+> session bus or `systemd --user` **as your uid**, with no filesystem
+> mapping involved — e.g. asking `systemd --user` to spawn a transient unit
+> that runs an arbitrary host command outside the sandbox. Filesystem
+> sockets reachable through `ro`/`bind` mappings of `/run`,
+> `/tmp/.X11-unix` & co. carry the same risk. For any command you do not
+> fully trust, use `"mode": "proxy"` or `"mode": "waf"` (below), which
+> isolate the network namespace; host mode is appropriate only for trusted
+> commands that genuinely need the host network stack.
+>
+> Mitigated in part since 2026-10-02: host-network mode denies
+> Unix-domain sockets by default (`net.host.unix_sockets`, see
+> [Unix-domain sockets](#unix-domain-sockets) below), which closes the
+> abstract-socket hole (and filesystem-socket access) with seccomp; opt
+> in only if the command genuinely needs local IPC. Proxy/waf modes
+> isolate the network namespace and are not exposed.
+
 Not covered by that equivalence (see "Notes" below): ai-bubble's
 `/proc` mounts are always fresh procfs instances and the command always
 runs as PID 1 of its PID namespace, mirroring `--as-pid-1`.
@@ -429,6 +450,11 @@ Notes:
 
 ## Isolated networking
 
+For untrusted commands this is the recommended network mode — host-network
+mode (the default, no `net` key) exposes the host's abstract Unix-domain
+sockets to the command as your uid (see the warning in
+[Equivalence with bwrap's namespace flags](#equivalence-with-bwraps-namespace-flags)).
+
 With `"net": { "mode": "proxy" }` or `"net": { "mode": "waf" }` the sandboxed command gets a network namespace that
 is completely isolated from the host (only a freshly brought-up loopback
 interface; the sandbox also gets its own UTS namespace) — while the
@@ -489,6 +515,33 @@ start with `*.` for a subdomain wildcard (`*.github.com` matches
 `api.github.com` but not `github.com`; it matches subdomains at any
 depth). Empty means nothing is proxied — every target must be listed
 explicitly.
+
+### Unix-domain sockets
+
+Host-network mode carries a `unix_sockets` flag, **`false` by default**:
+
+```json
+{ "net": { "mode": "host", "unix_sockets": true } }
+```
+
+With the default, the command cannot create *any* Unix-domain socket: a
+seccomp filter denies `socket(AF_UNIX)` and `socketpair(AF_UNIX)` — which
+covers both abstract-namespace sockets (`@/run/dbus/system_bus_socket`
+and friends, see the warning above) and filesystem sockets (e.g. under a
+mapped `/run`) — plus `io_uring_setup`, which can create sockets without
+going through `socket(2)`. TCP/UDP (`AF_INET`/`AF_INET6`) are unaffected,
+so host networking keeps working. If the spec also configures a
+`seccomp` section, the denial is merged into it: a blocklist keeps its
+unconditional entries, and an allowlist that lists `socket`/
+`socketpair` is narrowed to non-`AF_UNIX` domains (an allowlist without
+them was already denying everything). Set `"unix_sockets": true` only if
+the command genuinely needs local IPC — it re-opens the local-IPC escape
+hatch described above.
+
+In proxy/waf mode the command runs in a fresh network namespace, where
+the abstract-socket exposure does not exist (the namespace's socket
+names are its own); Unix-domain sockets are always allowed there, and
+the flag (like `allow`) is rejected in those modes.
 
 Standard tools automatically use the proxy, because the sandbox sets the
 following variables in its (isolated) environment — entries from the

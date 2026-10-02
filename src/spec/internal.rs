@@ -40,15 +40,22 @@ impl From<Violation> for SeccompViolation {
 /// allowlist (only the listed syscalls are permitted) or a blocklist
 /// (exactly these are denied). Compiled down from the spec's `seccomp`
 /// section, with the syscall names already resolved to numbers.
+///
+/// Independently of the mode, `unix_sockets` records the spec's
+/// `net.*.unix_sockets` opt-in: when `false` (the default), the sandbox
+/// additionally denies the creation of Unix-domain sockets (see
+/// [`SeccompPolicy::deny_unix_sockets`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SeccompPolicy {
     Allow {
         syscalls: Vec<i64>,
         on_violation: SeccompViolation,
+        unix_sockets: bool,
     },
     Block {
         syscalls: Vec<i64>,
         on_violation: SeccompViolation,
+        unix_sockets: bool,
     },
 }
 
@@ -73,6 +80,16 @@ impl SeccompPolicy {
     /// Whether this is an allowlist (as opposed to a blocklist).
     pub fn is_allowlist(&self) -> bool {
         matches!(self, SeccompPolicy::Allow { .. })
+    }
+
+    /// Whether Unix-domain sockets are allowed (the spec's
+    /// `net.*.unix_sockets`; `false` = deny, the default).
+    pub fn unix_sockets(&self) -> bool {
+        match self {
+            SeccompPolicy::Allow { unix_sockets, .. } | SeccompPolicy::Block { unix_sockets, .. } => {
+                *unix_sockets
+            }
+        }
     }
 }
 
@@ -102,16 +119,21 @@ pub struct Net {
     /// private/loopback/link-local ranges (see `NetConfig`'s
     /// `allow_private` and AUDIT.md H3). Off by default.
     pub allow_private: bool,
+    /// Whether the command may create Unix-domain sockets (see
+    /// `NetConfig::Host`'s `unix_sockets` and AUDIT.md M3). Host mode
+    /// defaults to denying them; the isolated netns modes always allow.
+    pub unix_sockets: bool,
 }
 
 impl From<&NetConfig> for Net {
     fn from(net: &NetConfig) -> Net {
         match net {
-            NetConfig::Host => Net {
+            NetConfig::Host { unix_sockets } => Net {
                 isolated: false,
                 mode: NetMode::Proxy,
                 allow: vec![],
                 allow_private: false,
+                unix_sockets: *unix_sockets,
             },
             NetConfig::Proxy {
                 allow,
@@ -121,6 +143,9 @@ impl From<&NetConfig> for Net {
                 mode: NetMode::Proxy,
                 allow: allow.clone(),
                 allow_private: *allow_private,
+                // The fresh network namespace already isolates abstract
+                // sockets; AF_UNIX is always allowed here.
+                unix_sockets: true,
             },
             NetConfig::Waf {
                 allow,
@@ -130,6 +155,7 @@ impl From<&NetConfig> for Net {
                 mode: NetMode::Waf,
                 allow: allow.clone(),
                 allow_private: *allow_private,
+                unix_sockets: true,
             },
         }
     }
@@ -165,8 +191,10 @@ pub struct SandboxConfig {
     pub audit_log: Option<PathBuf>,
     /// The seccomp policy to install for the sandboxed command, compiled
     /// down from the spec's `seccomp` section (with syscall names
-    /// resolved to numbers), or `None` when the spec configures no
-    /// filter.
+    /// resolved to numbers) — or, when the spec configures no filter but
+    /// denies Unix-domain sockets (the default, see `net.*.unix_sockets`
+    /// and AUDIT.md M3), a minimal policy carrying only that denial.
+    /// `None` when nothing needs a filter.
     pub seccomp: Option<SeccompPolicy>,
 }
 
@@ -195,7 +223,7 @@ impl SandboxConfig {
                 .expand_cwd()
                 .unwrap_or_else(|e| crate::sandbox::die(&e)),
             audit_log: spec.audit.log.as_deref().map(PathBuf::from),
-            seccomp: compile_seccomp(&spec.seccomp),
+            seccomp: compile_seccomp(&spec.seccomp, spec.net.unix_sockets()),
         }
     }
 }
@@ -205,15 +233,23 @@ impl SandboxConfig {
 /// error, so a typo is reported like any other spec problem), dedupe
 /// and keep them sorted for deterministic BPF generation. A section
 /// that names neither `allow`, `block` nor a `preset` compiles to no
-/// filter; a preset-based section always compiles to a blocklist (the
+/// filter — *unless* the spec denies Unix-domain sockets
+/// (`net.*.unix_sockets`, the default; AUDIT.md M3): that denial is
+/// itself a filter, so one is installed even without a `seccomp`
+/// section. A preset-based section always compiles to a blocklist (the
 /// preset baseline plus `block` entries minus `allow` exceptions, see
 /// [`SeccompConfig::resolved`]).
-fn compile_seccomp(config: &SeccompConfig) -> Option<SeccompPolicy> {
+fn compile_seccomp(config: &SeccompConfig, unix_sockets: bool) -> Option<SeccompPolicy> {
     use std::str::FromStr;
-    if !config.is_configured() {
+    let configured = config.is_configured();
+    if !configured && unix_sockets {
         return None;
     }
-    let (names, allowlist) = config.resolved();
+    let (names, allowlist) = if configured {
+        config.resolved()
+    } else {
+        (Vec::new(), false)
+    };
     let mut syscalls: Vec<i64> = names
         .iter()
         .map(|name| match syscalls::Sysno::from_str(name) {
@@ -230,11 +266,13 @@ fn compile_seccomp(config: &SeccompConfig) -> Option<SeccompPolicy> {
         SeccompPolicy::Allow {
             syscalls,
             on_violation,
+            unix_sockets,
         }
     } else {
         SeccompPolicy::Block {
             syscalls,
             on_violation,
+            unix_sockets,
         }
     })
 }
