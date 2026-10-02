@@ -59,22 +59,28 @@
 //! mount) now delays the event loop instead of only the blocking pool; for
 //! the local mirror this process serves, that trade is the right one.
 //!
-//! Symlinks: every access to the **real host filesystem** uses
-//! no-follow semantics — host paths are always opened with `O_NOFOLLOW`
-//! and stated with `symlink_metadata`. A mirrored symlink is therefore
-//! visible only *as a symlink* (its target can be read with `readlink`),
-//! never followed: opening one for reading or writing fails with `ELOOP`,
-//! and the target's content is not exposed unless the target itself
-//! matches a pattern. This keeps the "only mapped paths are visible"
-//! guarantee intact even when the host contains links pointing elsewhere.
+//! Symlinks: every access to the **real host filesystem** is dirfd-anchored
+//! (see [`anchored`]) — the real path is walked component-wise from a pinned
+//! root descriptor with `openat(O_NOFOLLOW|O_DIRECTORY)`, and the final
+//! operation runs `*at()`-relative to the pinned parent with
+//! `AT_SYMLINK_NOFOLLOW` / `O_NOFOLLOW`. Host paths are never resolved as
+//! strings through the kernel's path walking, so a host symlink is never
+//! followed — neither a *final* component (a mirrored symlink is visible
+//! only *as a symlink*: its target can be read with `readlink`, opening one
+//! for reading or writing fails with `ELOOP`) nor an *intermediate* one,
+//! which could otherwise re-point a mirrored path at content outside every
+//! mapping — deterministically, by swapping a symlink into place between
+//! two FUSE requests (audit finding C1). A link's target's content is not
+//! exposed unless the target itself matches a pattern.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::SeekFrom;
 use std::io::{Read, Seek, Write};
 use std::num::NonZeroU32;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -95,6 +101,8 @@ mod inodes;
 pub(crate) mod pattern;
 pub(crate) mod patterns;
 mod perf;
+
+mod anchored;
 
 use inodes::InodeMap;
 use patterns::Patterns;
@@ -255,6 +263,14 @@ struct HostFs {
     /// permission and structural decision (see
     /// [`Patterns::permission_of`]).
     patterns: Patterns,
+    /// The pinned host root directory descriptor every host-path walk
+    /// anchors on (see [`anchored`]). Host paths are *never* resolved as
+    /// strings through the kernel's path walking: each operation walks the
+    /// real path component-wise from this descriptor with `openat(
+    /// O_NOFOLLOW|O_DIRECTORY)`, so a host symlink at any intermediate
+    /// component — pre-existing, or swapped in between FUSE requests — can
+    /// never redirect an access outside the mirror (audit finding C1).
+    root: anchored::RootDir,
     /// The nodeid ↔ mirrored-path map (see [`inodes`]). There is exactly one
     /// map per FUSE session: the filesystem is *moved* into the mount, and
     /// the mount fallback builds a fresh filesystem (the failed attempt never
@@ -306,6 +322,8 @@ impl HostFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             patterns: patterns.clone(),
+            root: anchored::RootDir::open()
+                .unwrap_or_else(|e| die(&format!("Can't pin the host root directory: {e}"))),
             inodes: std::sync::RwLock::new(InodeMap::new()),
             handles: std::sync::Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
@@ -382,12 +400,12 @@ impl HostFs {
     /// paths, and purely virtual ancestors of empty or injected paths
     /// whose real host path does not exist. Such paths are readable
     /// directories (mode 0555) — or injected files — that are never
-    /// writable. It stats the real host filesystem.
+    /// writable. It stats the real host filesystem (anchored, no-follow).
     fn virtual_only(&self, mirrored: &Path) -> bool {
         self.patterns.is_empty(mirrored)
             || self.patterns.is_inject(mirrored).is_some()
             || (self.patterns.is_empty_prefix(mirrored) || self.patterns.is_inject_prefix(mirrored))
-                && std::fs::symlink_metadata(self.patterns.redirect(mirrored)).is_err()
+                && !self.real_exists(&self.patterns.redirect(mirrored))
     }
 
     /// The attributes of an empty path (or a purely virtual ancestor of
@@ -413,8 +431,8 @@ impl HostFs {
 
     /// The attributes of an empty file: the real metadata, but with no
     /// content (the host file is never read).
-    fn empty_file_attr(md: &std::fs::Metadata) -> FileAttr {
-        let mut attr = attr_from_metadata(md);
+    fn empty_file_attr(md: &libc::stat) -> FileAttr {
+        let mut attr = attr_from_stat(md);
         attr.size = 0;
         attr.blocks = 0;
         attr
@@ -443,11 +461,35 @@ impl HostFs {
 
     /// Whether the given **host** path can act as a listable directory
     /// without following symlinks: it must really be a directory (a
-    /// symlink to a directory is not followed).
+    /// symlink to a directory is not followed — and neither is anything
+    /// above it: the check is dirfd-anchored, see [`anchored`]).
     fn is_host_dir(&self, real: &Path) -> bool {
-        std::fs::symlink_metadata(real)
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
+        Self::stat_is_dir(
+            &self
+                .real_lstat(real)
+                .unwrap_or_else(|_| unsafe { std::mem::zeroed() }),
+        )
+    }
+
+    /// Whether a raw `stat` result describes a directory.
+    fn stat_is_dir(st: &libc::stat) -> bool {
+        st.st_mode & libc::S_IFMT == libc::S_IFDIR
+    }
+
+    /// Whether a raw `stat` result describes a symlink.
+    fn stat_is_symlink(st: &libc::stat) -> bool {
+        st.st_mode & libc::S_IFMT == libc::S_IFLNK
+    }
+
+    /// Anchored `lstat` of a real host path: every component no-follow
+    /// (the anchored `symlink_metadata`).
+    fn real_lstat(&self, real: &Path) -> std::io::Result<libc::stat> {
+        anchored::lstat(&self.root, real)
+    }
+
+    /// Whether the real host path exists at all (anchored `lstat` succeeds).
+    fn real_exists(&self, real: &Path) -> bool {
+        self.real_lstat(real).is_ok()
     }
 
     /// The `lstat`-style attribute of a mirrored path, or ENOENT. It
@@ -463,14 +505,14 @@ impl HostFs {
         // when the path is (or would be) a directory, as an empty file
         // when it matches a real file.
         if self.patterns.is_empty(mirrored) {
-            return match std::fs::symlink_metadata(mirrored) {
-                Ok(md) if !md.is_dir() => Ok(Self::empty_file_attr(&md)),
+            return match self.real_lstat(mirrored) {
+                Ok(st) if !Self::stat_is_dir(&st) => Ok(Self::empty_file_attr(&st)),
                 _ => Ok(self.empty_dir_attr()),
             };
         }
         let real = self.patterns.redirect(mirrored);
-        match std::fs::symlink_metadata(&real) {
-            Ok(md) => Ok(attr_from_metadata(&md)),
+        match self.real_lstat(&real) {
+            Ok(md) => Ok(attr_from_stat(&md)),
             // A purely virtual ancestor of an empty path has no real
             // counterpart; present it as a directory. The same holds for
             // purely virtual ancestors of injected files: `exists`/`readdir`
@@ -510,48 +552,51 @@ impl HostFs {
     /// of its real entries. Everything below an empty path is shadowed by
     /// its precedence; empty paths that live directly under the directory
     /// are always shown. Symlinks are never followed: a host symlink
-    /// standing for the directory is not listed through. It reads
-    /// and stats the real host directory.
+    /// standing for the directory is not listed through. It reads and
+    /// stats the real host directory, with the directory's descriptor
+    /// pinned before the entries are listed and each entry's attributes
+    /// taken from that descriptor (anchored, see [`anchored`]).
     fn dir_entries(&self, mirrored: &Path) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
         // A directory named by a mirrored pattern itself is a recursive
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
         let unfiltered = self.patterns.matches(mirrored);
-        let mut names: Vec<std::ffi::OsString> =
-            if self.is_host_dir(&self.patterns.redirect(mirrored)) {
-                match std::fs::read_dir(self.patterns.redirect(mirrored)) {
-                    Ok(entries) => {
-                        let mut names = Vec::new();
-                        for entry in entries {
-                            let Ok(entry) = entry else { continue };
-                            let name = entry.file_name();
-                            // Fail closed for names that can never match a
-                            // pattern: they are not creatable through the
-                            // mirror, so they must not be listed either —
-                            // otherwise readdir would advertise entries lookup
-                            // can never resolve (undeletable "ghost" entries).
-                            if name.to_str().is_none() {
-                                continue;
-                            }
-                            let child = mirrored.join(&name);
-                            // Empty-path precedence: nothing below an empty path is
-                            // visible, not even a mirror match. Denied entries (and
-                            // everything below a hidden directory) are hidden even
-                            // inside a recursively mirrored directory.
-                            if self.patterns.under_empty(&child) || self.patterns.hidden(&child) {
-                                continue;
-                            }
-                            if unfiltered || self.patterns.exists(&child) {
-                                names.push(name);
-                            }
-                        }
-                        names
-                    }
-                    Err(_) => Vec::new(),
+        let base_real = self.patterns.redirect(mirrored);
+        let mut dir: Option<std::os::fd::OwnedFd> = None;
+        let mut names: Vec<std::ffi::OsString> = Vec::new();
+        if let Ok(opened) = anchored::open_dir(&self.root, &base_real) {
+            // `readdir_names` consumes its descriptor (fdopendir/closedir
+            // own it), so it lists a *duplicate*; the original stays
+            // pinned below for the entries' attributes.
+            let listing = opened
+                .try_clone()
+                .map(anchored::readdir_names)
+                .unwrap_or_default();
+            dir = Some(opened);
+            for name in listing {
+                // Fail closed for names that can never match a
+                // pattern: they are not creatable through the
+                // mirror, so they must not be listed either —
+                // otherwise readdir would advertise entries lookup
+                // can never resolve (undeletable "ghost" entries).
+                if name.to_str().is_none() {
+                    continue;
                 }
-            } else {
-                Vec::new()
-            };
+                let child = mirrored.join(&name);
+                // Empty-path precedence: nothing below an empty path is
+                // visible, not even a mirror match. Denied entries (and
+                // everything below a hidden directory) are hidden even
+                // inside a recursively mirrored directory.
+                if self.patterns.under_empty(&child) || self.patterns.hidden(&child) {
+                    continue;
+                }
+                if unfiltered || self.patterns.exists(&child) {
+                    names.push(name);
+                }
+            }
+            // Not a listable directory (or not a real one): the empty
+            // listing only leaves the virtual entries below.
+        }
         // Virtual entries living directly under this directory (also when
         // the real directory itself cannot be listed): every `empty`,
         // `inject` or `redirect` pattern with a purely literal next
@@ -571,7 +616,7 @@ impl HostFs {
             // really exists on the host — otherwise the entry would
             // advertise a lookup that fails (an undeletable "ghost").
             if let Some(source) = permission.redirect_source()
-                && std::fs::symlink_metadata(source).is_err()
+                && !self.real_exists(source)
             {
                 continue;
             }
@@ -581,9 +626,89 @@ impl HostFs {
         let mut entries = Vec::with_capacity(names.len());
         for name in names {
             let child = mirrored.join(&name);
-            entries.push((name, self.attr(&child)));
+            let attr = self.child_attr(dir.as_ref().map(|d| d.as_fd()), &base_real, &child, &name);
+            entries.push((name, attr));
         }
         entries
+    }
+
+    /// The attributes of one listed child. Fast path: when the child's
+    /// real host path is exactly the listed directory joined with its name
+    /// (no redirect anywhere in between), the child is stat'ed on the
+    /// directory descriptor the listing came from — no second walk. Any
+    /// virtual or redirected child (and any path the pinned descriptor
+    /// cannot answer for) falls back to the plain anchored
+    /// [`HostFs::attr`].
+    fn child_attr(
+        &self,
+        dir: Option<std::os::fd::BorrowedFd<'_>>,
+        base_real: &Path,
+        child: &Path,
+        name: &OsStr,
+    ) -> std::io::Result<FileAttr> {
+        // Virtual children (empty paths, injected files and their purely
+        // virtual ancestors) never resolve inside the listed directory.
+        let plain = self.patterns.is_inject(child).is_none()
+            && !self.patterns.is_empty(child)
+            && !self.patterns.is_empty_prefix(child)
+            && !self.patterns.is_inject_prefix(child)
+            && self.patterns.redirect(child) == child
+            && base_real.join(name) == child;
+        if plain && let Some(dir) = dir {
+            let cname = cstring_of(Path::new(name))?;
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: valid descriptor, NUL-terminated name, writable buffer.
+            if unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    cname.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(attr_from_stat(&st));
+        }
+        self.attr(child)
+    }
+}
+
+/// The attribute of a raw `stat` — same conversion as
+/// [`attr_from_metadata`], for the dirfd-anchored stat results (see
+/// [`anchored`]). `ino` is filled in by the reply sites that know it.
+fn attr_from_stat(st: &libc::stat) -> FileAttr {
+    let kind = match st.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => FileType::Directory,
+        libc::S_IFLNK => FileType::Symlink,
+        libc::S_IFCHR => FileType::CharDevice,
+        libc::S_IFBLK => FileType::BlockDevice,
+        libc::S_IFIFO => FileType::NamedPipe,
+        libc::S_IFSOCK => FileType::Socket,
+        _ => FileType::RegularFile,
+    };
+    FileAttr {
+        // Filled in by the reply sites that know the nodeid.
+        ino: 0,
+        size: st.st_size as u64,
+        blocks: st.st_blocks as u64,
+        atime: (SystemTime::UNIX_EPOCH
+            + Duration::new(st.st_atime.max(0) as u64, st.st_atime_nsec.max(0) as u32))
+        .into(),
+        mtime: (SystemTime::UNIX_EPOCH
+            + Duration::new(st.st_mtime.max(0) as u64, st.st_mtime_nsec.max(0) as u32))
+        .into(),
+        ctime: (SystemTime::UNIX_EPOCH
+            + Duration::new(st.st_ctime.max(0) as u64, st.st_ctime_nsec.max(0) as u32))
+        .into(),
+        kind,
+        perm: (st.st_mode & 0o7777) as u16,
+        nlink: st.st_nlink as u32,
+        uid: st.st_uid,
+        gid: st.st_gid,
+        rdev: st.st_rdev as u32,
+        blksize: st.st_blksize as u32,
     }
 }
 
@@ -816,7 +941,7 @@ impl Filesystem for HostFs {
         if !self.patterns.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        let target = std::fs::read_link(self.patterns.redirect(&mirrored))?;
+        let target = anchored::read_link(&self.root, &self.patterns.redirect(&mirrored))?;
         Ok(ReplyData::from(Bytes::copy_from_slice(
             target.as_os_str().as_encoded_bytes(),
         )))
@@ -860,17 +985,14 @@ impl Filesystem for HostFs {
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not), and
         // symlinks are never followed: a host symlink cannot be opened
-        // through the mirror (its target may not be mirrored at all).
-        let md = match std::fs::symlink_metadata(self.patterns.redirect(&mirrored)) {
-            Ok(md) => md,
+        // through the mirror (its target may not be mirrored at all). The
+        // metadata is taken from the dirfd-anchored path: no intermediate
+        // component may resolve through a host symlink.
+        let real = self.patterns.redirect(&mirrored);
+        let md_stat = match self.real_lstat(&real) {
+            Ok(st) => st,
             Err(e) => {
-                log_op_err(
-                    "open",
-                    &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
-                    &e,
-                )
-                .await;
+                log_op_err("open", &mirrored, Some(&real), &e).await;
                 // A purely virtual directory (ancestor of an empty or
                 // injected path with no real counterpart) is not openable,
                 // exactly like a real one that `open` refuses: report it as
@@ -885,21 +1007,21 @@ impl Filesystem for HostFs {
                 return Err(libc::ENOENT.into());
             }
         };
-        if md.file_type().is_symlink() {
+        if Self::stat_is_symlink(&md_stat) {
             log_op_err(
                 "open",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&real),
                 &std::io::Error::from_raw_os_error(libc::ELOOP),
             )
             .await;
             return Err(libc::ELOOP.into());
         }
-        if md.is_dir() {
+        if Self::stat_is_dir(&md_stat) {
             log_op_err(
                 "open",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&real),
                 &std::io::Error::from_raw_os_error(libc::EISDIR),
             )
             .await;
@@ -913,7 +1035,7 @@ impl Filesystem for HostFs {
             log_op_err(
                 "open",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&real),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
@@ -926,30 +1048,25 @@ impl Filesystem for HostFs {
         // The truncation happens in the open below (the file is opened for
         // real and kept for the handle's lifetime).
         let append = flags & libc::O_APPEND as u32 != 0;
-        let mut opts = std::fs::OpenOptions::new();
-        if !write_flags || flags & libc::O_RDWR as u32 != 0 {
-            opts.read(true);
-        }
-        if write_flags {
-            opts.write(true);
-        }
+        let mut oflags = if !write_flags {
+            libc::O_RDONLY
+        } else if flags & libc::O_RDWR as u32 != 0 {
+            libc::O_RDWR
+        } else {
+            libc::O_WRONLY
+        };
         if append {
-            opts.append(true);
+            oflags |= libc::O_APPEND;
         }
         if write_flags && flags & libc::O_TRUNC as u32 != 0 {
-            opts.truncate(true);
+            oflags |= libc::O_TRUNC;
         }
-        opts.custom_flags(libc::O_NOFOLLOW);
-        let file = match opts.open(self.patterns.redirect(&mirrored)) {
+        // Anchored open relative to the pinned parent, final component
+        // `O_NOFOLLOW` (see [`anchored`]).
+        let file = match anchored::open_at(&self.root, &real, oflags, 0) {
             Ok(f) => f,
             Err(e) => {
-                log_op_err(
-                    "open",
-                    &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
-                    &e,
-                )
-                .await;
+                log_op_err("open", &mirrored, Some(&real), &e).await;
                 return Err(e.into());
             }
         };
@@ -1045,14 +1162,16 @@ impl Filesystem for HostFs {
         if self.patterns.is_empty(&mirrored) {
             return Ok(ReplyData::from(Bytes::new()));
         }
-        // Stateless IO fallback: reopen the host file — never following
-        // symlinks (a host symlink is visible only as a link, and its
-        // target may not be mirrored at all).
-        let mut file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(self.patterns.redirect(&mirrored))
-        {
+        // Stateless IO fallback: reopen the host file relative to the pinned
+        // parent — never following symlinks (a host symlink is visible only
+        // as a link, and its target may not be mirrored at all; and no
+        // intermediate component is followed either).
+        let mut file = match anchored::open_at(
+            &self.root,
+            &self.patterns.redirect(&mirrored),
+            libc::O_RDONLY,
+            0,
+        ) {
             Ok(f) => f,
             Err(e) => {
                 log_op_err(
@@ -1185,27 +1304,28 @@ impl Filesystem for HostFs {
             .await;
             return Ok(ReplyWrite { written: n as u32 });
         }
-        // Stateless IO fallback: reopen the host file — never following
-        // symlinks (a host symlink is never written through; its target
-        // may not be mirrored at all).
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .append(append)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(self.patterns.redirect(&mirrored))
-        {
-            Ok(f) => f,
-            Err(e) => {
-                log_op_err(
-                    "write",
-                    &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
-                    &e,
-                )
-                .await;
-                return Err(e.into());
-            }
-        };
+        // Stateless IO fallback: reopen the host file relative to the pinned
+        // parent — never following symlinks (a host symlink is never
+        // written through; its target may not be mirrored at all; and no
+        // intermediate component is followed either).
+        let mut oflags = libc::O_WRONLY;
+        if append {
+            oflags |= libc::O_APPEND;
+        }
+        let mut file =
+            match anchored::open_at(&self.root, &self.patterns.redirect(&mirrored), oflags, 0) {
+                Ok(f) => f,
+                Err(e) => {
+                    log_op_err(
+                        "write",
+                        &mirrored,
+                        Some(&self.patterns.redirect(&mirrored)),
+                        &e,
+                    )
+                    .await;
+                    return Err(e.into());
+                }
+            };
         if !append {
             file.seek(SeekFrom::Start(offset))?;
         }
@@ -1247,7 +1367,7 @@ impl Filesystem for HostFs {
         if self.patterns.is_inject(&mirrored).is_some()
             || (self.patterns.is_empty_prefix(&mirrored)
                 || self.patterns.is_inject_prefix(&mirrored))
-                && std::fs::symlink_metadata(self.patterns.redirect(&mirrored)).is_err()
+                && !self.real_exists(&self.patterns.redirect(&mirrored))
         {
             return Ok(ReplyStatFs {
                 blocks: 1,
@@ -1260,23 +1380,23 @@ impl Filesystem for HostFs {
                 frsize: 512,
             });
         }
-        let mirrored = if is_root(mirrored.as_os_str()) {
+        let real = if is_root(mirrored.as_os_str()) {
             PathBuf::from("/")
         } else {
             self.patterns.redirect(&mirrored)
         };
-        let cpath =
-            CString::new(mirrored.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
         // O_PATH works on any file type (including directories) and
-        // O_NOFOLLOW keeps symlinked paths from being followed.
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        // O_NOFOLLOW keeps symlinked final components from being followed —
+        // anchored, so intermediate components are not either.
+        let fd = match anchored::open_full(&self.root, &real, libc::O_PATH | libc::O_NOFOLLOW) {
+            Ok(fd) => fd,
+            Err(e) => return Err(e.into()),
+        };
         let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::fstatvfs(fd, &mut vfs) };
+        // SAFETY: valid descriptor and a writable `statvfs` buffer.
+        let rc = unsafe { libc::fstatvfs(fd.as_raw_fd(), &mut vfs) };
         let err = std::io::Error::last_os_error();
-        unsafe { libc::close(fd) };
+        drop(fd);
         if rc != 0 {
             return Err(err.into());
         }
@@ -1450,13 +1570,20 @@ impl Filesystem for HostFs {
             return Ok(());
         }
         let real = self.patterns.redirect(&mirrored);
-        let cpath = CString::new(real.as_os_str().as_encoded_bytes()).map_err(|_| libc::ENOENT)?;
-        // `faccessat` with `AT_SYMLINK_NOFOLLOW` — never follow symlinks
-        // when deciding access on the real host filesystem.
+        let anchored = anchored::anchor_parent(&self.root, &real).map_err(|e| {
+            // ENOENT mapping preserved from the old cpath construction.
+            if e.raw_os_error() == Some(libc::EINVAL) {
+                return std::io::Error::from_raw_os_error(libc::ENOENT);
+            }
+            e
+        })?;
+        // `faccessat` with `AT_SYMLINK_NOFOLLOW` on the pinned parent —
+        // never follow symlinks (final component or otherwise) when
+        // deciding access on the real host filesystem.
         if unsafe {
             libc::faccessat(
-                libc::AT_FDCWD,
-                cpath.as_ptr(),
+                anchored.dir().as_raw_fd(),
+                anchored.name().as_ptr(),
                 non_write as libc::c_int,
                 libc::AT_SYMLINK_NOFOLLOW,
             )
@@ -1487,24 +1614,44 @@ impl Filesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         let real = self.patterns.redirect(&mirrored);
+        // Anchor the parent once: every operation below is an `*at()`
+        // syscall relative to the pinned parent descriptor, so no component
+        // of the path can resolve through a host symlink (final-component
+        // no-follow semantics are kept per operation, as before).
+        let anchored = anchored::anchor_parent(&self.root, &real)?;
+        let dirfd = anchored.dir().as_raw_fd();
+        let name = anchored.name().as_ptr();
         if let Some(size) = set_attr.size {
             // Never follow symlinks: a host symlink is not truncated
             // through (its target may not be mirrored at all).
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&real)?;
+            let fd = unsafe {
+                libc::openat(
+                    dirfd,
+                    name,
+                    libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: `fd` is a freshly opened, owned descriptor.
+            let f = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
             f.set_len(size)?;
         }
         if let Some(mode) = set_attr.mode {
-            let perms = std::fs::Permissions::from_mode(mode);
-            std::fs::set_permissions(&real, perms)?;
+            // fchmodat without AT_SYMLINK_NOFOLLOW keeps the old chmod
+            // semantics for the final component (it follows a symlink
+            // standing there, see finding M4); the anchored parent keeps
+            // every intermediate component honest.
+            if unsafe { libc::fchmodat(dirfd, name, mode as libc::mode_t, 0) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
         }
         if set_attr.uid.is_some() || set_attr.gid.is_some() {
-            let cpath = cstring_of(&real)?;
             let uid = set_attr.uid.unwrap_or(u32::MAX);
             let gid = set_attr.gid.unwrap_or(u32::MAX);
-            if unsafe { libc::lchown(cpath.as_ptr(), uid, gid) } != 0 {
+            if unsafe { libc::fchownat(dirfd, name, uid, gid, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
         }
@@ -1513,15 +1660,8 @@ impl Filesystem for HostFs {
                 ts_to_timespec(set_attr.atime),
                 ts_to_timespec(set_attr.mtime),
             ];
-            let cpath = cstring_of(&real)?;
-            if unsafe {
-                libc::utimensat(
-                    libc::AT_FDCWD,
-                    cpath.as_ptr(),
-                    times.as_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
+            if unsafe { libc::utimensat(dirfd, name, times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) }
+                != 0
             {
                 return Err(std::io::Error::last_os_error().into());
             }
@@ -1553,8 +1693,9 @@ impl Filesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         // Only a *real* entry at the target means EEXIST; a path merely
-        // matched by a wildcard pattern may not exist yet.
-        if std::fs::symlink_metadata(self.patterns.redirect(&mirrored)).is_ok() {
+        // matched by a wildcard pattern may not exist yet. (Anchored:
+        // no symlink is followed anywhere on the host path.)
+        if self.real_exists(&self.patterns.redirect(&mirrored)) {
             log_op_err(
                 "mkdir",
                 &mirrored,
@@ -1564,8 +1705,20 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EEXIST.into());
         }
-        let cpath = cstring_of(&self.patterns.redirect(&mirrored))?;
-        let rc = unsafe { libc::mkdir(cpath.as_ptr(), (mode & 0o7777) as libc::mode_t) };
+        let real = self.patterns.redirect(&mirrored);
+        let anchored = anchored::anchor_parent(&self.root, &real).map_err(|e| {
+            if e.raw_os_error() == Some(libc::EINVAL) {
+                return std::io::Error::from_raw_os_error(libc::ENOENT);
+            }
+            e
+        })?;
+        let rc = unsafe {
+            libc::mkdirat(
+                anchored.dir().as_raw_fd(),
+                anchored.name().as_ptr(),
+                (mode & 0o7777) as libc::mode_t,
+            )
+        };
         if rc != 0 {
             // Capture the error right after the syscall (errno is per-thread
             // and any intervening call would clobber it).
@@ -1622,7 +1775,9 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        if let Err(e) = std::fs::remove_file(self.patterns.redirect(&mirrored)) {
+        let anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&mirrored))?;
+        if unsafe { libc::unlinkat(anchored.dir().as_raw_fd(), anchored.name().as_ptr(), 0) } != 0 {
+            let e = std::io::Error::last_os_error();
             log_op_err(
                 "unlink",
                 &mirrored,
@@ -1680,7 +1835,16 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        if let Err(e) = std::fs::remove_dir(self.patterns.redirect(&mirrored)) {
+        let anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&mirrored))?;
+        if unsafe {
+            libc::unlinkat(
+                anchored.dir().as_raw_fd(),
+                anchored.name().as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            let e = std::io::Error::last_os_error();
             log_op_err(
                 "rmdir",
                 &mirrored,
@@ -1748,6 +1912,8 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
+        let old_real = self.patterns.redirect(&old);
+        let new_real = self.patterns.redirect(&new);
         // A *directory* rename carries every child from one pattern
         // context to another: a `hide` or `ro` rule that might apply to a
         // child of the source (or of the destination) must block the
@@ -1757,26 +1923,39 @@ impl Filesystem for HostFs {
         // `/project/src/**/*.bin` is `hide`); moving another directory
         // *into* such a subtree is denied as well, so content cannot be
         // planted there and carried back out with the same effect.
-        let dir_rename = self.is_host_dir(&self.patterns.redirect(&old))
-            || self.is_host_dir(&self.patterns.redirect(&new));
+        let dir_rename = self.is_host_dir(&old_real) || self.is_host_dir(&new_real);
         if dir_rename
             && (self.patterns.subtree_restricted(&old) || self.patterns.subtree_restricted(&new))
         {
             log_op_err(
                 "rename",
                 &old,
-                Some(&self.patterns.redirect(&new)),
+                Some(&new_real),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
             return Err(libc::EACCES.into());
         }
-        if let Err(e) = std::fs::rename(self.patterns.redirect(&old), self.patterns.redirect(&new))
+        // Both parents are pinned before the atomic `renameat` between
+        // them: no component of either path can resolve through a host
+        // symlink, and a swap between the two resolutions cannot re-point
+        // either name (the operation acts *inside* the pinned directories).
+        let old_anchored = anchored::anchor_parent(&self.root, &old_real)?;
+        let new_anchored = anchored::anchor_parent(&self.root, &new_real)?;
+        if unsafe {
+            libc::renameat(
+                old_anchored.dir().as_raw_fd(),
+                old_anchored.name().as_ptr(),
+                new_anchored.dir().as_raw_fd(),
+                new_anchored.name().as_ptr(),
+            )
+        } != 0
         {
-            log_op_err("rename", &old, Some(&self.patterns.redirect(&new)), &e).await;
+            let e = std::io::Error::last_os_error();
+            log_op_err("rename", &old, Some(&new_real), &e).await;
             return Err(e.into());
         }
-        log_op_ok("rename", &old, &self.patterns.redirect(&new)).await;
+        log_op_ok("rename", &old, &new_real).await;
 
         // The kernel moves the dentry on rename, re-hashing `old` as `new`
         // *keeping the source's nodeid*. Re-point the new path at the source
@@ -1827,12 +2006,18 @@ impl Filesystem for HostFs {
     }
 
     /// Create a hard link: the new name points at the *same real host file*
-    /// as the source (`link` on the host filesystem), so writes through
+    /// as the source (`linkat` on the host filesystem), so writes through
     /// either name are visible through both. The new name gets a **fresh
     /// nodeid** mapping to the new path: the mirror's pattern permissions
     /// are decided per path, and a hard-linked name is an independent path
     /// (the source nodeid keeps its mapping; renaming one name must not
     /// affect the other's).
+    ///
+    /// The source is **never followed**: a host symlink at the source name is
+    /// linked as the link itself (re-created with the same target — Linux
+    /// `linkat` cannot no-follow the source), because its target may live
+    /// outside every mapping and following it would be a variant of the C1
+    /// escape the anchored resolution closes.
     ///
     /// **Both** names must be writable. Checking only the new name would
     /// let the sandbox link a *read-only* mapped file (say, from
@@ -1890,9 +2075,42 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        if let Err(e) =
-            std::fs::hard_link(self.patterns.redirect(&old), self.patterns.redirect(&new))
-        {
+        // Both parents pinned. The source entry is stat'ed first (anchored): a
+        // host symlink standing at the source name must be linked *as a
+        // link*, never followed to its target — the target may live
+        // outside every mapping, and following it here would be a variant
+        // of the C1 escape (Linux `linkat` cannot no-follow the source, so
+        // a link source is re-created as an identical symlink instead). The
+        // check and the syscall below run in one await-free block — on the
+        // single-threaded runtime nothing can swap the entry in between.
+        let old_anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&old))?;
+        let new_anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&new))?;
+        let source_stat = anchored::stat_entry(&old_anchored)?;
+        let link_result = if Self::stat_is_symlink(&source_stat) {
+            let target = anchored::read_link_at(&old_anchored)?;
+            let ctarget = cstring_of(Path::new(&target))?;
+            // SAFETY: valid descriptors and NUL-terminated names.
+            unsafe {
+                libc::symlinkat(
+                    ctarget.as_ptr(),
+                    new_anchored.dir().as_raw_fd(),
+                    new_anchored.name().as_ptr(),
+                )
+            }
+        } else {
+            // SAFETY: valid descriptors and NUL-terminated names.
+            unsafe {
+                libc::linkat(
+                    old_anchored.dir().as_raw_fd(),
+                    old_anchored.name().as_ptr(),
+                    new_anchored.dir().as_raw_fd(),
+                    new_anchored.name().as_ptr(),
+                    0,
+                )
+            }
+        };
+        if link_result != 0 {
+            let e = std::io::Error::last_os_error();
             log_op_err("link", &new, Some(&self.patterns.redirect(&new)), &e).await;
             return Err(e.into());
         }
@@ -1936,17 +2154,22 @@ impl Filesystem for HostFs {
         // Only with O_EXCL does a *real* entry at the target mean EEXIST;
         // a plain O_CREAT (without O_EXCL) opens an existing file like the
         // host filesystem would. A path merely matched by a wildcard
-        // pattern may not exist yet.
-        let existing = std::fs::symlink_metadata(self.patterns.redirect(&mirrored)).ok();
+        // pattern may not exist yet. The parent is pinned first and the
+        // existing-entry check runs on it (`fstatat(AT_SYMLINK_NOFOLLOW)`):
+        // a host symlink standing at the target is never followed — neither
+        // by the check nor by the open below.
+        let real = self.patterns.redirect(&mirrored);
+        let anchored = anchored::anchor_parent(&self.root, &real)?;
         let excl = flags & libc::O_EXCL as u32 != 0;
         let truncate = flags & libc::O_TRUNC as u32 != 0;
         let append = flags & libc::O_APPEND as u32 != 0;
-        if let Some(md) = existing {
-            if md.file_type().is_symlink() {
+        let existing = anchored::stat_entry(&anchored).ok();
+        if let Some(st) = existing {
+            if Self::stat_is_symlink(&st) {
                 log_op_err(
                     "create",
                     &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
+                    Some(&real),
                     &std::io::Error::from_raw_os_error(libc::ELOOP),
                 )
                 .await;
@@ -1956,45 +2179,38 @@ impl Filesystem for HostFs {
                 log_op_err(
                     "create",
                     &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
+                    Some(&real),
                     &std::io::Error::from_raw_os_error(libc::EEXIST),
                 )
                 .await;
                 return Err(libc::EEXIST.into());
             }
-            if md.is_dir() {
+            if Self::stat_is_dir(&st) {
                 log_op_err(
                     "create",
                     &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
+                    Some(&real),
                     &std::io::Error::from_raw_os_error(libc::EISDIR),
                 )
                 .await;
                 return Err(libc::EISDIR.into());
             }
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).custom_flags(libc::O_NOFOLLOW);
+            let mut oflags = libc::O_WRONLY;
             if truncate {
-                opts.truncate(true);
+                oflags |= libc::O_TRUNC;
             }
             if append {
-                opts.append(true);
+                oflags |= libc::O_APPEND;
             }
-            let file = match opts.open(self.patterns.redirect(&mirrored)) {
+            let file = match anchored::open_at(&self.root, &real, oflags, 0) {
                 Ok(f) => f,
                 Err(e) => {
-                    log_op_err(
-                        "create",
-                        &mirrored,
-                        Some(&self.patterns.redirect(&mirrored)),
-                        &e,
-                    )
-                    .await;
+                    log_op_err("create", &mirrored, Some(&real), &e).await;
                     return Err(e.into());
                 }
             };
             let md = file.metadata()?;
-            log_op_ok("create", &mirrored, &self.patterns.redirect(&mirrored)).await;
+            log_op_ok("create", &mirrored, &real).await;
             let inode = self
                 .inodes
                 .write()
@@ -2015,33 +2231,26 @@ impl Filesystem for HostFs {
                 flags: 0,
             });
         }
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        if flags & libc::O_RDWR as u32 != 0 {
-            opts.read(true);
-        }
-        if flags & libc::O_APPEND as u32 != 0 {
-            opts.append(true);
-        }
-        let file = match opts
-            .mode(mode & 0o7777)
-            .open(self.patterns.redirect(&mirrored))
-        {
-            Ok(f) => f,
-            Err(e) => {
-                log_op_err(
-                    "create-new",
-                    &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
-                    &e,
-                )
-                .await;
-                return Err(e.into());
-            }
+        let base = if flags & libc::O_RDWR as u32 != 0 {
+            libc::O_RDWR
+        } else {
+            libc::O_WRONLY
         };
+        let mut oflags = libc::O_CREAT | libc::O_EXCL | base;
+        if append {
+            oflags |= libc::O_APPEND;
+        }
+        let file =
+            match anchored::open_at(&self.root, &real, oflags, (mode & 0o7777) as libc::mode_t) {
+                Ok(f) => f,
+                Err(e) => {
+                    log_op_err("create-new", &mirrored, Some(&real), &e).await;
+                    return Err(e.into());
+                }
+            };
         let md = file.metadata()?;
         let mut attr = attr_from_metadata(&md);
-        log_op_ok("create-new", &mirrored, &self.patterns.redirect(&mirrored)).await;
+        log_op_ok("create-new", &mirrored, &real).await;
         let inode = self
             .inodes
             .write()

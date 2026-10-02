@@ -16,13 +16,34 @@ fn fs_with_empties(entries: &[(&str, Permission)]) -> HostFs {
     fs(entries)
 }
 
-#[allow(unused)]
+/// Run a FUSE-handler future to completion (the handlers are async only
+/// because the trait demands it — the IO inside is synchronous).
 fn block<T>(fut: impl std::future::Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(fut)
+}
+
+/// The kernel consults `access` during `chdir`'s permission check —
+/// including for the mount root itself (the sandbox chroots into the FUSE
+/// mount in root mode). The root has no parent component; the anchored
+/// parent must resolve to the pinned anchor with the name `.` and the
+/// real filesystem (here: the root itself, a readable directory) decides.
+/// A silent ENOENT here made `chdir` into the sandbox root fail with
+/// ENOENT (a regression of the C1 fix).
+#[test]
+fn access_on_the_root_inode_is_answered_by_the_real_fs() {
+    let f = fs(&[("/usr", Permission::Ro)]);
+    block(async {
+        f.access(Request::default(), inodes::ROOT_INODE, libc::X_OK as u32)
+            .await
+            .expect("access(X_OK) on the root inode");
+        f.access(Request::default(), inodes::ROOT_INODE, libc::R_OK as u32)
+            .await
+            .expect("access(R_OK) on the root inode");
+    });
 }
 
 #[test]
@@ -437,4 +458,146 @@ fn walk_depth_reports_how_deep_a_pattern_reaches() {
         p.walk_depth(Path::new("/etc/passwd")),
         Some((Walk::Ancestor, 1))
     );
+}
+
+/// A base directory with a pre-existing host symlink (`evil`) pointing at
+/// `outside`, plus a real `real/.ssh` skeleton — the exact layout of the
+/// audit's C1 attack.
+fn escape_fixture(tag: &str) -> (PathBuf, PathBuf) {
+    let base =
+        std::env::temp_dir().join(format!("ai-bubble-hostfs-c1-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("real/.ssh")).unwrap();
+    std::fs::create_dir_all(base.join("outside")).unwrap();
+    std::fs::write(base.join("outside/authorized_keys"), b"HOST-SECRET").unwrap();
+    std::os::unix::fs::symlink(base.join("outside"), base.join("evil")).unwrap();
+    (base.clone(), base.join("outside/authorized_keys"))
+}
+
+/// The audit's C1 attack, exercised through the FUSE handlers: the sandbox
+/// looks up the real directory skeleton, then (out of band, e.g. through a
+/// bind mount) swaps a symlink into its place — and must not be able to
+/// read or write the symlink's target through the mirrored path afterwards.
+#[test]
+fn intermediate_symlink_swap_cannot_redirect_host_access() {
+    let (base, outside_file) = escape_fixture("open");
+    let f = fs(&[(base.to_str().unwrap(), Permission::Rw)]);
+
+    // Establish the directory dentries (cached nodeids), as the kernel
+    // would during the attack.
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+    let real_ino = block(async {
+        f.lookup(Request::default(), base_ino, OsStr::new("real"))
+            .await
+            .expect("lookup real")
+            .attr
+            .ino
+    });
+    let ssh_ino = block(async {
+        f.lookup(Request::default(), real_ino, OsStr::new(".ssh"))
+            .await
+            .expect("lookup .ssh")
+            .attr
+            .ino
+    });
+
+    // The swap: `real` becomes the host symlink (renamed out of band —
+    // through a bind mount, or between FUSE requests). No race involved:
+    // the mirrored path now persistently resolves through the link.
+    std::fs::rename(base.join("real"), base.join("real.bak")).unwrap();
+    std::fs::rename(base.join("evil"), base.join("real")).unwrap();
+
+    // Every operation on the cached paths must fail — never resolve
+    // through the host symlink to `outside`.
+    let res = block(async {
+        f.open(Request::default(), ssh_ino, libc::O_RDONLY as u32)
+            .await
+    });
+    assert!(res.is_err(), "open through swapped symlink must fail");
+    let res = block(async { f.read(Request::default(), ssh_ino, 0, 0, 64).await });
+    assert!(
+        res.is_err(),
+        "stateless read through swapped symlink must fail"
+    );
+    let res = block(async { f.getattr(Request::default(), real_ino, None, 0).await });
+    // `getattr` succeeds — the symlink is shown *as a symlink* — but it is
+    // never followed: the access below cannot reach its target.
+    let attr = res.expect("getattr on the swapped path succeeds");
+    assert_eq!(attr.attr.kind, FileType::Symlink);
+
+    // The target file is untouched and was never readable through the mirror.
+    assert_eq!(std::fs::read(&outside_file).unwrap(), b"HOST-SECRET");
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A symlink at an intermediate host-path component (pre-existing, not
+/// swapped) is never followed by any host access either: attributes of a
+/// path *through* it fail, while the symlink itself still shows as one.
+#[test]
+fn intermediate_symlinks_are_never_followed_by_host_access() {
+    let (base, outside_file) = escape_fixture("walk");
+    std::fs::write(base.join("real/.ssh/authorized_keys"), b"skeleton").unwrap();
+    let f = fs(&[(base.to_str().unwrap(), Permission::Rw)]);
+
+    // Through the link: the path cannot be resolved (no content leaks).
+    assert!(f.attr(&base.join("evil/authorized_keys")).is_err());
+    // The link itself is still visible *as a symlink*.
+    let attr = f.attr(&base.join("evil")).unwrap();
+    assert_eq!(attr.kind, FileType::Symlink);
+    // …and the real file behind the link is untouched.
+    assert_eq!(std::fs::read(&outside_file).unwrap(), b"HOST-SECRET");
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A symlink standing at a *final* component is linked as a link (never
+/// followed to its target), and the new name cannot be used to reach the
+/// target either.
+#[test]
+fn hard_linking_a_symlink_links_the_link_not_the_target() {
+    let (base, outside_file) = escape_fixture("link");
+    let f = fs(&[(base.to_str().unwrap(), Permission::Rw)]);
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+
+    // The sandbox links the symlink `evil` to a new name `copy`.
+    let evil_ino = block(async {
+        f.lookup(Request::default(), base_ino, OsStr::new("evil"))
+            .await
+            .expect("lookup evil")
+            .attr
+            .ino
+    });
+    block(async {
+        f.link(Request::default(), evil_ino, base_ino, OsStr::new("copy"))
+            .await
+            .expect("link of the symlink succeeds");
+    });
+
+    // The new name is a symlink (its target was not hard-linked through).
+    let attr = block(async {
+        f.lookup(Request::default(), base_ino, OsStr::new("copy"))
+            .await
+            .expect("lookup copy")
+            .attr
+    });
+    assert_eq!(attr.kind, FileType::Symlink);
+    // Opening it fails like any mirror symlink: the target stays unreachable.
+    let copy_ino = attr.ino;
+    let res = block(async {
+        f.open(Request::default(), copy_ino, libc::O_RDONLY as u32)
+            .await
+    });
+    assert!(res.is_err());
+    assert_eq!(std::fs::read(&outside_file).unwrap(), b"HOST-SECRET");
+
+    std::fs::remove_dir_all(&base).unwrap();
 }
