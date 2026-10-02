@@ -50,6 +50,7 @@ use crate::waf;
 /// `env` is the sandbox's isolated environment (the spec's `env` section);
 /// the proxy variables are merged into it below. `cwd` is the command's
 /// working directory inside the sandbox (see `sandbox::mount_and_exec`).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     ops: &[Op],
     command: &[String],
@@ -57,6 +58,7 @@ pub fn run(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
     die_with_parent: bool,
+    new_session: bool,
     seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
@@ -88,6 +90,7 @@ pub fn run(
                 env,
                 cwd,
                 die_with_parent,
+                new_session,
                 seccomp,
             );
         }
@@ -139,6 +142,7 @@ fn isolated_parent(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
     die_with_parent: bool,
+    new_session: bool,
     seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
@@ -262,7 +266,7 @@ fn isolated_parent(
             // dead P leaves the sandbox re-parented to init.
             handle_die_with_parent(die_with_parent);
             // PID 1 of its own PID namespace (see pidns_and_exec).
-            pidns_and_exec(ops, command, &child_env, cwd, die_with_parent, seccomp);
+            pidns_and_exec(ops, command, &child_env, cwd, die_with_parent, new_session, seccomp);
         }
 
         // Serve the mode's network frontends while the command runs.

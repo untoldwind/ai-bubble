@@ -6,9 +6,15 @@ use std::path::Path;
 use crate::{audit, hostfs, netns, sandbox, spec, waf};
 
 /// Runs the `run` sub-command. `spec_dir` is the `--spec-dir` value (if
-/// given), `die_with_parent` the (negatable) PDEATHSIG flag, `command` the
-/// command to execute inside the sandbox.
-pub fn run(spec_dir: Option<&Path>, die_with_parent: bool, mut command: Vec<String>) {
+/// given), `die_with_parent` the (negatable) PDEATHSIG flag, `new_session`
+/// the (negatable) new-terminal-session flag, `command` the command to
+/// execute inside the sandbox.
+pub fn run(
+    spec_dir: Option<&Path>,
+    die_with_parent: bool,
+    new_session: bool,
+    mut command: Vec<String>,
+) {
     if command.is_empty() {
         sandbox::die(
             "No command given; usage: ai-bubble run [--spec-dir DIR] -- COMMAND [args...]",
@@ -92,6 +98,7 @@ pub fn run(spec_dir: Option<&Path>, die_with_parent: bool, mut command: Vec<Stri
             &sandbox_config.env,
             sandbox_config.cwd.as_deref(),
             die_with_parent,
+            new_session,
             sandbox_config.seccomp.as_ref(),
         );
     } else {
@@ -101,6 +108,7 @@ pub fn run(spec_dir: Option<&Path>, die_with_parent: bool, mut command: Vec<Stri
             &sandbox_config.env,
             sandbox_config.cwd.as_deref(),
             die_with_parent,
+            new_session,
             sandbox_config.seccomp.as_ref(),
         );
     }

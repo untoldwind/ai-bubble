@@ -68,6 +68,23 @@ Notes:
   SIGKILL when ai-bubble — or ai-bubble's parent — dies (like bwrap's
   `--die-with-parent`, which is the default here); `run
   --no-die-with-parent` switches it off.
+* `run` starts the command in a **new terminal session** (like bwrap's
+  `--new-session`, also the default here): the command's terminal is not
+  the caller's *controlling* tty. A malicious command therefore cannot
+  push keystrokes into the user's shell with `TIOCSTI`, and the host pts
+  device is not bind-mounted into the sandbox as `/dev/console`.
+  When the command actually talks to a terminal (stdin and stdout are
+  both ttys), this automatically runs in **pty mode**: the launcher
+  allocates a private pty and relays it (like `script(1)`), giving the
+  command a real controlling terminal — job control, `^C`, `SIGWINCH`,
+  interactive shells, `su` — while still never exposing the host terminal
+  device. With pipes on stdin or stdout the plain new-session behaviour
+  is kept (the command simply has no controlling tty; `/dev/tty` fails
+  with `ENXIO`, as it does in bwrap's `--new-session`).
+  Only if you explicitly need the *shared*-terminal behaviour — the
+  command seeing the very same pts device — use `run --no-new-session`,
+  which bind-mounts the host terminal into the sandbox; only use it for
+  commands you trust.
 * A typical spec directory:
 
   ```
@@ -333,6 +350,14 @@ SIGKILL when ai-bubble — or ai-bubble's parent — dies. Pass
 `--no-die-with-parent` to switch this off. Every process in the chain
 (launcher, isolated-net parent and connector, sandboxed child) sets it for
 itself, because the setting does not survive fork.
+
+`--new-session` (bwrap's option of the same name) is likewise on by
+default: the command runs in a fresh terminal session with no controlling
+terminal (`setsid()` + `TIOCNOTTY` in the sandboxed child, before exec).
+This closes the `TIOCSTI` keystroke-injection escape through the shared
+terminal and drops the `/dev/console` and `/dev/tty` host binds that
+terminal sharing needs; `--no-new-session` restores them for trusted,
+interactive commands.
 
 ## How it works
 

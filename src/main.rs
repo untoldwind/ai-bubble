@@ -11,6 +11,10 @@
 //! * `sandbox` — the privileged filesystem part: user/mount namespaces,
 //!   tmpfs root, bind mounts, symlinks, proc, exec. Never touches the
 //!   network.
+//! * `pty`     — the private-pty terminal mode: a launcher-created pty
+//!   pair, the stdio ⇄ master relay in the launcher-side parent, and the
+//!   child-side `setsid()` + `TIOCSCTTY` that give the sandboxed command
+//!   a real controlling terminal without exposing the caller's tty.
 //! * `hostfs`  — the host-side FUSE filesystem server process and the virtual
 //!   filesystem it serves; bind-mounted into the sandbox at `/host`.
 //! * `netns`   — the isolated-network process tree: forks, user/network
@@ -29,6 +33,7 @@ mod audit;
 mod cli;
 mod hostfs;
 mod netns;
+mod pty;
 mod proxy;
 mod sandbox;
 mod spec;
@@ -64,8 +69,9 @@ fn main() {
     match cli.command {
         Some(Command::Run {
             die_with_parent,
+            new_session,
             command,
-        }) => cli::run(cli.spec.as_deref(), die_with_parent, command),
+        }) => cli::run(cli.spec.as_deref(), die_with_parent, new_session, command),
 
         Some(Command::Ls { path }) => cli::ls(cli.spec.as_deref(), &path),
 

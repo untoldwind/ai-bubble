@@ -199,6 +199,7 @@ pub fn setup_and_exec(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
     die_with_parent: bool,
+    new_session: bool,
     seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
@@ -260,7 +261,7 @@ pub fn setup_and_exec(
 
         // The command must also run in its own PID namespace (and get a
         // fresh /proc), like bwrap's --unshare-pid + --proc.
-        pidns_and_exec(ops, command, env, cwd, die_with_parent, seccomp);
+        pidns_and_exec(ops, command, env, cwd, die_with_parent, new_session, seccomp);
     }
 }
 
@@ -287,13 +288,46 @@ pub fn setup_and_exec(
 /// A PID namespace always needs a PID 1; making the command itself PID 1
 /// corresponds to bwrap's `--as-pid-1` mode.
 ///
+/// Detach the (forked) sandboxed child from the caller's controlling
+/// terminal — bwrap's `--new-session`. Must run in a freshly forked child
+/// (never a process-group leader, so `setsid()` cannot fail with EPERM).
+///
+/// `setsid()` alone suffices: a new session has no controlling terminal,
+/// so the command cannot reach the user's tty through `/dev/tty` (it fails
+/// with ENXIO) and `TIOCSTI` on fd 0/2 no longer targets *its* controlling
+/// terminal — the escape where a malicious command pushes keystrokes into
+/// the user's shell. `TIOCNOTTY` is issued first anyway (harmless if not a
+/// tty) so a caller that already had a session still loses the ctty when
+/// `setsid()` would fail.
+///
+/// The corresponding mount-side change is in `mount_and_exec`: the host
+/// pts (`/dev/console`) and the `/dev/tty` bind are skipped in this mode.
+pub(crate) unsafe fn new_terminal_session() {
+    unsafe {
+        let _ = libc::ioctl(0, libc::TIOCNOTTY);
+        if libc::setsid() < 0 {
+            die_with_error("Can't start a new terminal session");
+        }
+    }
+}
+
 /// The parent keeps waiting for the child and forwards its exit status.
+///
+/// Pty mode ([`crate::pty::wanted`]): when new-session is requested and
+/// the caller's stdin/stdout are ttys, a *private* pty is allocated
+/// before the fork ([`crate::pty::open`]). The child gets the slave as
+/// fds 0/1/2 and controlling terminal ([`crate::pty::child_attach`]);
+/// this process (the one that waitpid()s) becomes the stdio ⇄ master
+/// relay ([`crate::pty::parent_relay`]). See the `pty` module docs for
+/// why this keeps new-session's security properties while restoring full
+/// controlling-terminal functionality (job control, SIGWINCH, …).
 pub(crate) unsafe fn pidns_and_exec(
     ops: &[Op],
     command: &[String],
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
     die_with_parent: bool,
+    new_session: bool,
     seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
@@ -303,6 +337,16 @@ pub(crate) unsafe fn pidns_and_exec(
         if libc::unshare(libc::CLONE_NEWPID) != 0 {
             die_with_error("Can't unshare PID namespace");
         }
+        // Pty mode: allocate the private pty before the fork, so both
+        // sides inherit their end. With pipes on stdin/stdout (or
+        // --no-new-session) this stays None and the behaviour below is
+        // exactly as before.
+        let pty = if crate::pty::wanted(new_session) {
+            Some(crate::pty::open())
+        } else {
+            None
+        };
+        let stderr_is_tty = libc::isatty(2) == 1;
         let pid = libc::fork();
         if pid < 0 {
             die_with_error("Can't fork sandboxed command");
@@ -312,10 +356,38 @@ pub(crate) unsafe fn pidns_and_exec(
             // the sandboxed process must bind its own lifecycle to the
             // launcher before doing anything else.
             handle_die_with_parent(die_with_parent);
-            mount_and_exec(ops, command, env, cwd, seccomp);
+            // Terminal setup, in order of preference: pty mode (private
+            // controlling terminal, see the pty module docs), otherwise
+            // the plain new-session detach (bwrap's --new-session).
+            // Done in this forked child — which is never a process-group
+            // leader, so setsid() cannot fail with EPERM — so both entry
+            // points get it.
+            if let Some(p) = &pty {
+                crate::pty::child_attach(p, stderr_is_tty);
+            } else if new_session {
+                new_terminal_session();
+            }
+            mount_and_exec(
+                ops,
+                command,
+                env,
+                cwd,
+                new_session,
+                pty.as_ref().map(|p| p.slave_path.as_str()),
+                seccomp,
+            );
         }
 
-        // Parent: supervise the PID-1 child and forward its exit status.
+        // Parent: the child must not keep the slave open, or the master
+        // would never see EOF when the command exits.
+        if let Some(p) = &pty {
+            crate::pty::close_slave(p);
+            // Relay stdio ⇄ master until the pty closes or a fatal
+            // signal arrives; the terminal is restored before returning.
+            crate::pty::parent_relay(p, pid);
+        }
+
+        // Supervise the PID-1 child and forward its exit status.
         let mut status: libc::c_int = 0;
         loop {
             let r = libc::waitpid(pid, &mut status, 0);
@@ -452,11 +524,19 @@ pub(crate) unsafe fn mount_tmpfs(
 /// must reach this in the child that inherited the fresh user namespace
 /// created by `netns::isolated_parent` (the new mount namespace is then
 /// owned by that same user namespace).
+/// `pty_slave_path` is set in pty mode (see the `pty` module docs): the
+/// host path of the private pty's slave, which is then bind-mounted as
+/// `/dev/console` (so ttyname-style paths resolve) — and `/dev/tty` is
+/// provided too, because the command's controlling terminal is now the
+/// private pty, not the caller's. In plain new-session mode both stay
+/// out of the sandbox, exactly as before.
 pub(crate) unsafe fn mount_and_exec(
     ops: &[Op],
     command: &[String],
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
+    new_session: bool,
+    pty_slave_path: Option<&str>,
     seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
@@ -661,7 +741,18 @@ pub(crate) unsafe fn mount_and_exec(
                     // The device nodes: bwrap creates a read-only placeholder
                     // file and bind-mounts the host node over it (device
                     // access works because the bind mount carries it over).
-                    for name in ["null", "zero", "full", "random", "urandom", "tty"] {
+                    // In plain new-session mode /dev/tty is skipped: the
+                    // command has no controlling terminal, so a bind of the
+                    // host's /dev/tty node (which resolves to the *caller's*
+                    // ctty on the host) would only re-expose it. In pty mode
+                    // the ctty is the *private* pty, so /dev/tty resolves to
+                    // that and is safe to provide.
+                    let dev_names: &[&str] = if new_session && pty_slave_path.is_none() {
+                        &["null", "zero", "full", "random", "urandom"]
+                    } else {
+                        &["null", "zero", "full", "random", "urandom", "tty"]
+                    };
+                    for name in dev_names.iter().copied() {
                         let node = dev_abs.join(name);
                         if fs::OpenOptions::new()
                             .write(true)
@@ -721,24 +812,35 @@ pub(crate) unsafe fn mount_and_exec(
                         die_with_error("Can't make symlink ptmx -> pts/ptmx");
                     }
 
-                    // If stdin is a tty, bind-mount that host device as
-                    // /dev/console so ttyname() works in the sandbox (bwrap
-                    // does the same; it grants no extra access).
-                    let tty = libc::ttyname(0);
-                    if !tty.is_null() {
-                        let host_tty = CStr::from_ptr(tty);
-                        if !host_tty.to_bytes().is_empty() {
-                            if fs::OpenOptions::new()
-                                .write(true)
-                                .create_new(true)
-                                .mode(0o444)
-                                .open(dev_abs.join("console"))
-                                .is_err()
-                            {
-                                die_with_error("Can't create device placeholder console");
-                            }
-                            bind_into_dev(&host_tty.to_string_lossy(), &dev_abs, "console");
+                    // Bind a terminal device as /dev/console so ttyname()-style paths
+                    // resolve in the sandbox (bwrap does the same; it grants
+                    // no extra access). Which device: in pty mode the
+                    // private pty's slave — *not* the caller's terminal
+                    // device; in shared (--no-new-session) mode the caller's
+                    // terminal; in plain new-session mode nothing, because
+                    // the command has no controlling tty at all.
+                    let console_src: Option<String> = if new_session {
+                        pty_slave_path.map(str::to_string)
+                    } else {
+                        let tty = libc::ttyname(0);
+                        if tty.is_null() {
+                            None
+                        } else {
+                            let host_tty = CStr::from_ptr(tty).to_string_lossy().into_owned();
+                            (!host_tty.is_empty()).then_some(host_tty)
                         }
+                    };
+                    if let Some(src) = console_src {
+                        if fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o444)
+                            .open(dev_abs.join("console"))
+                            .is_err()
+                        {
+                            die_with_error("Can't create device placeholder console");
+                        }
+                        bind_into_dev(&src, &dev_abs, "console");
                     }
                 }
                 Op::Symlink { src, dest } => {

@@ -68,6 +68,30 @@ pub enum Command {
         )]
         die_with_parent: bool,
 
+        /// Start the command in a *new terminal session* (like bwrap's
+        /// `--new-session`, on by default): the launcher calls `setsid()`
+        /// and `TIOCNOTTY` before exec, so the command has no controlling
+        /// terminal. It keeps fds 0/1/2 on the caller's terminal for I/O,
+        /// but the terminal is no longer *its* controlling tty — a
+        /// malicious command cannot push keystrokes back into the user's
+        /// shell (`TIOCSTI`), and `/dev/console` / the host pts device are
+        /// not bind-mounted into the sandbox.
+        ///
+        /// When the command actually talks to a terminal (stdin and stdout
+        /// are both ttys), this automatically switches to **pty mode**: a
+        /// private pty is allocated by the launcher and relayed, giving
+        /// the command a real controlling terminal (job control, SIGWINCH,
+        /// interactive shells) while still never exposing the host
+        /// terminal device. Pass `--no-new-session` to restore the old
+        /// shared-terminal behaviour instead (binds the host pts into the
+        /// sandbox; only use it for commands you trust).
+        #[arg(
+            long = "no-new-session",
+            action = clap::ArgAction::SetFalse,
+            default_value_t = true
+        )]
+        new_session: bool,
+
         /// The command to run inside the sandbox (everything after the
         /// first bare argument or after `--`). Its own flags (e.g.
         /// `ls -l`) pass through verbatim.
@@ -118,6 +142,7 @@ mod tests {
             cli.command,
             Some(Command::Run {
                 die_with_parent: true,
+                new_session: true,
                 command: ["sh", "-c", "echo hi"]
                     .iter()
                     .map(|s| s.to_string())
@@ -173,6 +198,16 @@ mod tests {
         };
         assert!(run(&["ai-bubble", "run", "sh"]));
         assert!(!run(&["ai-bubble", "run", "--no-die-with-parent", "sh"]));
+    }
+
+    #[test]
+    fn new_session_flag() {
+        let run = |args: &[&str]| match parse(args).command {
+            Some(Command::Run { new_session, .. }) => new_session,
+            other => panic!("expected run, got {other:?}"),
+        };
+        assert!(run(&["ai-bubble", "run", "sh"]));
+        assert!(!run(&["ai-bubble", "run", "--no-new-session", "sh"]));
     }
 
     #[test]
