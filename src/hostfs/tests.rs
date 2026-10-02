@@ -29,13 +29,13 @@ fn block<T>(fut: impl std::future::Future<Output = T>) -> T {
 
 /// The kernel consults `access` during `chdir`'s permission check —
 /// including for the mount root itself (the sandbox chroots into the FUSE
-/// mount in root mode). The root has no parent component; the anchored
-/// parent must resolve to the pinned anchor with the name `.` and the
-/// real filesystem (here: the root itself, a readable directory) decides.
-/// A silent ENOENT here made `chdir` into the sandbox root fail with
-/// ENOENT (a regression of the C1 fix).
+/// mount in root mode). The root is a synthetic inode: read/traverse are
+/// answered affirmatively by policy (it is always listable and navigable)
+/// without touching any anchor — the parent anchor of `.` would be the
+/// pinned HOST root directory, and a silent ENOENT here made `chdir` into
+/// the sandbox root fail with ENOENT (a regression of the C1 fix).
 #[test]
-fn access_on_the_root_inode_is_answered_by_the_real_fs() {
+fn access_on_the_root_inode_is_answered_by_policy() {
     let f = fs(&[("/usr", Permission::Ro)]);
     block(async {
         f.access(Request::default(), inodes::ROOT_INODE, libc::X_OK as u32)
@@ -44,6 +44,68 @@ fn access_on_the_root_inode_is_answered_by_the_real_fs() {
         f.access(Request::default(), inodes::ROOT_INODE, libc::R_OK as u32)
             .await
             .expect("access(R_OK) on the root inode");
+    });
+}
+
+/// `access(W_OK)` on the mirror root must be decided by the spec's
+/// writability policy — never by `faccessat` on the host root directory
+/// the root's parent anchor resolves to (audit finding M1).
+#[test]
+fn access_write_on_the_root_inode_follows_the_policy() {
+    let f = fs(&[("/usr", Permission::Ro)]);
+    block(async {
+        let res = f
+            .access(Request::default(), inodes::ROOT_INODE, libc::W_OK as u32)
+            .await;
+        assert_eq!(
+            <fuse3::Errno>::from(libc::EACCES),
+            res.unwrap_err(),
+            "W_OK on the root inode must follow the policy"
+        );
+    });
+}
+
+/// `setattr` on the mirror root must be refused even when the spec marks
+/// the root writable (`rw /**`): the root's parent anchor is the pinned
+/// HOST root directory with the name `.`, and a chmod/chown/utimens there
+/// would operate on the host `/` (audit finding M1).
+#[test]
+fn setattr_on_the_root_inode_is_refused() {
+    let f = fs(&[("/**", Permission::Rw)]);
+    block(async {
+        let res = f
+            .setattr(
+                Request::default(),
+                inodes::ROOT_INODE,
+                None,
+                SetAttr {
+                    mode: Some(0o777),
+                    ..SetAttr::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            <fuse3::Errno>::from(libc::EACCES),
+            res.unwrap_err(),
+            "setattr on the root inode must be refused"
+        );
+    });
+}
+
+/// `statfs` on the mirror root must report the synthetic statfs, not the
+/// host `/` filesystem the root's anchor resolves to (audit finding M1):
+/// the host root's total/free space and filesystem type must not leak.
+#[test]
+fn statfs_on_the_root_inode_reports_the_synthetic_statfs() {
+    let f = fs(&[("/**", Permission::Rw)]);
+    block(async {
+        let reply = f
+            .statfs(Request::default(), inodes::ROOT_INODE)
+            .await
+            .expect("statfs on the root inode");
+        assert_eq!(reply.blocks, 1);
+        assert_eq!(reply.bsize, 512);
+        assert_eq!(reply.files, 1);
     });
 }
 

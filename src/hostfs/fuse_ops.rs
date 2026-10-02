@@ -117,6 +117,22 @@ pub(super) fn is_root(path: &OsStr) -> bool {
     path == Path::new("/") || path.is_empty()
 }
 
+/// A minimal, self-consistent `statfs` for paths with no real host
+/// counterpart (virtual/injected paths, and the synthetic mirror root —
+/// see the `statfs` op): one block, one file, small fixed sizes.
+fn minimal_statfs() -> ReplyStatFs {
+    ReplyStatFs {
+        blocks: 1,
+        bfree: 0,
+        bavail: 0,
+        files: 1,
+        ffree: 0,
+        bsize: 512,
+        namelen: 255,
+        frsize: 512,
+    }
+}
+
 impl Filesystem for HostFs {
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
         perf::fuse_op!("init");
@@ -719,6 +735,14 @@ impl Filesystem for HostFs {
         // with `O_NOFOLLOW` and `fstatvfs` runs on the descriptor: symlinks
         // are never followed to a filesystem outside the mirror.
         let mirrored = self.resolve(inode)?;
+        // The mirror root is synthetic: it must not be resolved to the
+        // pinned HOST root directory (whose `fstatvfs` would report the
+        // host `/` filesystem — its total/free space and type — to the
+        // sandbox; AUDIT.md finding M1). Report the same minimal,
+        // self-consistent statfs as virtual paths below.
+        if is_root(mirrored.as_os_str()) {
+            return Ok(minimal_statfs());
+        }
         // An injected path has no host counterpart: report a minimal,
         // self-consistent statfs instead of opening anything. The same
         // holds for a purely virtual ancestor of an injected (or empty)
@@ -729,16 +753,7 @@ impl Filesystem for HostFs {
                 || self.patterns.is_inject_prefix(&mirrored))
                 && !self.real_exists(&self.patterns.redirect(&mirrored))
         {
-            return Ok(ReplyStatFs {
-                blocks: 1,
-                bfree: 0,
-                bavail: 0,
-                files: 1,
-                ffree: 0,
-                bsize: 512,
-                namelen: 255,
-                frsize: 512,
-            });
+            return Ok(minimal_statfs());
         }
         let real = if is_root(mirrored.as_os_str()) {
             PathBuf::from("/")
@@ -915,6 +930,18 @@ impl Filesystem for HostFs {
             }
             return Ok(());
         }
+        // The mirror root is synthetic: answering via the anchor would
+        // `faccessat` the HOST root directory (`.` under the pinned
+        // host-root descriptor), probing the host root's real permissions
+        // (AUDIT.md finding M1). Answer from policy instead: writability
+        // is the spec's decision, read/traverse are inherent to the
+        // synthetic root (it is always listable and navigable).
+        if is_root(mirrored.as_os_str()) {
+            if mask & libc::W_OK as u32 != 0 && !self.patterns.writable(&mirrored) {
+                return Err(libc::EACCES.into());
+            }
+            return Ok(());
+        }
         // W_OK is answered by the spec: only `rw` paths may be written (the
         // real file permissions are checked when a write is attempted).
         let non_write = mask & !(libc::W_OK as u32);
@@ -960,6 +987,15 @@ impl Filesystem for HostFs {
     ) -> Result<ReplyAttr> {
         perf::fuse_op!("setattr");
         let mirrored = self.resolve(inode)?;
+        // The mirror root is a synthetic inode (see `getattr`): it has no
+        // host counterpart of its own, and its parent anchor would be the
+        // pinned HOST root directory with the name `.` — a setattr here
+        // would chmod/chown/utimens the host `/` (AUDIT.md finding M1).
+        // Nothing in the mirror needs metadata changes on the synthetic
+        // root, so refuse unconditionally.
+        if is_root(mirrored.as_os_str()) {
+            return Err(libc::EACCES.into());
+        }
         if self.patterns.is_empty(&mirrored) {
             // Empty paths are virtual: nothing to change.
             return Err(libc::EACCES.into());
