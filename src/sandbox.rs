@@ -1276,6 +1276,16 @@ fn apply_seccomp(policy: &SeccompPolicy) {
     // AF_UNIX | (1 << 32), ...)` would put garbage in the upper half of
     // the argument word and slip past a full 64-bit equality check while
     // the kernel still sees AF_UNIX (AUDIT.md H1).
+    //
+    // Residual (AUDIT.md H2): on kernels with CONFIG_IA32_EMULATION, a
+    // 64-bit process issuing `int $0x80` gets the *ia32* syscall table
+    // while seccomp still sees AUDIT_ARCH_X86_64 — ia32 `socketcall` is
+    // number 102, which this filter interprets as `getuid` (ungated), so
+    // AF_UNIX sockets can be created that way. No seccomp rule can close
+    // this (the arch check passes and the number is ambiguous); the gate
+    // is best-effort there. Host-network mode must be treated as full
+    // local IPC for untrusted commands — see the module docs in
+    // `spec/seccomp.rs` and the README's "Unix-domain sockets" section.
     if !policy.unix_sockets() {
         use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
         let af_unix = libc::AF_UNIX as u64;

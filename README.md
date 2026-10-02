@@ -357,9 +357,10 @@ is the network namespace, which corresponds to bwrap's `--share-net`:
 > Mitigated in part since 2026-10-02: host-network mode denies
 > Unix-domain sockets by default (`net.host.unix_sockets`, see
 > [Unix-domain sockets](#unix-domain-sockets) below), which closes the
-> abstract-socket hole (and filesystem-socket access) with seccomp; opt
-> in only if the command genuinely needs local IPC. Proxy/waf modes
-> isolate the network namespace and are not exposed.
+> abstract-socket hole (and filesystem-socket access) with seccomp —
+> **on kernels without IA32 emulation**; see the warning below. Opt in
+> only if the command genuinely needs local IPC. Proxy/waf modes isolate
+> the network namespace and are not exposed.
 
 Not covered by that equivalence (see "Notes" below): ai-bubble's
 `/proc` mounts are always fresh procfs instances and the command always
@@ -537,6 +538,19 @@ unconditional entries, and an allowlist that lists `socket`/
 them was already denying everything). Set `"unix_sockets": true` only if
 the command genuinely needs local IPC — it re-opens the local-IPC escape
 hatch described above.
+
+> **⚠️ Best-effort on kernels with IA32 emulation (AUDIT.md H2).** On a
+> kernel built with `CONFIG_IA32_EMULATION` (the common distro default),
+> a 64-bit process can issue `int $0x80` and reach the *ia32* syscall
+> table while seccomp still reports the x86_64 architecture: ia32
+> `socketcall` is syscall 102, which the filter can only interpret as
+> x86_64 `getuid` — a syscall that cannot be denied — so AF_UNIX sockets
+> remain creatable despite this default. No seccomp rule can distinguish
+> the case, because the syscall *number* is genuinely ambiguous. With
+> IA32 emulation the AF_UNIX gate is therefore best-effort, and
+> host-network mode must be treated as **full local IPC** for untrusted
+> commands: prefer `"mode": "proxy"` or `"mode": "waf"` there. Kernels
+> without IA32 emulation get the full protection described above.
 
 In proxy/waf mode the command runs in a fresh network namespace, where
 the abstract-socket exposure does not exist (the namespace's socket

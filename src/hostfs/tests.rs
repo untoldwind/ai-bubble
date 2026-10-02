@@ -797,6 +797,94 @@ fn setattr_chmod_strips_setuid_and_setgid_bits() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
+/// A `create` (open O_CREAT|O_EXCL) through the mirror must not be able to
+/// plant setuid/setgid bits on a host file (AUDIT.md H3): the kernel honors
+/// those bits in `open(O_CREAT)`'s mode (umask only masks 0777), so a
+/// `0o4755` request used to create a setuid binary owned by the invoking
+/// user — inert for an unprivileged ai-bubble, a setuid-root escalation
+/// when it runs as root. The requested mode must come out as plain `0o755`.
+#[test]
+fn create_strips_setuid_and_setgid_bits() {
+    let base = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-h3-create-setuid-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let f = fs(&[(&format!("{}/*", base.display()), Permission::Rw)]);
+
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+
+    // create() with a setuid-bit mode, exactly like open(O_CREAT|O_EXCL).
+    let created = block(async {
+        f.create(
+            Request::default(),
+            base_ino,
+            OsStr::new("helper"),
+            0o4755,
+            (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as u32,
+        )
+        .await
+        .expect("create of helper succeeds")
+    });
+    assert_ne!(created.fh, 0, "a real file must get a real handle");
+
+    let mode = std::fs::metadata(base.join("helper"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o7777,
+        0o755,
+        "create must not honor the setuid/setgid bits in the mode"
+    );
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// `mkdir` through the mirror must strip the setuid/setgid bits, too
+/// (AUDIT.md H3): `mkdirat` honors them in its mode argument. Whether the
+/// kernel strips some of them anyway is fs-dependent — the mirror strips
+/// them itself so the host result does not depend on that.
+#[test]
+fn mkdir_strips_setuid_and_setgid_bits() {
+    let base = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-h3-mkdir-setgid-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let f = fs(&[(&format!("{}/*", base.display()), Permission::Rw)]);
+
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+
+    block(async {
+        f.mkdir(Request::default(), base_ino, OsStr::new("dir"), 0o2755, 0o22)
+            .await
+            .expect("mkdir of dir succeeds")
+    });
+
+    let mode = std::fs::metadata(base.join("dir"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o7777,
+        0o755,
+        "mkdir must not honor the setuid/setgid bits in the mode"
+    );
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
 /// The open-handle table is capped (AUDIT.md L14): a malicious command
 /// must not be able to grow the FUSE server's memory and host fd usage
 /// without bound. Opening more than `MAX_HANDLES` files fails with ENFILE

@@ -5,6 +5,16 @@
 
 use super::*;
 
+/// The mode mask every *creation* path applies (AUDIT.md H3): the usual
+/// `0o7777` permission bits, minus the setuid/setgid bits (`0o6000`).
+/// The kernel honors setuid/setgid in the `open(O_CREAT)`/`mkdirat` mode
+/// (umask only masks `0777`, and `inode_init_owner` never clears
+/// `S_ISUID`), so passing a `0o4755` through unmasked would create a
+/// setuid binary owned by the invoking user — inert for an unprivileged
+/// ai-bubble, but a setuid-root escalation when ai-bubble runs as root
+/// (e.g. in a container). The `setattr` chmod path applies the same mask.
+pub(super) const SAFE_MODE: libc::mode_t = 0o7777 & !0o6000;
+
 /// [`attr_from_metadata`], for the dirfd-anchored stat results (see
 /// [`anchored`]). `ino` is filled in by the reply sites that know it.
 pub(super) fn attr_from_stat(st: &libc::stat) -> FileAttr {
@@ -999,13 +1009,13 @@ impl Filesystem for HostFs {
             // the sibling denial style above) and otherwise chmod the regular
             // file/directory with the historic flags.
             //
-            // The requested mode is masked to `0o7777` and its setuid/setgid
-            // bits (0o6000) are stripped silently: for an unprivileged user
-            // fchmod cannot set them anyway, but ai-bubble may legitimately
-            // run elevated (root in a container), and then a mode like 0o4755
-            // through the mirror would plant dangerous privilege bits on the
-            // host.
-            let mode = (mode & 0o7777 & !0o6000) as libc::mode_t;
+            // The requested mode is masked with `SAFE_MODE` (`0o7777` with
+            // the setuid/setgid bits (0o6000) stripped silently): for an
+            // unprivileged user fchmod cannot set them anyway, but ai-bubble
+            // may legitimately run elevated (root in a container), and then
+            // a mode like 0o4755 through the mirror would plant dangerous
+            // privilege bits on the host.
+            let mode = (mode & SAFE_MODE) as libc::mode_t;
             if unsafe { libc::fchmodat(dirfd, name, mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
                 let err = std::io::Error::last_os_error();
                 match err.raw_os_error() {
@@ -1104,7 +1114,9 @@ impl Filesystem for HostFs {
             libc::mkdirat(
                 anchored.dir().as_raw_fd(),
                 anchored.name().as_ptr(),
-                (mode & 0o7777) as libc::mode_t,
+                // AUDIT.md H3: `SAFE_MODE` strips the setuid/setgid bits —
+                // the kernel honors them in `mkdirat`'s mode.
+                (mode & SAFE_MODE) as libc::mode_t,
             )
         };
         if rc != 0 {
@@ -1622,7 +1634,8 @@ impl Filesystem for HostFs {
             oflags |= libc::O_APPEND;
         }
         let file =
-            match anchored::open_at(&self.root, &real, oflags, (mode & 0o7777) as libc::mode_t) {
+            match anchored::open_at(&self.root, &real, oflags, (mode & SAFE_MODE) as libc::mode_t)
+            {
                 Ok(f) => f,
                 Err(e) => {
                     log_op_err("create-new", &mirrored, Some(&real), &e).await;
