@@ -26,6 +26,9 @@ use std::process::exit;
 use std::sync::OnceLock;
 
 use crate::spec::internal::{Op, SeccompPolicy, SeccompViolation};
+
+#[cfg(test)]
+use crate::spec::internal::SocketGate;
 use crate::spec::rlimits::Rlimits;
 use crate::spec::tmpfs::TmpfsPerms;
 
@@ -1261,12 +1264,28 @@ fn apply_seccomp(policy: &SeccompPolicy) {
         (SeccompAction::Allow, deny)
     };
 
-    // Unix-domain sockets are denied unless the spec opted in via
-    // `net.*.unix_sockets` (AUDIT.md M3: abstract-namespace sockets live
-    // in the network namespace, so host-network mode would otherwise
-    // expose the D-Bus system bus, `systemd --user`, ... to the command).
+    // Dangerous address families are denied unless the spec opted in
+    // via `net.*.unix_sockets`/`netlink`/`vsock`/`bluetooth` (AUDIT.md
+    // M3):
+    //
+    // - AF_UNIX: abstract-namespace sockets live in the network
+    //   namespace, so host-network mode would otherwise expose the
+    //   D-Bus system bus, `systemd --user`, ... to the command.
+    // - AF_NETLINK: unprivileged NETLINK_ROUTE/SOCK_DIAG hand the
+    //   command the host's network state and unix-socket inventory
+    //   (reconnaissance), and netlink is a recurring kernel-CVE area.
+    // - AF_VSOCK: creation is unprivileged and vsock is *not*
+    //   network-namespaced — on VMs the command could reach
+    //   host/hypervisor vsock services (e.g. CID 2).
+    // - AF_BLUETOOTH: unprivileged-creatable; usable to the extent the
+    //   stack allows.
+    //
+    // AF_INET/AF_INET6 are deliberately not gated (that is the point
+    // of host networking); AF_PACKET needs no gate either (packet
+    // sockets require CAP_NET_RAW, which the command never has).
+    //
     // socket(2) and socketpair(2) take the address family as a *value*
-    // argument, so seccomp can gate them on `domain == AF_UNIX` without
+    // argument, so seccomp can gate them on `domain == AF_xxx` without
     // dereferencing anything (unlike connect(2), whose address is behind
     // a pointer). io_uring_setup is denied outright, because
     // IORING_OP_SOCKET creates sockets without going through socket(2).
@@ -1281,19 +1300,30 @@ fn apply_seccomp(policy: &SeccompPolicy) {
     // 64-bit process issuing `int $0x80` gets the *ia32* syscall table
     // while seccomp still sees AUDIT_ARCH_X86_64 — ia32 `socketcall` is
     // number 102, which this filter interprets as `getuid` (ungated), so
-    // AF_UNIX sockets can be created that way. No seccomp rule can close
-    // this (the arch check passes and the number is ambiguous); the gate
-    // is best-effort there. Host-network mode must be treated as full
-    // local IPC for untrusted commands — see the module docs in
-    // `spec/seccomp.rs` and the README's "Unix-domain sockets" section.
-    if !policy.unix_sockets() {
+    // sockets in any gated family can be created that way. No seccomp
+    // rule can close this (the arch check passes and the number is
+    // ambiguous); the gate is best-effort there. Host-network mode must
+    // be treated as full local IPC for untrusted commands — see the
+    // module docs in `spec/seccomp.rs` and the README's "Unix-domain
+    // sockets" section.
+    let sockets = policy.sockets();
+    let denied: Vec<(u64, &str)> = [
+        (libc::AF_UNIX as u64, "unix_sockets", sockets.unix_sockets),
+        (libc::AF_NETLINK as u64, "netlink", sockets.netlink),
+        (libc::AF_VSOCK as u64, "vsock", sockets.vsock),
+        (libc::AF_BLUETOOTH as u64, "bluetooth", sockets.bluetooth),
+    ]
+    .iter()
+    .filter(|&&(_, _, allowed)| !allowed)
+    .map(|&(family, flag, _)| (family, flag))
+    .collect();
+    if !denied.is_empty() {
         use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
-        let af_unix = libc::AF_UNIX as u64;
-        let af_unix_rule = |op: SeccompCmpOp| {
-            let cond = SeccompCondition::new(0, SeccompCmpArgLen::Dword, op, af_unix)
-                .unwrap_or_else(|e| die(&format!("Can't compile the AF_UNIX condition: {e}")));
+        let deny_rule = |family: u64, op: SeccompCmpOp| {
+            let cond = SeccompCondition::new(0, SeccompCmpArgLen::Dword, op, family)
+                .unwrap_or_else(|e| die(&format!("Can't compile the AF_* condition: {e}")));
             SeccompRule::new(vec![cond])
-                .unwrap_or_else(|e| die(&format!("Can't compile the AF_UNIX rule: {e}")))
+                .unwrap_or_else(|e| die(&format!("Can't compile the AF_* rule: {e}")))
         };
         let allowlist = policy.is_allowlist();
         for nr in [syscalls::Sysno::socket as i64, syscalls::Sysno::socketpair as i64] {
@@ -1301,12 +1331,30 @@ fn apply_seccomp(policy: &SeccompPolicy) {
                 Some(existing) => {
                     if allowlist {
                         // The allowlist lists the syscall; narrow it to
-                        // "everything but AF_UNIX": a matching rule yields
-                        // Allow, AF_UNIX falls to the mismatch action.
-                        rules.insert(nr, vec![af_unix_rule(SeccompCmpOp::Ne)]);
+                        // "everything but the denied families": a
+                        // rule matching none of them yields Allow
+                        // (conditions within a rule are ANDed), any
+                        // denied family falls to the mismatch action.
+                        let conds = denied
+                            .iter()
+                            .map(|&(family, _)| {
+                                SeccompCondition::new(
+                                    0,
+                                    SeccompCmpArgLen::Dword,
+                                    SeccompCmpOp::Ne,
+                                    family,
+                                )
+                                .unwrap_or_else(|e| {
+                                    die(&format!("Can't compile the AF_* condition: {e}"))
+                                })
+                            })
+                            .collect();
+                        let rule = SeccompRule::new(conds)
+                            .unwrap_or_else(|e| die(&format!("Can't compile the AF_* rule: {e}")));
+                        rules.insert(nr, vec![rule]);
                     } else {
                         // The blocklist denies it unconditionally; that
-                        // stands (and covers AF_UNIX).
+                        // stands (and covers every family).
                         rules.insert(nr, existing);
                     }
                 }
@@ -1314,9 +1362,13 @@ fn apply_seccomp(policy: &SeccompPolicy) {
                     if allowlist {
                         // Absent from the allowlist: already denied.
                     } else {
-                        // Deny only AF_UNIX dials; other families fall to
-                        // the mismatch action (Allow).
-                        rules.insert(nr, vec![af_unix_rule(SeccompCmpOp::Eq)]);
+                        // Deny only the gated families; everything
+                        // else (AF_INET, ...) falls to the mismatch
+                        // action (Allow). Rules are ORed.
+                        rules.insert(
+                            nr,
+                            denied.iter().map(|&(family, _)| deny_rule(family, SeccompCmpOp::Eq)).collect(),
+                        );
                     }
                 }
             }

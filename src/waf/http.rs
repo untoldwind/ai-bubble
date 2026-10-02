@@ -132,7 +132,13 @@ impl Proxy {
             Ok(host) => host,
             Err(_) => return empty_response(StatusCode::BAD_REQUEST),
         };
-        parts.headers.entry(hyper::header::HOST).or_insert(host);
+        // `insert`, not `or_insert` (AUDIT.md finding M2): an
+        // attacker-supplied `Host` header must never survive. The dialed
+        // authority decides where the request goes (the allow-list
+        // checked *that*), so the forwarded request must name it too —
+        // otherwise shared infrastructure could route the request
+        // elsewhere via the original `Host`.
+        parts.headers.insert(hyper::header::HOST, host);
 
         let (mut sender, conn) =
             match hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await {
@@ -246,9 +252,8 @@ mod tests {
     /// connector -> a TCP echo server, with the request replayed there.
     #[tokio::test]
     async fn end_to_end_http_proxy() {
-        // "Server": echoes a fixed response after the request head; the
-        // replayed request must carry the rewritten (origin-form) request
-        // line.
+        // "Server": echoes the request head inside the response body, so
+        // the test can assert exactly what the upstream received.
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
         tokio::spawn(async move {
@@ -265,13 +270,19 @@ mod tests {
                             Ok(n) => buf.extend_from_slice(&chunk[..n]),
                         }
                     }
-                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let head = String::from_utf8_lossy(&buf).to_string();
                     assert!(
-                        text.starts_with("GET /path?x=1 HTTP/1.1\r\n"),
-                        "replayed head: {text:?}"
+                        head.starts_with("GET /path?x=1 HTTP/1.1\r\n"),
+                        "replayed head: {head:?}"
                     );
                     let _ = s
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{head}",
+                                head.len()
+                            )
+                            .as_bytes(),
+                        )
                         .await;
                 });
             }
@@ -307,6 +318,40 @@ mod tests {
         let mut resp = Vec::new();
         c.read_to_end(&mut resp).await.unwrap();
         assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let body = String::from_utf8_lossy(&resp).to_string();
+        let body = body.split("\r\n\r\n").nth(1).expect("echo body");
+        assert!(
+            body.contains(&format!("host: 127.0.0.1:{}", echo_addr.port())),
+            "replayed Host must be the dialed authority: {body:?}"
+        );
+
+        // HTTP-level fronting (AUDIT.md M2): an attacker-supplied `Host`
+        // header must be overwritten with the dialed authority — the
+        // allow-list checked the URI's target, and shared infrastructure
+        // would route by the `Host` header instead.
+        let mut c = TcpStream::connect(http_addr).await.unwrap();
+        c.write_all(
+            format!(
+                "GET http://127.0.0.1:{}/path?x=1 HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+                echo_addr.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut resp = Vec::new();
+        c.read_to_end(&mut resp).await.unwrap();
+        assert!(resp.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let body = String::from_utf8_lossy(&resp).to_string();
+        let body = body.split("\r\n\r\n").nth(1).expect("echo body");
+        assert!(
+            body.contains(&format!("host: 127.0.0.1:{}", echo_addr.port())),
+            "replayed Host must be the dialed authority: {body:?}"
+        );
+        assert!(
+            !body.to_ascii_lowercase().contains("evil.example"),
+            "attacker-supplied Host must not survive: {body:?}"
+        );
 
         // Denied targets get a 403 (empty allow list).
         let dir2 = std::env::temp_dir().join(format!("ai-bubble-waf-http2-{}", std::process::id()));

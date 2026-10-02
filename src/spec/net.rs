@@ -17,14 +17,31 @@ use schemars::JsonSchema;
 ///   resolve allow-listed names to 127.0.0.2 and forward the traffic
 ///   from the host side over a Unix socket.
 ///
-/// Host mode carries `unix_sockets` (default `false`): whether the
-/// command may create Unix-domain sockets. Off by default — Unix
-/// sockets are a local-IPC escape hatch (abstract-namespace sockets
-/// like the D-Bus system bus live in the *network namespace*, so
-/// host-network mode without this default would expose them to an
-/// untrusted command; see AUDIT.md M3). Proxy/waf modes run in a fresh
-/// network namespace, where the abstract-socket exposure does not
-/// exist, and always allow Unix-domain sockets.
+/// Host mode carries four opt-in flags (all default `false`) for the
+/// address families that are *not* the point of host networking and are
+/// dangerous by default:
+///
+/// - `unix_sockets` (default `false`): whether the command may create
+///   Unix-domain sockets. Off by default — Unix sockets are a
+///   local-IPC escape hatch (abstract-namespace sockets like the D-Bus
+///   system bus live in the *network namespace*, so host-network mode
+///   without this default would expose them to an untrusted command;
+///   see AUDIT.md M3).
+/// - `netlink` (default `false`): whether the command may create
+///   netlink sockets. Unprivileged `NETLINK_ROUTE`/`NETLINK_SOCK_DIAG`
+///   hand the command the host's network state and unix-socket
+///   inventory (reconnaissance), and the netlink surface is a
+///   recurring kernel-CVE area (AUDIT.md M3).
+/// - `vsock` (default `false`): whether the command may create
+///   AF_VSOCK sockets. Socket creation is unprivileged and vsock is
+///   *not* network-namespaced, so on VMs the command could connect to
+///   host/hypervisor vsock services (e.g. CID 2) (AUDIT.md M3).
+/// - `bluetooth` (default `false`): whether the command may create
+///   AF_BLUETOOTH sockets (AUDIT.md M3).
+///
+/// Proxy/waf modes run in a fresh network namespace, where the
+/// abstract-socket exposure does not exist, and always allow all four
+/// families.
 #[derive(Debug, PartialEq, Deserialize, Clone, JsonSchema)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum NetConfig {
@@ -36,6 +53,21 @@ pub enum NetConfig {
         /// which can create sockets without `socket(2)`).
         #[serde(default)]
         unix_sockets: bool,
+        /// Whether the command may create netlink sockets. Off by
+        /// default: unprivileged netlink exposes the host's network
+        /// state (reconnaissance) and is a recurring kernel-CVE area.
+        #[serde(default)]
+        netlink: bool,
+        /// Whether the command may create AF_VSOCK sockets. Off by
+        /// default: creation is unprivileged and vsock is not
+        /// network-namespaced, so on VMs the command could reach
+        /// host/hypervisor vsock services.
+        #[serde(default)]
+        vsock: bool,
+        /// Whether the command may create AF_BLUETOOTH sockets. Off by
+        /// default.
+        #[serde(default)]
+        bluetooth: bool,
     },
     /// Run the command in a fresh network namespace and proxy its
     /// connections from the host side.
@@ -72,9 +104,14 @@ pub enum NetConfig {
 }
 
 impl Default for NetConfig {
-    /// Host mode, Unix-domain sockets denied (the safe default).
+    /// Host mode, every dangerous family denied (the safe default).
     fn default() -> Self {
-        NetConfig::Host { unix_sockets: false }
+        NetConfig::Host {
+            unix_sockets: false,
+            netlink: false,
+            vsock: false,
+            bluetooth: false,
+        }
     }
 }
 
@@ -85,7 +122,37 @@ impl NetConfig {
     /// allow them.
     pub fn unix_sockets(&self) -> bool {
         match self {
-            NetConfig::Host { unix_sockets } => *unix_sockets,
+            NetConfig::Host { unix_sockets, .. } => *unix_sockets,
+            NetConfig::Proxy { .. } | NetConfig::Waf { .. } => true,
+        }
+    }
+
+    /// Whether the sandboxed command may create netlink sockets (the
+    /// spec's `net.host.netlink`, default `false`; isolated modes
+    /// always allow).
+    pub fn netlink(&self) -> bool {
+        match self {
+            NetConfig::Host { netlink, .. } => *netlink,
+            NetConfig::Proxy { .. } | NetConfig::Waf { .. } => true,
+        }
+    }
+
+    /// Whether the sandboxed command may create AF_VSOCK sockets (the
+    /// spec's `net.host.vsock`, default `false`; isolated modes always
+    /// allow).
+    pub fn vsock(&self) -> bool {
+        match self {
+            NetConfig::Host { vsock, .. } => *vsock,
+            NetConfig::Proxy { .. } | NetConfig::Waf { .. } => true,
+        }
+    }
+
+    /// Whether the sandboxed command may create AF_BLUETOOTH sockets
+    /// (the spec's `net.host.bluetooth`, default `false`; isolated
+    /// modes always allow).
+    pub fn bluetooth(&self) -> bool {
+        match self {
+            NetConfig::Host { bluetooth, .. } => *bluetooth,
             NetConfig::Proxy { .. } | NetConfig::Waf { .. } => true,
         }
     }
@@ -161,8 +228,55 @@ mod tests {
     #[test]
     fn host_mode_is_default() {
         let spec = parse("{}");
-        assert_eq!(spec.net, NetConfig::Host { unix_sockets: false });
         assert_eq!(spec.net, NetConfig::default());
+        assert!(!spec.net.unix_sockets());
+        assert!(!spec.net.netlink());
+        assert!(!spec.net.vsock());
+        assert!(!spec.net.bluetooth());
+    }
+
+    #[test]
+    fn dangerous_families_are_denied_by_default_in_host_mode() {
+        // AUDIT.md M3: besides AF_UNIX, the other dangerous-but
+        // unprivileged-creatable families (netlink, vsock, bluetooth)
+        // are denied by default in host mode and need an explicit opt-in.
+        for json in [
+            r#"{ "net": { "mode": "host", "netlink": true } }"#,
+            r#"{ "net": { "mode": "host", "vsock": true } }"#,
+            r#"{ "net": { "mode": "host", "bluetooth": true } }"#,
+        ] {
+            let spec = parse(json);
+            assert!(!spec.net.unix_sockets(), "{json}: AF_UNIX stays denied");
+        }
+        let spec = parse(r#"{ "net": { "mode": "host", "netlink": true } }"#);
+        assert!(spec.net.netlink(), "netlink opt-in must allow AF_NETLINK");
+        assert!(!spec.net.vsock(), "netlink opt-in must not touch vsock");
+        let spec = parse(r#"{ "net": { "mode": "host", "vsock": true } }"#);
+        assert!(spec.net.vsock(), "vsock opt-in must allow AF_VSOCK");
+        let spec = parse(r#"{ "net": { "mode": "host", "bluetooth": true } }"#);
+        assert!(spec.net.bluetooth(), "bluetooth opt-in must allow AF_BLUETOOTH");
+        // The isolated modes always allow all four (their network
+        // namespace already isolates the namespace-scoped families).
+        for json in [
+            r#"{ "net": { "mode": "proxy", "allow": ["example.com"] } }"#,
+            r#"{ "net": { "mode": "waf", "allow": ["example.com"] } }"#,
+        ] {
+            let spec = parse(json);
+            assert!(spec.net.netlink(), "{json} must allow AF_NETLINK");
+            assert!(spec.net.vsock(), "{json} must allow AF_VSOCK");
+            assert!(spec.net.bluetooth(), "{json} must allow AF_BLUETOOTH");
+        }
+        // ...and reject the meaningless flags there.
+        for json in [
+            r#"{ "net": { "mode": "proxy", "allow": [], "netlink": true } }"#,
+            r#"{ "net": { "mode": "waf", "allow": [], "vsock": true } }"#,
+            r#"{ "net": { "mode": "waf", "allow": [], "bluetooth": false } }"#,
+        ] {
+            assert!(
+                super::super::tests::parse_err(json).is_some(),
+                "{json} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -211,9 +325,20 @@ mod tests {
             super::super::tests::parse_err(r#"{ "net": { "mode": "host", "allow": ["x"] } }"#)
                 .is_some()
         );
-        // The only host-mode field is unix_sockets.
-        let spec = parse(r#"{ "net": { "mode": "host", "unix_sockets": true } }"#);
-        assert_eq!(spec.net, NetConfig::Host { unix_sockets: true });
+        // The host-mode family flags are the only fields there.
+        let spec = parse(
+            r#"{ "net": { "mode": "host", "unix_sockets": true, "netlink": false,
+                 "vsock": false, "bluetooth": true } }"#,
+        );
+        assert_eq!(
+            spec.net,
+            NetConfig::Host {
+                unix_sockets: true,
+                netlink: false,
+                vsock: false,
+                bluetooth: true,
+            }
+        );
     }
 
     #[test]
@@ -224,15 +349,29 @@ mod tests {
         // section — the AF_UNIX denial is its only content.
         let compiled = SandboxConfig::compile(&parse("{}"));
         let policy = compiled.seccomp.expect("default must install a filter");
-        assert!(!policy.unix_sockets());
+        assert_eq!(
+            policy.sockets(),
+            &super::super::internal::SocketGate::default(),
+            "default must deny every gated family"
+        );
         assert_eq!(policy.syscalls(), &[] as &[i64], "no extra denies needed");
         assert!(!policy.is_allowlist());
 
-        // Opting in with no seccomp section compiles to no filter at all.
+        // Opting in to every family with no seccomp section compiles to no
+        // filter at all.
         let compiled = SandboxConfig::compile(&parse(
-            r#"{ "net": { "mode": "host", "unix_sockets": true } }"#,
+            r#"{ "net": { "mode": "host", "unix_sockets": true, "netlink": true,
+                 "vsock": true, "bluetooth": true } }"#,
         ));
         assert!(compiled.seccomp.is_none());
+
+        // A partial opt-in (some family still denied) keeps the filter.
+        let compiled = SandboxConfig::compile(&parse(
+            r#"{ "net": { "mode": "host", "unix_sockets": true, "netlink": true } }"#,
+        ));
+        let policy = compiled.seccomp.expect("partial opt-in must keep the filter");
+        assert!(policy.sockets().unix_sockets && policy.sockets().netlink);
+        assert!(!policy.sockets().vsock && !policy.sockets().bluetooth);
 
         // Opting in with a seccomp section keeps that section's policy
         // (with the flag recorded for the sandbox to honor).
@@ -241,13 +380,13 @@ mod tests {
                  "seccomp": { "block": ["ptrace"] } }"#,
         ));
         let policy = compiled.seccomp.expect("seccomp section kept");
-        assert!(policy.unix_sockets());
+        assert!(policy.sockets().unix_sockets);
         assert_eq!(policy.syscalls(), &[syscalls::Sysno::ptrace as i64]);
 
         // And a seccomp section without the opt-in keeps the denial.
         let compiled = SandboxConfig::compile(&parse(r#"{ "seccomp": { "block": ["ptrace"] } }"#));
         let policy = compiled.seccomp.expect("seccomp section kept");
-        assert!(!policy.unix_sockets());
+        assert!(!policy.sockets().unix_sockets);
 
         // The isolated modes always allow AF_UNIX: no flag, no filter
         // unless the spec configures a seccomp section.
@@ -265,7 +404,7 @@ mod tests {
     fn empty_spec_is_default() {
         let spec = parse("{}");
         assert_eq!(spec, crate::spec::Spec::default());
-        assert_eq!(spec.net, NetConfig::Host { unix_sockets: false });
+        assert_eq!(spec.net, NetConfig::default());
         assert_eq!(spec.hostfs.mappings.len(), 0);
     }
 }

@@ -126,7 +126,7 @@ fn seccomp_blocklist_denies_listed_syscalls() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![syscalls::Sysno::getpid as i64],
                 on_violation: SeccompViolation::Errno,
-                unix_sockets: true,
+                sockets: SocketGate { unix_sockets: true, ..SocketGate::default() },
             };
             apply_seccomp(&policy);
             // Raw syscalls: the seccomp ERRNO action makes the raw
@@ -152,7 +152,7 @@ fn seccomp_allowlist_permits_only_listed_syscalls() {
                     syscalls::Sysno::exit_group as i64,
                 ],
                 on_violation: SeccompViolation::Errno,
-                unix_sockets: true,
+                sockets: SocketGate { unix_sockets: true, ..SocketGate::default() },
             };
             apply_seccomp(&policy);
             if libc::syscall(libc::SYS_getpid) >= 0 && libc::syscall(libc::SYS_getuid) == -1 {
@@ -174,7 +174,7 @@ fn unix_sockets_are_denied_unless_opted_in() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![],
                 on_violation: SeccompViolation::Errno,
-                unix_sockets: false,
+                sockets: SocketGate { unix_sockets: false, ..SocketGate::default() },
             };
             apply_seccomp(&policy);
             let unix_fd =
@@ -203,7 +203,7 @@ fn unix_sockets_are_denied_unless_opted_in() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![],
                 on_violation: SeccompViolation::Errno,
-                unix_sockets: true,
+                sockets: SocketGate { unix_sockets: true, ..SocketGate::default() },
             };
             apply_seccomp(&policy);
             let fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -229,7 +229,7 @@ fn unix_socket_denial_narrows_an_allowlist() {
                     syscalls::Sysno::exit_group as i64,
                 ],
                 on_violation: SeccompViolation::Errno,
-                unix_sockets: false,
+                sockets: SocketGate { unix_sockets: false, ..SocketGate::default() },
             };
             apply_seccomp(&policy);
             let unix_fd =
@@ -256,7 +256,7 @@ fn unix_socket_denial_survives_garbage_upper_argument_bits() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![],
                 on_violation: SeccompViolation::Errno,
-                unix_sockets: false,
+                sockets: SocketGate { unix_sockets: false, ..SocketGate::default() },
             };
             apply_seccomp(&policy);
             let mangled_unix =
@@ -289,7 +289,7 @@ fn unix_socket_denial_survives_garbage_upper_argument_bits() {
                     syscalls::Sysno::exit_group as i64,
                 ],
                 on_violation: SeccompViolation::Errno,
-                unix_sockets: false,
+                sockets: SocketGate { unix_sockets: false, ..SocketGate::default() },
             };
             apply_seccomp(&policy);
             let mangled_unix =
@@ -304,6 +304,109 @@ fn unix_socket_denial_survives_garbage_upper_argument_bits() {
 }
 
 #[test]
+fn dangerous_families_are_denied_unless_opted_in() {
+    // Regression for AUDIT.md M3: besides AF_UNIX, the other
+    // unprivileged-creatable-but-dangerous families (AF_NETLINK,
+    // AF_VSOCK, AF_BLUETOOTH) are denied by the default gate, while
+    // AF_INET (the point of host networking) keeps working. Each
+    // family has its own opt-in flag: allowing one must not open the
+    // others.
+    let denied = |family: libc::c_int| -> libc::c_int {
+        // Run in a forked child: the filter cannot be removed, so each
+        // case needs a fresh process.
+        unsafe {
+            run_in_child(|| {
+                let policy = SeccompPolicy::Block {
+                    syscalls: vec![],
+                    on_violation: SeccompViolation::Errno,
+                    sockets: SocketGate::default(),
+                };
+                apply_seccomp(&policy);
+                let fd = libc::syscall(libc::SYS_socket, family, libc::SOCK_STREAM, 0);
+                if fd == -1 {
+                    libc::_exit(0);
+                }
+                libc::_exit(1);
+            })
+        }
+    };
+    for (family, name) in [
+        (libc::AF_UNIX, "AF_UNIX"),
+        (libc::AF_NETLINK, "AF_NETLINK"),
+        (libc::AF_VSOCK, "AF_VSOCK"),
+        (libc::AF_BLUETOOTH, "AF_BLUETOOTH"),
+    ] {
+        assert_eq!(
+            denied(family),
+            0,
+            "{name} must be denied by the default socket gate"
+        );
+    }
+
+    // The per-family opt-in opens exactly its family. (This case is
+    // inlined rather than parameterized: the "allowed" assertion needs
+    // a positive fd check, and AF_INET doubles as the control.)
+    let code = unsafe {
+        run_in_child(|| {
+            let policy = SeccompPolicy::Block {
+                syscalls: vec![],
+                on_violation: SeccompViolation::Errno,
+                sockets: SocketGate { netlink: true, ..SocketGate::default() },
+            };
+            apply_seccomp(&policy);
+            let netlink = libc::syscall(
+                libc::SYS_socket,
+                libc::AF_NETLINK,
+                libc::SOCK_RAW,
+                libc::NETLINK_GENERIC,
+            );
+            let unix_fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let vsock = libc::syscall(libc::SYS_socket, libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+            if netlink >= 0 && unix_fd == -1 && vsock == -1 {
+                libc::close(netlink as libc::c_int);
+                libc::_exit(0);
+            }
+        })
+    };
+    assert_eq!(
+        code, 0,
+        "the netlink opt-in must allow AF_NETLINK and only AF_NETLINK"
+    );
+}
+
+#[test]
+fn socket_gate_narrows_an_allowlist_for_every_dangerous_family() {
+    // An allowlist that lists socket(2) is narrowed to "everything but
+    // the gated families" — all four of them, not just AF_UNIX.
+    let code = unsafe {
+        run_in_child(|| {
+            let policy = SeccompPolicy::Allow {
+                syscalls: vec![
+                    syscalls::Sysno::socket as i64,
+                    syscalls::Sysno::exit_group as i64,
+                ],
+                on_violation: SeccompViolation::Errno,
+                sockets: SocketGate::default(),
+            };
+            apply_seccomp(&policy);
+            let inet_fd = libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
+            let unix_fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let netlink = libc::syscall(libc::SYS_socket, libc::AF_NETLINK, libc::SOCK_RAW, 0);
+            let vsock = libc::syscall(libc::SYS_socket, libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+            let bluetooth = libc::syscall(libc::SYS_socket, libc::AF_BLUETOOTH, libc::SOCK_STREAM, 0);
+            if inet_fd >= 0 && unix_fd == -1 && netlink == -1 && vsock == -1 && bluetooth == -1 {
+                libc::close(inet_fd as libc::c_int);
+                libc::_exit(0);
+            }
+        })
+    };
+    assert_eq!(
+        code, 0,
+        "allowlist with socket(2) must deny every gated family"
+    );
+}
+
+#[test]
 fn seccomp_kill_on_violation_kills_the_process() {
     // With on_violation=kill the denied syscall raises SIGSYS: the
     // child dies by signal instead of observing an error.
@@ -315,7 +418,7 @@ fn seccomp_kill_on_violation_kills_the_process() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![syscalls::Sysno::getpid as i64],
                 on_violation: SeccompViolation::Kill,
-                unix_sockets: true,
+                sockets: SocketGate { unix_sockets: true, ..SocketGate::default() },
             };
             apply_seccomp(&policy);
             let _ = libc::getpid();

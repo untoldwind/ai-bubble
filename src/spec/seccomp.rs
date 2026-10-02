@@ -69,18 +69,19 @@
 //! correspond to syscalls the allowlist also denies).
 //!
 //! **One exception is an immediate breakout, not surface exposure** (see
-//! AUDIT.md H2): the AF_UNIX gate installed for host-network mode
-//! (`net.*.unix_sockets: false`, the default) relies on denying x86_64
+//! AUDIT.md H2): the socket gate installed for host-network mode (the
+//! `net.host.unix_sockets`/`netlink`/`vsock`/`bluetooth` family flags,
+//! all denied by default — AUDIT.md M3) relies on denying x86_64
 //! `socket`/`socketpair`. ia32 `socketcall` is syscall **102**, which the
 //! filter sees as x86_64 `getuid` — a syscall nothing can afford to deny.
-//! `int $0x80; <ia32 socketcall>` therefore creates `AF_UNIX` sockets in
-//! both blocklist and allowlist modes, and *no* seccomp rule can close
-//! the hole: the arch check passes (the task reports `AUDIT_ARCH_X86_64`)
-//! and the syscall *number* is genuinely ambiguous between the two
-//! tables. On kernels with `CONFIG_IA32_EMULATION` (the common distro
-//! default) the AF_UNIX gate is best-effort only — host-network mode must
-//! be treated as full local IPC for untrusted commands; use proxy/waf
-//! mode instead.
+//! `int $0x80; <ia32 socketcall>` therefore creates sockets in any gated
+//! family in both blocklist and allowlist modes, and *no* seccomp rule can
+//! close the hole: the arch check passes (the task reports
+//! `AUDIT_ARCH_X86_64`) and the syscall *number* is genuinely ambiguous
+//! between the two tables. On kernels with `CONFIG_IA32_EMULATION` (the
+//! common distro default) the socket gate is best-effort only —
+//! host-network mode must be treated as full local IPC for untrusted
+//! commands; use proxy/waf mode instead.
 
 use std::sync::LazyLock;
 

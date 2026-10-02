@@ -531,31 +531,58 @@ covers both abstract-namespace sockets (`@/run/dbus/system_bus_socket`
 and friends, see the warning above) and filesystem sockets (e.g. under a
 mapped `/run`) — plus `io_uring_setup`, which can create sockets without
 going through `socket(2)`. TCP/UDP (`AF_INET`/`AF_INET6`) are unaffected,
-so host networking keeps working. If the spec also configures a
-`seccomp` section, the denial is merged into it: a blocklist keeps its
-unconditional entries, and an allowlist that lists `socket`/
-`socketpair` is narrowed to non-`AF_UNIX` domains (an allowlist without
-them was already denying everything). Set `"unix_sockets": true` only if
-the command genuinely needs local IPC — it re-opens the local-IPC escape
-hatch described above.
+so host networking keeps working.
+
+The same filter denies the other address families that are
+unprivileged-creatable but have no business in a sandbox
+(AUDIT.md M3), each with its own opt-in flag:
+
+| Family | Flag (default) | Why it is denied by default |
+| --- | --- | --- |
+| `AF_UNIX` | `unix_sockets` (`false`) | local-IPC escape hatch (see above) |
+| `AF_NETLINK` | `netlink` (`false`) | unprivileged `NETLINK_ROUTE`/`NETLINK_SOCK_DIAG` expose the host's network state and unix-socket inventory (reconnaissance), and netlink is a recurring kernel-CVE area |
+| `AF_VSOCK` | `vsock` (`false`) | creation is unprivileged and vsock is *not* network-namespaced — on VMs the command could reach host/hypervisor vsock services (e.g. CID 2) |
+| `AF_BLUETOOTH` | `bluetooth` (`false`) | unprivileged-creatable; usable to the extent the stack allows |
+
+```json
+{ "net": { "mode": "host", "netlink": true } }
+```
+
+What the filter deliberately does *not* close in host mode:
+
+- `AF_INET`/`AF_INET6`: that is the point of host networking — every
+  service bound on host `127.0.0.1`/`::1` (dev servers, databases,
+  docker-over-TCP) is fully reachable. The family flags above do
+  nothing about this; do not over-trust them.
+- `AF_PACKET`: nothing to do — packet sockets require `CAP_NET_RAW`,
+  which the command never has.
+
+If the spec also configures a `seccomp` section, the denials are merged
+into it: a blocklist keeps its unconditional entries, and an allowlist
+that lists `socket`/`socketpair` is narrowed to non-gated domains (an
+allowlist without them was already denying everything). Set any flag to
+`true` only if the command genuinely needs that family — each flag
+re-opens exactly its family's exposure.
 
 > **⚠️ Best-effort on kernels with IA32 emulation (AUDIT.md H2).** On a
 > kernel built with `CONFIG_IA32_EMULATION` (the common distro default),
 > a 64-bit process can issue `int $0x80` and reach the *ia32* syscall
 > table while seccomp still reports the x86_64 architecture: ia32
 > `socketcall` is syscall 102, which the filter can only interpret as
-> x86_64 `getuid` — a syscall that cannot be denied — so AF_UNIX sockets
-> remain creatable despite this default. No seccomp rule can distinguish
-> the case, because the syscall *number* is genuinely ambiguous. With
-> IA32 emulation the AF_UNIX gate is therefore best-effort, and
-> host-network mode must be treated as **full local IPC** for untrusted
-> commands: prefer `"mode": "proxy"` or `"mode": "waf"` there. Kernels
-> without IA32 emulation get the full protection described above.
+> x86_64 `getuid` — a syscall that cannot be denied — so sockets in any
+> gated family (`AF_UNIX` *and* `AF_NETLINK`/`AF_VSOCK`/`AF_BLUETOOTH`)
+> remain creatable despite these defaults. No seccomp rule can
+> distinguish the case, because the syscall *number* is genuinely
+> ambiguous. With IA32 emulation the socket gate is therefore
+> best-effort, and host-network mode must be treated as **full local
+> IPC** for untrusted commands: prefer `"mode": "proxy"` or `"mode":
+> "waf"` there. Kernels without IA32 emulation get the full protection
+> described above.
 
 In proxy/waf mode the command runs in a fresh network namespace, where
 the abstract-socket exposure does not exist (the namespace's socket
 names are its own); Unix-domain sockets are always allowed there, and
-the flag (like `allow`) is rejected in those modes.
+the family flags (like `allow`) are rejected in those modes.
 
 Standard tools automatically use the proxy, because the sandbox sets the
 following variables in its (isolated) environment — entries from the
@@ -600,8 +627,12 @@ just resolve a name and connect) are redirected transparently:
   resolves to `127.0.0.2`; anything else gets NXDOMAIN.
 * **HTTPS** on `127.0.0.2:443`: reads the TLS ClientHello, extracts the
   SNI and terminates the TLS session itself with a certificate forged
-  for exactly that SNI (see below). The decrypted plaintext is tunneled
-  to `<sni>:443` on the host, where the host performs the *real* TLS
+  for exactly that SNI (see below). The decrypted plaintext is parsed as
+  HTTP by the in-sandbox server (it is *not* a raw tunnel): every
+  request's `Host` header must name the same host the SNI did — a
+  mismatch is refused with a 400 and never reaches the upstream — and
+  each request is forwarded to `<sni>:443` on the host with that dialed
+  authority as the `Host` header, where the host performs the *real* TLS
   handshake — with the genuine endpoint and proper certificate
   verification, since the sandbox has no real trust anchors by design.
   Connections without a SNI are dropped.
@@ -632,8 +663,12 @@ Note the inherent limit of TCP-layer allow-listing (both modes): a
 `host:port` entry cannot distinguish *domains* served by shared
 infrastructure — `CONNECT allowed.com:443` with a TLS SNI or HTTP
 `Host:` header of `evil.com` on the same CDN reaches the disallowed
-domain (domain fronting). The waf mode exists precisely to close this:
-it sees the plaintext (SNI/`Host`) before anything is dialed.
+domain (domain fronting). The waf mode closes this on both layers: it
+matches the TLS SNI against the allow-list before anything is dialed,
+and — because it terminates TLS — it also compares the decrypted
+request's `Host` header against the SNI on every request (HTTP-level
+fronting gets a 400), and rewrites the `Host` of forwarded requests to
+the dialed authority.
 
 The same namespace/process tree is used as in proxy mode; only the
 in-sandbox listeners differ. No proxy variables are set in the

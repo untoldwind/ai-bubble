@@ -37,26 +37,56 @@ impl From<Violation> for SeccompViolation {
     }
 }
 
+/// The address families the sandboxed command may create sockets for,
+/// compiled down from the spec's `net.*` opt-in flags. Each is `false`
+/// (deny) by default in host-network mode; the isolated
+/// network-namespace modes always allow (their fresh netns isolates the
+/// namespace-scoped families).
+///
+/// The denial is implemented as argument-gated seccomp rules on
+/// `socket(2)`/`socketpair(2)` in `crate::sandbox::apply_seccomp` (see
+/// AUDIT.md M3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SocketGate {
+    /// Unix-domain sockets (spec `net.host.unix_sockets`).
+    pub unix_sockets: bool,
+    /// Netlink sockets (spec `net.host.netlink`).
+    pub netlink: bool,
+    /// AF_VSOCK sockets (spec `net.host.vsock`).
+    pub vsock: bool,
+    /// AF_BLUETOOTH sockets (spec `net.host.bluetooth`).
+    pub bluetooth: bool,
+}
+
+impl SocketGate {
+    /// Whether every family is allowed (so no socket-gating filter is
+    /// needed at all).
+    pub fn all_allowed(&self) -> bool {
+        self.unix_sockets && self.netlink && self.vsock && self.bluetooth
+    }
+}
+
 /// The seccomp filter to install for the sandboxed command: either an
 /// allowlist (only the listed syscalls are permitted) or a blocklist
 /// (exactly these are denied). Compiled down from the spec's `seccomp`
 /// section, with the syscall names already resolved to numbers.
 ///
-/// Independently of the mode, `unix_sockets` records the spec's
-/// `net.*.unix_sockets` opt-in: when `false` (the default), the sandbox
-/// additionally denies the creation of Unix-domain sockets (see
-/// [`SeccompPolicy::deny_unix_sockets`]).
+/// Independently of the mode, `sockets` records the spec's `net.*`
+/// opt-ins: the families that are *not* opted in (the dangerous
+/// defaults — `SocketGate::default()` denies all four) are denied by
+/// argument-gated rules on `socket(2)`/`socketpair(2)` (see
+/// [`SocketGate`] and [`SeccompPolicy::sockets`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SeccompPolicy {
     Allow {
         syscalls: Vec<i64>,
         on_violation: SeccompViolation,
-        unix_sockets: bool,
+        sockets: SocketGate,
     },
     Block {
         syscalls: Vec<i64>,
         on_violation: SeccompViolation,
-        unix_sockets: bool,
+        sockets: SocketGate,
     },
 }
 
@@ -83,13 +113,11 @@ impl SeccompPolicy {
         matches!(self, SeccompPolicy::Allow { .. })
     }
 
-    /// Whether Unix-domain sockets are allowed (the spec's
-    /// `net.*.unix_sockets`; `false` = deny, the default).
-    pub fn unix_sockets(&self) -> bool {
+    /// The address-family gate this policy carries (see
+    /// [`SocketGate`]).
+    pub fn sockets(&self) -> &SocketGate {
         match self {
-            SeccompPolicy::Allow { unix_sockets, .. } | SeccompPolicy::Block { unix_sockets, .. } => {
-                *unix_sockets
-            }
+            SeccompPolicy::Allow { sockets, .. } | SeccompPolicy::Block { sockets, .. } => sockets,
         }
     }
 }
@@ -124,17 +152,36 @@ pub struct Net {
     /// `NetConfig::Host`'s `unix_sockets` and AUDIT.md M3). Host mode
     /// defaults to denying them; the isolated netns modes always allow.
     pub unix_sockets: bool,
+    /// Whether the command may create netlink sockets (spec
+    /// `net.host.netlink`; AUDIT.md M3). Same defaults as
+    /// `unix_sockets`.
+    pub netlink: bool,
+    /// Whether the command may create AF_VSOCK sockets (spec
+    /// `net.host.vsock`; AUDIT.md M3). Same defaults as `unix_sockets`.
+    pub vsock: bool,
+    /// Whether the command may create AF_BLUETOOTH sockets (spec
+    /// `net.host.bluetooth`; AUDIT.md M3). Same defaults as
+    /// `unix_sockets`.
+    pub bluetooth: bool,
 }
 
 impl From<&NetConfig> for Net {
     fn from(net: &NetConfig) -> Net {
         match net {
-            NetConfig::Host { unix_sockets } => Net {
+            NetConfig::Host {
+                unix_sockets,
+                netlink,
+                vsock,
+                bluetooth,
+            } => Net {
                 isolated: false,
                 mode: NetMode::Proxy,
                 allow: vec![],
                 allow_private: false,
                 unix_sockets: *unix_sockets,
+                netlink: *netlink,
+                vsock: *vsock,
+                bluetooth: *bluetooth,
             },
             NetConfig::Proxy {
                 allow,
@@ -145,8 +192,11 @@ impl From<&NetConfig> for Net {
                 allow: allow.clone(),
                 allow_private: *allow_private,
                 // The fresh network namespace already isolates abstract
-                // sockets; AF_UNIX is always allowed here.
+                // sockets; all four families are always allowed here.
                 unix_sockets: true,
+                netlink: true,
+                vsock: true,
+                bluetooth: true,
             },
             NetConfig::Waf {
                 allow,
@@ -157,6 +207,9 @@ impl From<&NetConfig> for Net {
                 allow: allow.clone(),
                 allow_private: *allow_private,
                 unix_sockets: true,
+                netlink: true,
+                vsock: true,
+                bluetooth: true,
             },
         }
     }
@@ -193,8 +246,8 @@ pub struct SandboxConfig {
     /// The seccomp policy to install for the sandboxed command, compiled
     /// down from the spec's `seccomp` section (with syscall names
     /// resolved to numbers) — or, when the spec configures no filter but
-    /// denies Unix-domain sockets (the default, see `net.*.unix_sockets`
-    /// and AUDIT.md M3), a minimal policy carrying only that denial.
+    /// denies a dangerous address family (the default, see `net.*` and
+    /// AUDIT.md M3), a minimal policy carrying only that denial.
     /// `None` when nothing needs a filter.
     pub seccomp: Option<SeccompPolicy>,
     /// The resource limits (setrlimit) for the sandboxed command,
@@ -218,9 +271,18 @@ impl SandboxConfig {
     /// mounted when the spec says so: a `proc` mapping chooses where (and
     /// whether at all) a fresh procfs instance appears.
     pub fn compile(spec: &Spec) -> SandboxConfig {
+        let net = Net::from(&spec.net);
+        // Compile the family gate from the NetConfig accessors (the
+        // same semantics the isolated modes get from `Net::from`).
+        let sockets = SocketGate {
+            unix_sockets: spec.net.unix_sockets(),
+            netlink: spec.net.netlink(),
+            vsock: spec.net.vsock(),
+            bluetooth: spec.net.bluetooth(),
+        };
         let config = SandboxConfig {
             ops: spec.hostfs.ops(),
-            net: Net::from(&spec.net),
+            net: net.clone(),
             patterns: spec.hostfs.patterns(),
             env: spec
                 .env
@@ -230,7 +292,7 @@ impl SandboxConfig {
                 .expand_cwd()
                 .unwrap_or_else(|e| crate::sandbox::die(&e)),
             audit_log: spec.audit.log.as_deref().map(PathBuf::from),
-            seccomp: compile_seccomp(&spec.seccomp, spec.net.unix_sockets()),
+            seccomp: compile_seccomp(&spec.seccomp, sockets),
             rlimits: spec.rlimits,
         };
         // The rlimits are applied by `mount_and_exec` (crate::sandbox)
@@ -251,16 +313,16 @@ impl SandboxConfig {
 /// error, so a typo is reported like any other spec problem), dedupe
 /// and keep them sorted for deterministic BPF generation. A section
 /// that names neither `allow`, `block` nor a `preset` compiles to no
-/// filter — *unless* the spec denies Unix-domain sockets
-/// (`net.*.unix_sockets`, the default; AUDIT.md M3): that denial is
-/// itself a filter, so one is installed even without a `seccomp`
-/// section. A preset-based section always compiles to a blocklist (the
-/// preset baseline plus `block` entries minus `allow` exceptions, see
-/// [`SeccompConfig::resolved`]).
-fn compile_seccomp(config: &SeccompConfig, unix_sockets: bool) -> Option<SeccompPolicy> {
+/// filter — *unless* the spec denies a dangerous address family (the
+/// `net.*` opt-ins, all denied by default in host mode; AUDIT.md M3):
+/// that denial is itself a filter, so one is installed even without a
+/// `seccomp` section. A preset-based section always compiles to a
+/// blocklist (the preset baseline plus `block` entries minus `allow`
+/// exceptions, see [`SeccompConfig::resolved`]).
+fn compile_seccomp(config: &SeccompConfig, sockets: SocketGate) -> Option<SeccompPolicy> {
     use std::str::FromStr;
     let configured = config.is_configured();
-    if !configured && unix_sockets {
+    if !configured && sockets.all_allowed() {
         return None;
     }
     let (names, allowlist) = if configured {
@@ -284,13 +346,13 @@ fn compile_seccomp(config: &SeccompConfig, unix_sockets: bool) -> Option<Seccomp
         SeccompPolicy::Allow {
             syscalls,
             on_violation,
-            unix_sockets,
+            sockets,
         }
     } else {
         SeccompPolicy::Block {
             syscalls,
             on_violation,
-            unix_sockets,
+            sockets,
         }
     })
 }
