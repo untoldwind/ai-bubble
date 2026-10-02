@@ -246,6 +246,64 @@ fn unix_socket_denial_narrows_an_allowlist() {
 }
 
 #[test]
+fn unix_socket_denial_survives_garbage_upper_argument_bits() {
+    // Regression for AUDIT.md H1: the kernel truncates the `domain`
+    // argument of socket(2)/socketpair(2) to a C `int`, so untrusted code
+    // calling `syscall(SYS_socket, AF_UNIX | (1 << 32), ...)` must still
+    // be denied. A full 64-bit comparison would miss it.
+    let code = unsafe {
+        run_in_child(|| {
+            let policy = SeccompPolicy::Block {
+                syscalls: vec![],
+                on_violation: SeccompViolation::Errno,
+                unix_sockets: false,
+            };
+            apply_seccomp(&policy);
+            let mangled_unix =
+                libc::syscall(libc::SYS_socket, libc::AF_UNIX as u64 | (1u64 << 32),
+                              libc::SOCK_STREAM, 0);
+            let mangled_pair =
+                libc::syscall(libc::SYS_socketpair, libc::AF_UNIX as u64 | (1u64 << 32),
+                              libc::SOCK_STREAM, 0, std::ptr::null_mut::<libc::c_int>());
+            // AF_INET with garbage in the upper bits must still work:
+            // the kernel sees plain AF_INET.
+            let mangled_inet =
+                libc::syscall(libc::SYS_socket, libc::AF_INET as u64 | (1u64 << 32),
+                              libc::SOCK_STREAM, 0);
+            if mangled_unix == -1 && mangled_pair == -1 && mangled_inet >= 0 {
+                libc::close(mangled_inet as libc::c_int);
+                libc::_exit(0);
+            }
+        })
+    };
+    assert_eq!(code, 0, "AF_UNIX must be denied even with garbage upper arg bits");
+
+    // Same in allowlist mode, where socket(2) is listed and narrowed
+    // with a Ne(AF_UNIX) rule: the mangled AF_UNIX call must fall to
+    // the mismatch action (deny), not to Allow.
+    let code = unsafe {
+        run_in_child(|| {
+            let policy = SeccompPolicy::Allow {
+                syscalls: vec![
+                    syscalls::Sysno::socket as i64,
+                    syscalls::Sysno::exit_group as i64,
+                ],
+                on_violation: SeccompViolation::Errno,
+                unix_sockets: false,
+            };
+            apply_seccomp(&policy);
+            let mangled_unix =
+                libc::syscall(libc::SYS_socket, libc::AF_UNIX as u64 | (1u64 << 32),
+                              libc::SOCK_STREAM, 0);
+            if mangled_unix == -1 {
+                libc::_exit(0);
+            }
+        })
+    };
+    assert_eq!(code, 0, "allowlist Ne rule must not be fooled by garbage upper arg bits");
+}
+
+#[test]
 fn seccomp_kill_on_violation_kills_the_process() {
     // With on_violation=kill the denied syscall raises SIGSYS: the
     // child dies by signal instead of observing an error.

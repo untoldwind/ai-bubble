@@ -1270,11 +1270,17 @@ fn apply_seccomp(policy: &SeccompPolicy) {
     // dereferencing anything (unlike connect(2), whose address is behind
     // a pointer). io_uring_setup is denied outright, because
     // IORING_OP_SOCKET creates sockets without going through socket(2).
+    //
+    // The comparison must be Dword (low 32 bits only): the kernel
+    // truncates `domain` to a C `int`, so a raw `syscall(SYS_socket,
+    // AF_UNIX | (1 << 32), ...)` would put garbage in the upper half of
+    // the argument word and slip past a full 64-bit equality check while
+    // the kernel still sees AF_UNIX (AUDIT.md H1).
     if !policy.unix_sockets() {
         use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
         let af_unix = libc::AF_UNIX as u64;
         let af_unix_rule = |op: SeccompCmpOp| {
-            let cond = SeccompCondition::new(0, SeccompCmpArgLen::Qword, op, af_unix)
+            let cond = SeccompCondition::new(0, SeccompCmpArgLen::Dword, op, af_unix)
                 .unwrap_or_else(|e| die(&format!("Can't compile the AF_UNIX condition: {e}")));
             SeccompRule::new(vec![cond])
                 .unwrap_or_else(|e| die(&format!("Can't compile the AF_UNIX rule: {e}")))
