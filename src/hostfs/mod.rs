@@ -982,6 +982,31 @@ impl Filesystem for HostFs {
                 .open_handle(inode);
             return Ok(ReplyOpen { fh: 0, flags: 0 });
         }
+        // An `empty` path is blanked out of the sandbox: like an injected
+        // path it is a purely virtual file (served as empty, never writable,
+        // the host file — which may really exist — is never opened). Without
+        // this check, opening a real host file under an `empty` mapping would
+        // register a stateful handle serving the real bytes, defeating the
+        // mapping (the stateless read path already serves zero bytes for
+        // empty paths; only the handle fast-path bypasses the spec check).
+        if self.patterns.is_empty(&mirrored) {
+            let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
+            if write_flags {
+                log_op_err(
+                    "open",
+                    &mirrored,
+                    None,
+                    &std::io::Error::from_raw_os_error(libc::EACCES),
+                )
+                .await;
+                return Err(libc::EACCES.into());
+            }
+            self.inodes
+                .write()
+                .expect("hostfs inode map poisoned")
+                .open_handle(inode);
+            return Ok(ReplyOpen { fh: 0, flags: 0 });
+        }
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not), and
         // symlinks are never followed: a host symlink cannot be opened

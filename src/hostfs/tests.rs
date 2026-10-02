@@ -601,3 +601,78 @@ fn hard_linking_a_symlink_links_the_link_not_the_target() {
 
     std::fs::remove_dir_all(&base).unwrap();
 }
+
+/// The audit's H1 finding, exercised through the FUSE handlers: an `empty`
+/// mapping that names a *real existing host file* must blank the file out
+/// even for `open()`. Before the fix, `open(O_RDONLY)` lstat'ed and opened
+/// the real file and registered a stateful handle, whose read fast-path
+/// served the real bytes without any spec re-check — exactly what the
+/// mapping was supposed to prevent.
+#[test]
+fn open_of_an_empty_path_never_opens_the_real_file() {
+    let base = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-h1-empty-open-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("secret"), b"HOST-SECRET").unwrap();
+    let secret = base.join("secret");
+    let f = fs(&[
+        (base.to_str().unwrap(), Permission::Ro),
+        (secret.to_str().unwrap(), Permission::Empty),
+    ]);
+
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+    let secret_ino = block(async {
+        f.lookup(Request::default(), base_ino, OsStr::new("secret"))
+            .await
+            .expect("lookup secret")
+            .attr
+            .ino
+    });
+
+    // The lookup advertised a size-0 file (the empty-file attr); the open
+    // must agree with it: a virtual handle (fh 0), not the real host file.
+    let opened = block(async {
+        f.open(Request::default(), secret_ino, libc::O_RDONLY as u32)
+            .await
+            .expect("open of an empty path succeeds")
+    });
+    assert_eq!(opened.fh, 0, "empty path must get the virtual fh 0");
+
+    // The read goes down the stateless path, which serves zero bytes for
+    // empty paths — never the real file's content.
+    let data = block(async {
+        f.read(Request::default(), secret_ino, opened.fh, 0, 64)
+            .await
+            .expect("read of an empty path succeeds")
+    });
+    assert!(data.data.is_empty(), "empty path reads as empty");
+    assert_eq!(data.data.len(), 0);
+
+    // Write opens are refused like for injected paths.
+    let res = block(async {
+        f.open(
+            Request::default(),
+            secret_ino,
+            (libc::O_WRONLY | libc::O_TRUNC) as u32,
+        )
+        .await
+    });
+    let Err(res) = res else { unreachable!() };
+    assert_eq!(
+        <fuse3::Errno>::from(libc::EACCES),
+        res,
+        "write open of an empty path must be EACCES"
+    );
+
+    // The real file is untouched and its content never left the host side.
+    assert_eq!(std::fs::read(&secret).unwrap(), b"HOST-SECRET");
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
