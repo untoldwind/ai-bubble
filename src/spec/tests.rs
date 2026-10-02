@@ -354,7 +354,8 @@ fn spec_fields_are_kept_as_written_at_parse_time() {
     assert_eq!(
         spec.net,
         crate::spec::net::NetConfig::Proxy {
-            allow: vec!["${RS_BUBBLE_TEST_UNSET}:443".to_string()]
+            allow: vec!["${RS_BUBBLE_TEST_UNSET}:443".to_string()],
+            allow_private: false
         }
     );
     assert_eq!(
@@ -490,7 +491,7 @@ fn explicit_spec_dir_is_required() {
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         spec.net,
-        crate::spec::net::NetConfig::Proxy { allow: vec![] }
+        crate::spec::net::NetConfig::Proxy { allow: vec![], allow_private: false }
     );
 }
 
@@ -608,7 +609,8 @@ fn env_expansion_applies_only_to_path_like_mapping_fields() {
     assert_eq!(
         spec.net,
         crate::spec::net::NetConfig::Proxy {
-            allow: vec!["${RS_BUBBLE_TEST_HOME}:443".to_string()]
+            allow: vec!["${RS_BUBBLE_TEST_HOME}:443".to_string()],
+            allow_private: false
         }
     );
     unsafe { std::env::remove_var("RS_BUBBLE_TEST_HOME") };

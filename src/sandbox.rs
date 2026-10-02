@@ -161,6 +161,17 @@ pub(crate) fn handle_die_with_parent(enabled: bool) {
         if enabled && libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
             die_with_error("Can't set PR_SET_PDEATHSIG");
         }
+        // Close the classic fork→prctl race: if the parent died between the
+        // fork and the prctl above, the signal was armed against the *new*
+        // (re-parented) parent and will never fire. Every caller's parent is
+        // an ai-bubble process in the host PID namespace, so getppid() == 1
+        // unambiguously means the real parent is already gone — exit rather
+        // than linger. (In `pidns_and_exec`'s forked child the parent lives
+        // outside the new PID namespace, so getppid() returns 0 there, never
+        // a namespace-local 1.)
+        if enabled && libc::getppid() == 1 {
+            die("Parent died before PR_SET_PDEATHSIG was armed");
+        }
     }
 }
 

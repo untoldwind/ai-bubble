@@ -98,6 +98,10 @@ pub struct Net {
     /// The allow-list; empty means: allow nothing. Entries may use a
     /// `*.` subdomain wildcard.
     pub allow: Vec<String>,
+    /// Whether the host-side connectors may dial resolved addresses in
+    /// private/loopback/link-local ranges (see `NetConfig`'s
+    /// `allow_private` and AUDIT.md H3). Off by default.
+    pub allow_private: bool,
 }
 
 impl From<&NetConfig> for Net {
@@ -107,16 +111,25 @@ impl From<&NetConfig> for Net {
                 isolated: false,
                 mode: NetMode::Proxy,
                 allow: vec![],
+                allow_private: false,
             },
-            NetConfig::Proxy { allow } => Net {
+            NetConfig::Proxy {
+                allow,
+                allow_private,
+            } => Net {
                 isolated: true,
                 mode: NetMode::Proxy,
                 allow: allow.clone(),
+                allow_private: *allow_private,
             },
-            NetConfig::Waf { allow } => Net {
+            NetConfig::Waf {
+                allow,
+                allow_private,
+            } => Net {
                 isolated: true,
                 mode: NetMode::Waf,
                 allow: allow.clone(),
+                allow_private: *allow_private,
             },
         }
     }

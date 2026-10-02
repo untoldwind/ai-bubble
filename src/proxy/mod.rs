@@ -14,6 +14,7 @@
 
 pub mod allowlist;
 pub mod connector;
+pub mod ipfilter;
 pub mod sandbox;
 
 pub use self::connector::serve_connector;
@@ -64,6 +65,7 @@ mod tests {
         tokio::spawn(serve_connector(
             unix,
             vec![format!("127.0.0.1:{}", echo_addr.port())],
+            true,
         ));
 
         // Sandbox-side CONNECT proxy.

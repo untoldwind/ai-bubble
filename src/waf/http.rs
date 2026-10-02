@@ -264,6 +264,7 @@ mod tests {
         tokio::spawn(host::serve_host(
             listener,
             vec![format!("127.0.0.1:{}", echo_addr.port())],
+            true,
         ));
 
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -292,7 +293,7 @@ mod tests {
         let std_listener = StdUnixListener::bind(&sock2).unwrap();
         let _ = std_listener.set_nonblocking(true);
         let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
-        tokio::spawn(host::serve_host(listener, vec![]));
+        tokio::spawn(host::serve_host(listener, vec![], false));
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = http.local_addr().unwrap();
         tokio::spawn(serve_http(http, sock2));

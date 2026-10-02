@@ -95,6 +95,7 @@ pub fn run(
         // Connector: serve proxy/waf requests from the host side and
         // watch for P's exit.
         let allow = net.allow.clone();
+        let allow_private = net.allow_private;
         let status = block_on(async move {
             let _ = listener.set_nonblocking(true);
             let l = tokio::net::UnixListener::from_std(listener)
@@ -102,8 +103,10 @@ pub fn run(
             let status = tokio::select! {
                 _ = async {
                     match net.mode {
-                        NetMode::Proxy => crate::proxy::serve_connector(l, allow).await,
-                        NetMode::Waf => waf::host::serve_host(l, allow).await,
+                        NetMode::Proxy => {
+                            crate::proxy::serve_connector(l, allow, allow_private).await
+                        }
+                        NetMode::Waf => waf::host::serve_host(l, allow, allow_private).await,
                     }
                 } => {
                     unreachable!("connector accept loop never ends")
@@ -253,6 +256,11 @@ fn isolated_parent(
             die_with_error("Can't fork sandboxed command");
         }
         if child_pid == 0 {
+            // PR_SET_PDEATHSIG does not survive fork: like the child of
+            // `pidns_and_exec`, this intermediate process must bind its own
+            // lifecycle to its parent (P) before doing anything else, or a
+            // dead P leaves the sandbox re-parented to init.
+            handle_die_with_parent(die_with_parent);
             // PID 1 of its own PID namespace (see pidns_and_exec).
             pidns_and_exec(ops, command, &child_env, cwd, die_with_parent, seccomp);
         }

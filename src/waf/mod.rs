@@ -157,7 +157,7 @@ mod tests {
         let _ = std_listener.set_nonblocking(true);
         let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
         // Deny everything.
-        tokio::spawn(host::serve_host(listener, vec![]));
+        tokio::spawn(host::serve_host(listener, vec![], false));
 
         let err = connect_target(&sock, "example.com:443").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);

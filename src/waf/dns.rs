@@ -257,7 +257,7 @@ mod tests {
         let std_listener = StdUnixListener::bind(&sock).unwrap();
         let _ = std_listener.set_nonblocking(true);
         let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
-        tokio::spawn(host::serve_host(listener, vec![]));
+        tokio::spawn(host::serve_host(listener, vec![], false));
 
         // The server side of the "nameserver": a UDP socket the DNS
         // server serves queries on.
@@ -283,7 +283,11 @@ mod tests {
         let std_listener = StdUnixListener::bind(&sock2).unwrap();
         let _ = std_listener.set_nonblocking(true);
         let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
-        tokio::spawn(host::serve_host(listener, vec!["example.com".to_string()]));
+        tokio::spawn(host::serve_host(
+            listener,
+            vec!["example.com".to_string()],
+            false,
+        ));
         let server2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server2_addr = server2.local_addr().unwrap();
         tokio::spawn(serve_udp(server2, sock2));

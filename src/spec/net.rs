@@ -31,6 +31,16 @@ pub enum NetConfig {
         /// Required in proxy mode. Empty means: nothing is proxied — every
         /// target must be listed explicitly.
         allow: Vec<String>,
+        /// Let the connector dial resolved addresses in private, loopback
+        /// or link-local ranges (10/8, 172.16/12, 192.168/16, 127/8,
+        /// 169.254/16 including the cloud metadata endpoint, ...). Off by
+        /// default: an allowed *name* that resolves into such a range would
+        /// otherwise become an SSRF primitive dialing from the host's
+        /// network position. Turn this on only if the sandbox legitimately
+        /// needs LAN/localhost targets — it includes cloud metadata and
+        /// loopback services.
+        #[serde(default)]
+        allow_private: bool,
     },
     /// Run the command in a fresh network namespace behind the in-sandbox
     /// DNS/HTTP/HTTPS servers on 127.0.0.2 (see `crate::waf`).
@@ -39,6 +49,10 @@ pub enum NetConfig {
         /// A bare `host` entry (no port) is both resolved by the DNS server
         /// (to 127.0.0.2) and connectable. Empty means: nothing is allowed.
         allow: Vec<String>,
+        /// See the proxy mode's `allow_private`: the same opt-out, applied
+        /// to the waf host's `connect`/`tls-connect` dialing.
+        #[serde(default)]
+        allow_private: bool,
     },
 }
 
@@ -49,14 +63,23 @@ mod tests {
 
     #[test]
     fn net_options() {
-        let spec =
-            parse(r#"{ "net": { "mode": "proxy", "allow": ["example.com:443", "localhost"] } }"#);
+        let spec = parse(
+            r#"{ "net": { "mode": "proxy", "allow": ["example.com:443", "localhost"],
+                 "allow_private": true } }"#,
+        );
         assert_eq!(
             spec.net,
             NetConfig::Proxy {
-                allow: vec!["example.com:443".to_string(), "localhost".to_string()]
+                allow: vec!["example.com:443".to_string(), "localhost".to_string()],
+                allow_private: true,
             }
         );
+        // `allow_private` defaults to false (SSRF protection on).
+        let spec = parse(r#"{ "net": { "mode": "proxy", "allow": ["example.com"] } }"#);
+        assert!(matches!(
+            spec.net,
+            NetConfig::Proxy { allow_private: false, .. }
+        ));
     }
 
     #[test]
@@ -83,7 +106,8 @@ mod tests {
         assert_eq!(
             spec.net,
             NetConfig::Waf {
-                allow: vec!["example.com:443".to_string(), "*.example.com".to_string()]
+                allow: vec!["example.com:443".to_string(), "*.example.com".to_string()],
+                allow_private: false,
             }
         );
         // `allow` is mandatory here, too.

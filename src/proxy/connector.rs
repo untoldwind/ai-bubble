@@ -6,19 +6,20 @@
 //! host network.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
-use tokio::net::{TcpStream, UnixListener, UnixStream};
+use tokio::net::{UnixListener, UnixStream};
 
 use super::allowlist::target_allowed;
+use super::ipfilter::connect_checked;
 
 /// Accept loop on the host side: every connection becomes a raw pipe to the
 /// requested TCP target (or an error byte if denied/failed).
-pub async fn serve_connector(listener: UnixListener, allow: Vec<String>) {
+pub async fn serve_connector(listener: UnixListener, allow: Vec<String>, allow_private: bool) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let allow = allow.clone();
                 tokio::spawn(async move {
-                    handle_connector_conn(stream, &allow).await;
+                    handle_connector_conn(stream, &allow, allow_private).await;
                 });
             }
             Err(_) => return,
@@ -30,7 +31,7 @@ pub async fn serve_connector(listener: UnixListener, allow: Vec<String>) {
 /// we reply with a single status byte (`K` = connected, `E` =
 /// failed/denied) and then the connection becomes a raw bidirectional pipe
 /// to the real TCP target on the host side.
-async fn handle_connector_conn(mut stream: UnixStream, allow: &[String]) {
+async fn handle_connector_conn(mut stream: UnixStream, allow: &[String], allow_private: bool) {
     let Some(target) = read_line_target(&mut stream).await else {
         return;
     };
@@ -40,7 +41,10 @@ async fn handle_connector_conn(mut stream: UnixStream, allow: &[String]) {
         let _ = stream.write_all(b"E").await;
         return;
     }
-    let mut tcp = match TcpStream::connect(&target).await {
+    // Resolve the name here and refuse private/loopback/link-local ranges
+    // (SSRF via DNS rebinding, AUDIT.md H3): the dial goes to the validated
+    // IP directly.
+    let mut tcp = match connect_checked(&target, allow_private).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("ai-bubble proxy: can't connect to {target}: {e}");

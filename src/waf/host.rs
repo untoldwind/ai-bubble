@@ -25,19 +25,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 
 use crate::proxy::allowlist::{host_allowed, target_allowed};
+use crate::proxy::ipfilter::connect_checked;
 
 /// The address the in-sandbox servers redirect to (their own listener
 /// address, inside the sandbox network namespace).
 pub const REDIRECT_ADDR: &str = "127.0.0.2";
 
 /// Accept loop on the host side: one command per connection.
-pub async fn serve_host(listener: UnixListener, allow: Vec<String>) {
+pub async fn serve_host(listener: UnixListener, allow: Vec<String>, allow_private: bool) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let allow = allow.clone();
                 tokio::spawn(async move {
-                    handle_host_conn(stream, &allow).await;
+                    handle_host_conn(stream, &allow, allow_private).await;
                 });
             }
             Err(_) => return,
@@ -48,7 +49,7 @@ pub async fn serve_host(listener: UnixListener, allow: Vec<String>) {
 /// One command connection from the sandbox: a single line, answered with
 /// a single reply line (`OK ...` / `ERR <reason>`). A `connect` command
 /// turns the connection into a raw bidirectional pipe after `OK`.
-async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
+async fn handle_host_conn(mut stream: UnixStream, allow: &[String], allow_private: bool) {
     let Some(cmd) = read_line(&mut stream).await else {
         return;
     };
@@ -73,7 +74,10 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
                 .await;
             return;
         }
-        let mut tcp = match TcpStream::connect(target).await {
+        // Resolve the name here and refuse private/loopback/link-local
+        // ranges (SSRF via DNS rebinding, AUDIT.md H3): the dial goes to
+        // the validated IP directly.
+        let mut tcp = match connect_checked(target, allow_private).await {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("ai-bubble waf: can't connect to {target}: {e}");
@@ -145,7 +149,9 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String]) {
         let Some((host, _port)) = target.rsplit_once(':') else {
             return;
         };
-        let tcp = match TcpStream::connect(target).await {
+        // See `connect` above: resolved-IP filtering pins the dial to a
+        // validated address; TLS still verifies the *name*.
+        let tcp = match connect_checked(target, allow_private).await {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("ai-bubble waf: can't connect to {target}: {e}");
@@ -375,6 +381,7 @@ mod tests {
         tokio::spawn(serve_host(
             listener,
             allow(&["example.com", "*.github.com:443"]),
+            false,
         ));
 
         let mut c = UnixStream::connect(&sock).await.unwrap();
@@ -428,6 +435,7 @@ mod tests {
         tokio::spawn(serve_host(
             listener,
             allow(&[&format!("127.0.0.1:{}", echo_addr.port())]),
+            true,
         ));
 
         // Denied target.
@@ -460,6 +468,77 @@ mod tests {
         assert!(reply.starts_with("ERR"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AUDIT.md H3: an allowed *name* whose DNS resolves into a private or
+    /// loopback range must not become an SSRF primitive — the host refuses
+    /// to dial blocked ranges unless the operator opted out with
+    /// `allow_private`.
+    #[tokio::test]
+    async fn connect_to_blocked_ranges_is_refused_unless_allow_private() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = echo.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = s.read(&mut buf).await {
+                        let _ = s.write_all(&buf[..n]).await;
+                    }
+                });
+            }
+        });
+
+        for allow_private in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "ai-bubble-waf-ssrf-{}-{allow_private}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let sock = dir.join("sock");
+            let std_listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let _ = std_listener.set_nonblocking(true);
+            let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
+            tokio::spawn(serve_host(
+                listener,
+                allow(&[&format!("127.0.0.1:{}", echo_addr.port())]),
+                allow_private,
+            ));
+
+            let mut c = UnixStream::connect(&sock).await.unwrap();
+            c.write_all(format!("connect 127.0.0.1:{}\n", echo_addr.port()).as_bytes())
+                .await
+                .unwrap();
+            let mut reply = String::new();
+            if allow_private {
+                // The connection stays open as a raw pipe, so the reply
+                // must be read by length, not to EOF.
+                let mut ok = [0u8; 3];
+                c.read_exact(&mut ok).await.unwrap();
+                reply = String::from_utf8_lossy(&ok).into_owned();
+            } else {
+                c.read_to_string(&mut reply).await.unwrap();
+            }
+            if allow_private {
+                // Opted out: the dial succeeds and the pipe is live. The
+                // connection stays open as a raw pipe, so the reply must
+                // be read by length, not to EOF.
+                assert_eq!(reply, "OK\n", "allow_private={allow_private}");
+            } else {
+                // Default: the resolved loopback address is refused —
+                // before the TLS/plaintext pipe is ever opened.
+                assert!(
+                    reply.starts_with("ERR can't connect"),
+                    "allow_private={allow_private}: {reply:?}"
+                );
+                assert!(reply.contains("blocked range"));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
