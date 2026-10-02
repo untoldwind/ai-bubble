@@ -42,7 +42,7 @@ use std::io;
 use std::path::Path;
 
 use base64::Engine as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 /// The largest reply line accepted from the host (certificates are
@@ -61,32 +61,13 @@ pub async fn command(sock: &Path, cmd: &str) -> io::Result<String> {
 /// Read the one-line reply of a command connection: `OK ...` or
 /// `ERR <reason>`.
 async fn read_reply(stream: &mut UnixStream) -> io::Result<String> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte).await {
-            Ok(0) => break,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                if buf.len() > MAX_REPLY {
-                    break;
-                }
-                buf.push(byte[0]);
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    let reply = String::from_utf8_lossy(&buf).trim().to_string();
-    if reply.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "empty reply from host",
-        ));
-    }
-    Ok(reply)
+    // An over-limit reply (see [`MAX_REPLY`]) comes back as `None`: a
+    // reply that long is malformed for the protocol, so it fails the
+    // command instead of being silently truncated into a plausibly
+    // different reply.
+    crate::line::read_line_limited(stream, MAX_REPLY)
+        .await?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "bad reply from host"))
 }
 
 /// Open a raw pipe to `host:port` through the socket's `connect`

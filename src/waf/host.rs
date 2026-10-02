@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 
 use crate::connlimit::ConnLimit;
@@ -249,30 +249,7 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String], allow_privat
 
 /// Read one line (the command) from the connection.
 async fn read_line(stream: &mut UnixStream) -> Option<String> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte).await {
-            Ok(0) => return None,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                if buf.len() > 512 {
-                    return None;
-                }
-                buf.push(byte[0]);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        }
-    }
-    let s = String::from_utf8(buf).ok()?;
-    let t = s.trim().to_string();
-    if t.is_empty() || t.contains('\0') {
-        return None;
-    }
-    Some(t)
+    crate::line::read_line_limited(stream, 512).await.ok()?
 }
 
 /// A token bucket throttling leaf-key generation (`tls-cert`). Each

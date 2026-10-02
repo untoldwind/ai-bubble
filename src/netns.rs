@@ -33,7 +33,6 @@
 //! runtime with its parent, and the exec'd command must not inherit one.
 
 use std::collections::BTreeMap;
-use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener as StdUnixListener;
@@ -203,7 +202,7 @@ fn isolated_parent(
         // at 127.0.0.2 are reachable.
         bring_up_loopback();
 
-        // Set upSet up the mode's in-sandbox listeners (all on 127.0.0.2, the
+        // Set up the mode's in-sandbox listeners (all on 127.0.0.2, the
         // address the waf DNS server resolves to) and its environment
         // before forking the child. Entries from the spec's `env` section
         // are applied afterwards and so win over these: an explicit spec
@@ -335,16 +334,10 @@ fn isolated_parent(
 
 /// Create the temporary host directory for the proxy socket via mkdtemp(3).
 fn create_socket_dir() -> PathBuf {
-    let mut tmpl: Vec<u8> = b"/tmp/ai-bubble-net.XXXXXX".to_vec();
-    tmpl.push(0);
-    unsafe {
-        let tmpl_ptr = CString::from_vec_with_nul(tmpl).unwrap();
-        let dir_ptr = libc::mkdtemp(tmpl_ptr.into_raw() as *mut libc::c_char);
-        if dir_ptr.is_null() {
-            die_with_error("Can't create proxy socket directory");
-        }
-        PathBuf::from(CStr::from_ptr(dir_ptr).to_string_lossy().into_owned())
-    }
+    crate::sandbox::mkdtemp_dir(
+        b"/tmp/ai-bubble-net.XXXXXX",
+        "Can't create proxy socket directory",
+    )
 }
 
 /// Wait for `pid` on a blocking thread and return its raw waitpid status,

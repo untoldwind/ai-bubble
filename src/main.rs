@@ -26,6 +26,8 @@
 //!   servers inside the sandbox on 127.0.0.2 that redirect allow-listed
 //!   traffic to the host side over the same style of Unix socket, using a
 //!   simple command protocol (`resolve-dns`, `connect`).
+//! * `line`    — the one-line command/reply protocol shared by the
+//!   in-sandbox frontends and the host-side connector (see `proxy`/`waf`).
 
 use clap::Parser;
 
@@ -33,6 +35,7 @@ mod audit;
 mod cli;
 mod connlimit;
 mod hostfs;
+mod line;
 mod netns;
 mod pty;
 mod proxy;

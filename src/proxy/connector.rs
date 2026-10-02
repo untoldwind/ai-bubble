@@ -5,7 +5,7 @@
 //! sandbox and turns `host:port` requests into real TCP connections on the
 //! host network.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncWriteExt, copy_bidirectional};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::allowlist::target_allowed;
@@ -90,28 +90,5 @@ async fn handle_connector_conn(mut stream: UnixStream, allow: &[String], allow_p
 
 /// Read one line (the proxy target) from the connection.
 async fn read_line_target(stream: &mut UnixStream) -> Option<String> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte).await {
-            Ok(0) => return None,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                if buf.len() > 512 {
-                    return None;
-                }
-                buf.push(byte[0]);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        }
-    }
-    let s = String::from_utf8(buf).ok()?;
-    let t = s.trim().to_string();
-    if t.is_empty() || t.contains('\0') {
-        return None;
-    }
-    Some(t)
+    crate::line::read_line_limited(stream, 512).await.ok()?
 }

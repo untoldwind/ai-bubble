@@ -39,6 +39,19 @@ pub(crate) fn die_with_error(msg: &str) -> ! {
     exit(1)
 }
 
+/// Create a fresh directory under `/tmp` with `mkdtemp(3)`, like bwrap's
+/// temp directories. `template` must end in `XXXXXX` (a NUL is appended
+/// here); `msg` is the `die_with_error` context on failure.
+pub(crate) fn mkdtemp_dir(template: &[u8], msg: &str) -> PathBuf {
+    let mut tmpl: Vec<u8> = template.to_vec();
+    tmpl.push(0);
+    let raw = unsafe { libc::mkdtemp(CString::from_vec_with_nul(tmpl).unwrap().into_raw()) };
+    if raw.is_null() {
+        die_with_error(msg);
+    }
+    PathBuf::from(unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned())
+}
+
 /// The spec's `rlimits` section, registered when the spec is compiled
 /// ([`crate::spec::internal::SandboxConfig::compile`]) and applied by
 /// `mount_and_exec` in the sandboxed child (see [`apply_rlimits`]).
@@ -630,6 +643,398 @@ pub(crate) unsafe fn mount_tmpfs(
     }
 }
 
+/// Build the sandbox root and apply the spec's mount ops on top of it.
+///
+/// Split out of [`mount_and_exec`]: this is the privileged filesystem
+/// half (mount namespace, tmpfs root, `/host` bind, and the
+/// `Op::Bind`/`Op::Proc`/`Op::Tmpfs`/`Op::Dev`/`Op::Symlink` ops); the
+/// exec half stays in `mount_and_exec`. Returns the new root (in
+/// hostfs-root mode the FUSE mountpoint).
+///
+/// Must run as PID 1 of a fresh PID namespace (see `pidns_and_exec`) so
+/// that a fresh procfs instance (`Op::Proc`) is bound to it.
+///
+/// Unshares the mount namespace. This requires CAP_SYS_ADMIN over the user
+/// namespace owning the *current* mount namespace, so the isolated path
+/// must reach this in the child that inherited the fresh user namespace
+/// created by `netns::isolated_parent` (the new mount namespace is then
+/// owned by that same user namespace).
+/// `pty_slave_path` is set in pty mode (see the `pty` module docs): the
+/// host path of the private pty's slave, which is then bind-mounted as
+/// `/dev/console` (so ttyname-style paths resolve) — and `/dev/tty` is
+/// provided too, because the command's controlling terminal is now the
+/// private pty, not the caller's. In plain new-session mode both stay
+/// out of the sandbox, exactly as before.
+unsafe fn build_root(
+    ops: &[Op],
+    new_session: bool,
+    pty_slave_path: Option<&str>,
+) -> PathBuf {
+    unsafe {
+    if libc::unshare(libc::CLONE_NEWNS) != 0 {
+        die_with_error("Can't unshare mount namespace");
+    }
+
+    // Make our mount tree a slave of the parent, so nothing we mount
+    // propagates back to the host.
+    let root = CString::new("/").unwrap();
+    if libc::mount(
+        std::ptr::null(),
+        root.as_ptr(),
+        std::ptr::null(),
+        libc::MS_SLAVE | libc::MS_REC,
+        std::ptr::null(),
+    ) != 0
+    {
+        die_with_error("Can't make mount tree private");
+    }
+
+    // In hostfs-root mode the FUSE filesystem itself is the sandbox
+    // root: the ops are mounted on top of it and the process chroots
+    // into it below. No tmpfs root is created.
+    let newroot: PathBuf = if crate::hostfs::root_mode() {
+        match crate::hostfs::host_mount_point() {
+            Some(mountpoint) => mountpoint.clone(),
+            None => die("hostfs root requested but no host filesystem is mounted"),
+        }
+    } else {
+        // Create a fresh tmpfs to serve as the sandbox root.
+        let newroot = mkdtemp_dir(
+            b"/tmp/ai-bubble.XXXXXX",
+            "Can't create temporary sandbox root",
+        );
+
+        let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
+        if libc::mount(
+            CString::new("tmpfs").unwrap().as_ptr(),
+            newroot_c.as_ptr(),
+            CString::new("tmpfs").unwrap().as_ptr(),
+            // NOSUID|NODEV like `mount_tmpfs` (AUDIT.md L5): the root is
+            // attacker-writable inside the sandbox, so it must not honor
+            // set-id bits or device nodes (unreachable today —
+            // no_new_privs, no CAP_MKNOD — but the flags cost nothing).
+            libc::MS_NOSUID | libc::MS_NODEV,
+            std::ptr::null(),
+        ) != 0
+        {
+            die_with_error("Can't mount tmpfs sandbox root");
+        }
+        // Root of the sandbox should be traversable by everyone.
+        let _ = fs::set_permissions(&newroot, fs::Permissions::from_mode(0o755));
+        newroot
+    };
+
+    // Bind the host FUSE filesystem into the sandbox at /host. This must
+    // happen before chroot, while the host mountpoint path is still
+    // resolvable. (The FUSE server keeps running in the host process.)
+    // In hostfs-root mode the FUSE filesystem *is* the root, so there is
+    // no /host.
+    if let Some(host_mount) =
+        crate::hostfs::host_mount_point().filter(|_| !crate::hostfs::root_mode())
+    {
+        mkdir_p(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
+        let dest_abs = sandbox_path(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
+        let src_c = CString::new(host_mount.as_os_str().as_bytes()).unwrap();
+        let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
+        if libc::mount(
+            src_c.as_ptr(),
+            dest_c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        ) != 0
+        {
+            die_with_error("Can't bind mount host filesystem to /host");
+        }
+    }
+
+    // Apply the setup operations in order.
+    for op in ops {
+        match op {
+            Op::Bind { src, dest, rw } => {
+                if dest
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    die(&format!("Invalid bind destination {}", dest.display()));
+                }
+                let src_c = cstring(OsStr::new(src));
+                let mut src_stat: libc::stat = std::mem::zeroed();
+                if libc::stat(src_c.as_ptr(), &mut src_stat) != 0 {
+                    die_with_error(&format!("Can't find source {src}"));
+                }
+                let dest_abs = sandbox_path(&newroot, dest);
+                // Bind targets must exist; create missing directories on
+                // the tmpfs root (bwrap does the same for its new root).
+                // In hostfs-root mode they must already exist in the
+                // mirror (the FUSE filesystem only exposes mirrored paths).
+                ensure_dir(&newroot, dest);
+                refuse_symlink_dest(&newroot, dest);
+                let dest_c = cstring(dest_abs.as_os_str());
+                if libc::mount(
+                    src_c.as_ptr(),
+                    dest_c.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    die_with_error(&format!("Can't bind mount {src} -> {}", dest.display()));
+                }
+                // Bind mounts are read-only unless explicitly asked for
+                // (they bypass the FUSE mirror's write policy). The
+                // read-only flag is applied with a remount: MS_BIND
+                // mounts do not reliably pick up MS_RDONLY in the
+                // initial mount call.
+                if !rw
+                    && libc::mount(
+                        std::ptr::null(),
+                        dest_c.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                        std::ptr::null(),
+                    ) != 0
+                {
+                    die_with_error(&format!(
+                        "Can't make bind mount {src} -> {} read-only",
+                        dest.display()
+                    ));
+                }
+            }
+            Op::Proc { dest } => {
+                if dest
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    die(&format!("Invalid proc mount point {}", dest.display()));
+                }
+                ensure_dir(&newroot, dest);
+                refuse_symlink_dest(&newroot, dest);
+                let dest_abs = sandbox_path(&newroot, dest);
+                let dest_c = cstring(dest_abs.as_os_str());
+                // Mount a *fresh* procfs, like bwrap's --proc does when a
+                // new PID namespace exists: this instance shows only the
+                // sandbox's processes. (We are inside the new PID
+                // namespace here — pidns_and_exec forked before the setup
+                // — which is what binds the instance to it.)
+                if libc::mount(
+                    CString::new("proc").unwrap().as_ptr(),
+                    dest_c.as_ptr(),
+                    CString::new("proc").unwrap().as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    die_with_error(&format!("Can't mount proc on {}", dest.display()));
+                }
+            }
+            Op::Tmpfs { dest, perms, size } => {
+                if dest
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    die(&format!("Invalid tmpfs mount point {}", dest.display()));
+                }
+                ensure_dir(&newroot, dest);
+                refuse_symlink_dest(&newroot, dest);
+                let dest_abs = sandbox_path(&newroot, dest);
+                mount_tmpfs(&dest_abs, perms.unwrap_or(TmpfsPerms::DEFAULT), *size, dest);
+            }
+            Op::Dev { dest } => {
+                if dest
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    die(&format!("Invalid dev mount point {}", dest.display()));
+                }
+                ensure_dir(&newroot, dest);
+                refuse_symlink_dest(&newroot, dest);
+                let dev_abs = sandbox_path(&newroot, dest);
+                // Like bwrap's --dev: a fresh mode-0755 tmpfs, populated
+                // with the standard device nodes and symlinks below.
+                mount_tmpfs(&dev_abs, TmpfsPerms(0o755), None, dest);
+
+                /// Bind-mount a host path over `name` inside the dev tmpfs.
+                unsafe fn bind_into_dev(src: &str, dest_abs: &Path, name: &str) {
+                    let src_c = CString::new(src).unwrap();
+                    let dest_c =
+                        CString::new(dest_abs.join(name).as_os_str().as_bytes()).unwrap();
+                    if unsafe {
+                        libc::mount(
+                            src_c.as_ptr(),
+                            dest_c.as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_BIND,
+                            std::ptr::null(),
+                        )
+                    } != 0
+                    {
+                        die_with_error(&format!("Can't bind mount {src} to /{name}"));
+                    }
+                }
+
+                // The device nodes: bwrap creates a read-only placeholder
+                // file and bind-mounts the host node over it (device
+                // access works because the bind mount carries it over).
+                // In plain new-session mode /dev/tty is skipped: the
+                // command has no controlling terminal, so a bind of the
+                // host's /dev/tty node (which resolves to the *caller's*
+                // ctty on the host) would only re-expose it. In pty mode
+                // the ctty is the *private* pty, so /dev/tty resolves to
+                // that and is safe to provide.
+                let dev_names: &[&str] = if new_session && pty_slave_path.is_none() {
+                    &["null", "zero", "full", "random", "urandom"]
+                } else {
+                    &["null", "zero", "full", "random", "urandom", "tty"]
+                };
+                for name in dev_names.iter().copied() {
+                    let node = dev_abs.join(name);
+                    if fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o444)
+                        .open(&node)
+                        .is_err()
+                    {
+                        die_with_error(&format!("Can't create device placeholder {name}"));
+                    }
+                    bind_into_dev(&format!("/dev/{name}"), &dev_abs, name);
+                }
+
+                // The stdio symlinks and the legacy /dev/fd, /dev/core.
+                for (name, target) in [
+                    ("stdin", "/proc/self/fd/0"),
+                    ("stdout", "/proc/self/fd/1"),
+                    ("stderr", "/proc/self/fd/2"),
+                    ("fd", "/proc/self/fd"),
+                    ("core", "/proc/kcore"),
+                ] {
+                    let dest_c =
+                        CString::new(dev_abs.join(name).as_os_str().as_bytes()).unwrap();
+                    let target_c = CString::new(target).unwrap();
+                    if libc::symlink(target_c.as_ptr(), dest_c.as_ptr()) != 0 {
+                        die_with_error(&format!("Can't make symlink {name} -> {target}"));
+                    }
+                }
+
+                let dir_mode = fs::Permissions::from_mode(0o755);
+                for name in ["shm", "pts"] {
+                    let dir = dev_abs.join(name);
+                    if fs::create_dir(&dir).is_err() {
+                        die_with_error(&format!("Can't create {name} in dev"));
+                    }
+                    let _ = fs::set_permissions(&dir, dir_mode.clone());
+                }
+
+                // A fresh devpts instance on /dev/pts, with the ptmx
+                // symlink, exactly like bwrap's --dev.
+                let pts_c = CString::new(dev_abs.join("pts").as_os_str().as_bytes()).unwrap();
+                if libc::mount(
+                    CString::new("devpts").unwrap().as_ptr(),
+                    pts_c.as_ptr(),
+                    CString::new("devpts").unwrap().as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NOEXEC,
+                    CString::new("newinstance,ptmxmode=0666,mode=620")
+                        .unwrap()
+                        .as_ptr() as *const libc::c_void,
+                ) != 0
+                {
+                    die_with_error("Can't mount devpts on /dev/pts");
+                }
+                let ptmx_c = CString::new(dev_abs.join("ptmx").as_os_str().as_bytes()).unwrap();
+                let target_c = CString::new("pts/ptmx").unwrap();
+                if libc::symlink(target_c.as_ptr(), ptmx_c.as_ptr()) != 0 {
+                    die_with_error("Can't make symlink ptmx -> pts/ptmx");
+                }
+
+                // Bind a terminal device as /dev/console so ttyname()-style paths
+                // resolve in the sandbox (bwrap does the same; it grants
+                // no extra access). Which device: in pty mode the
+                // private pty's slave — *not* the caller's terminal
+                // device; in shared (--no-new-session) mode the caller's
+                // terminal; in plain new-session mode nothing, because
+                // the command has no controlling tty at all.
+                let console_src: Option<String> = if new_session {
+                    pty_slave_path.map(str::to_string)
+                } else {
+                    let tty = libc::ttyname(0);
+                    if tty.is_null() {
+                        None
+                    } else {
+                        let host_tty = CStr::from_ptr(tty).to_string_lossy().into_owned();
+                        (!host_tty.is_empty()).then_some(host_tty)
+                    }
+                };
+                if let Some(src) = console_src {
+                    if fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o444)
+                        .open(dev_abs.join("console"))
+                        .is_err()
+                    {
+                        die_with_error("Can't create device placeholder console");
+                    }
+                    bind_into_dev(&src, &dev_abs, "console");
+                }
+            }
+            Op::Symlink { src, dest } => {
+                if dest
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    die(&format!("Invalid symlink destination {}", dest.display()));
+                }
+                // Create the parent directories on the tmpfs root, like
+                // bwrap does for op destinations.
+                let parent = match dest.parent() {
+                    Some(p) if p.as_os_str().is_empty() => None,
+                    p => p,
+                };
+                if let Some(p) = parent {
+                    ensure_dir(&newroot, p);
+                }
+                let dest_abs = sandbox_path(&newroot, dest);
+                let dest_c = cstring(dest_abs.as_os_str());
+                let src_c = cstring(OsStr::new(src));
+                if libc::symlink(src_c.as_ptr(), dest_c.as_ptr()) != 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::AlreadyExists {
+                        // Mirror bwrap: same target is fine, otherwise it's
+                        // an error.
+                        match fs::read_link(&dest_abs) {
+                            Ok(existing) if existing == Path::new(src) => {}
+                            Ok(existing) => die(&format!(
+                                "Can't make symlink at {}: existing destination is {}",
+                                dest.display(),
+                                existing.display()
+                            )),
+                            Err(_) => die(&format!(
+                                "Can't make symlink at {}: destination exists and is not a symlink",
+                                dest.display()
+                            )),
+                        }
+                    } else {
+                        let hint = if crate::hostfs::root_mode() {
+                            " (the hostfs root only exposes mirrored paths; the symlink \
+                             must already exist in one)"
+                        } else {
+                            ""
+                        };
+                        die_with_error(&format!(
+                            "Can't make symlink at {}{hint}",
+                            dest.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+        newroot
+    }
+}
+
 /// Build the tmpfs sandbox filesystem and exec COMMAND.
 ///
 /// Must run as PID 1 of a fresh PID namespace (see pidns_and_exec) so that
@@ -669,370 +1074,7 @@ pub(crate) unsafe fn mount_and_exec(
     seccomp: Option<&SeccompPolicy>,
 ) -> ! {
     unsafe {
-        if libc::unshare(libc::CLONE_NEWNS) != 0 {
-            die_with_error("Can't unshare mount namespace");
-        }
-
-        // Make our mount tree a slave of the parent, so nothing we mount
-        // propagates back to the host.
-        let root = CString::new("/").unwrap();
-        if libc::mount(
-            std::ptr::null(),
-            root.as_ptr(),
-            std::ptr::null(),
-            libc::MS_SLAVE | libc::MS_REC,
-            std::ptr::null(),
-        ) != 0
-        {
-            die_with_error("Can't make mount tree private");
-        }
-
-        // In hostfs-root mode the FUSE filesystem itself is the sandbox
-        // root: the ops are mounted on top of it and the process chroots
-        // into it below. No tmpfs root is created.
-        let newroot: PathBuf = if crate::hostfs::root_mode() {
-            match crate::hostfs::host_mount_point() {
-                Some(mountpoint) => mountpoint.clone(),
-                None => die("hostfs root requested but no host filesystem is mounted"),
-            }
-        } else {
-            // Create a fresh tmpfs to serve as the sandbox root.
-            let mut tmpl: Vec<u8> = b"/tmp/ai-bubble.XXXXXX".to_vec();
-            tmpl.push(0);
-            let tmpl_ptr = CString::from_vec_with_nul(tmpl).unwrap();
-            let root_path = libc::mkdtemp(tmpl_ptr.into_raw() as *mut libc::c_char);
-            if root_path.is_null() {
-                die_with_error("Can't create temporary sandbox root");
-            }
-            let newroot = PathBuf::from(CStr::from_ptr(root_path).to_string_lossy().into_owned());
-
-            let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
-            if libc::mount(
-                CString::new("tmpfs").unwrap().as_ptr(),
-                newroot_c.as_ptr(),
-                CString::new("tmpfs").unwrap().as_ptr(),
-                // NOSUID|NODEV like `mount_tmpfs` (AUDIT.md L5): the root is
-                // attacker-writable inside the sandbox, so it must not honor
-                // set-id bits or device nodes (unreachable today —
-                // no_new_privs, no CAP_MKNOD — but the flags cost nothing).
-                libc::MS_NOSUID | libc::MS_NODEV,
-                std::ptr::null(),
-            ) != 0
-            {
-                die_with_error("Can't mount tmpfs sandbox root");
-            }
-            // Root of the sandbox should be traversable by everyone.
-            let _ = fs::set_permissions(&newroot, fs::Permissions::from_mode(0o755));
-            newroot
-        };
-
-        // Bind the host FUSE filesystem into the sandbox at /host. This must
-        // happen before chroot, while the host mountpoint path is still
-        // resolvable. (The FUSE server keeps running in the host process.)
-        // In hostfs-root mode the FUSE filesystem *is* the root, so there is
-        // no /host.
-        if let Some(host_mount) =
-            crate::hostfs::host_mount_point().filter(|_| !crate::hostfs::root_mode())
-        {
-            mkdir_p(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
-            let dest_abs = sandbox_path(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
-            let src_c = CString::new(host_mount.as_os_str().as_bytes()).unwrap();
-            let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
-            if libc::mount(
-                src_c.as_ptr(),
-                dest_c.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            ) != 0
-            {
-                die_with_error("Can't bind mount host filesystem to /host");
-            }
-        }
-
-        // Apply the setup operations in order.
-        for op in ops {
-            match op {
-                Op::Bind { src, dest, rw } => {
-                    if dest
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                    {
-                        die(&format!("Invalid bind destination {}", dest.display()));
-                    }
-                    let src_c = cstring(OsStr::new(src));
-                    let mut src_stat: libc::stat = std::mem::zeroed();
-                    if libc::stat(src_c.as_ptr(), &mut src_stat) != 0 {
-                        die_with_error(&format!("Can't find source {src}"));
-                    }
-                    let dest_abs = sandbox_path(&newroot, dest);
-                    // Bind targets must exist; create missing directories on
-                    // the tmpfs root (bwrap does the same for its new root).
-                    // In hostfs-root mode they must already exist in the
-                    // mirror (the FUSE filesystem only exposes mirrored paths).
-                    ensure_dir(&newroot, dest);
-                    refuse_symlink_dest(&newroot, dest);
-                    let dest_c = cstring(dest_abs.as_os_str());
-                    if libc::mount(
-                        src_c.as_ptr(),
-                        dest_c.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND,
-                        std::ptr::null(),
-                    ) != 0
-                    {
-                        die_with_error(&format!("Can't bind mount {src} -> {}", dest.display()));
-                    }
-                    // Bind mounts are read-only unless explicitly asked for
-                    // (they bypass the FUSE mirror's write policy). The
-                    // read-only flag is applied with a remount: MS_BIND
-                    // mounts do not reliably pick up MS_RDONLY in the
-                    // initial mount call.
-                    if !rw
-                        && libc::mount(
-                            std::ptr::null(),
-                            dest_c.as_ptr(),
-                            std::ptr::null(),
-                            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                            std::ptr::null(),
-                        ) != 0
-                    {
-                        die_with_error(&format!(
-                            "Can't make bind mount {src} -> {} read-only",
-                            dest.display()
-                        ));
-                    }
-                }
-                Op::Proc { dest } => {
-                    if dest
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                    {
-                        die(&format!("Invalid proc mount point {}", dest.display()));
-                    }
-                    ensure_dir(&newroot, dest);
-                    refuse_symlink_dest(&newroot, dest);
-                    let dest_abs = sandbox_path(&newroot, dest);
-                    let dest_c = cstring(dest_abs.as_os_str());
-                    // Mount a *fresh* procfs, like bwrap's --proc does when a
-                    // new PID namespace exists: this instance shows only the
-                    // sandbox's processes. (We are inside the new PID
-                    // namespace here — pidns_and_exec forked before the setup
-                    // — which is what binds the instance to it.)
-                    if libc::mount(
-                        CString::new("proc").unwrap().as_ptr(),
-                        dest_c.as_ptr(),
-                        CString::new("proc").unwrap().as_ptr(),
-                        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
-                        std::ptr::null(),
-                    ) != 0
-                    {
-                        die_with_error(&format!("Can't mount proc on {}", dest.display()));
-                    }
-                }
-                Op::Tmpfs { dest, perms, size } => {
-                    if dest
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                    {
-                        die(&format!("Invalid tmpfs mount point {}", dest.display()));
-                    }
-                    ensure_dir(&newroot, dest);
-                    refuse_symlink_dest(&newroot, dest);
-                    let dest_abs = sandbox_path(&newroot, dest);
-                    mount_tmpfs(&dest_abs, perms.unwrap_or(TmpfsPerms::DEFAULT), *size, dest);
-                }
-                Op::Dev { dest } => {
-                    if dest
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                    {
-                        die(&format!("Invalid dev mount point {}", dest.display()));
-                    }
-                    ensure_dir(&newroot, dest);
-                    refuse_symlink_dest(&newroot, dest);
-                    let dev_abs = sandbox_path(&newroot, dest);
-                    // Like bwrap's --dev: a fresh mode-0755 tmpfs, populated
-                    // with the standard device nodes and symlinks below.
-                    mount_tmpfs(&dev_abs, TmpfsPerms(0o755), None, dest);
-
-                    /// Bind-mount a host path over `name` inside the dev tmpfs.
-                    unsafe fn bind_into_dev(src: &str, dest_abs: &Path, name: &str) {
-                        let src_c = CString::new(src).unwrap();
-                        let dest_c =
-                            CString::new(dest_abs.join(name).as_os_str().as_bytes()).unwrap();
-                        if unsafe {
-                            libc::mount(
-                                src_c.as_ptr(),
-                                dest_c.as_ptr(),
-                                std::ptr::null(),
-                                libc::MS_BIND,
-                                std::ptr::null(),
-                            )
-                        } != 0
-                        {
-                            die_with_error(&format!("Can't bind mount {src} to /{name}"));
-                        }
-                    }
-
-                    // The device nodes: bwrap creates a read-only placeholder
-                    // file and bind-mounts the host node over it (device
-                    // access works because the bind mount carries it over).
-                    // In plain new-session mode /dev/tty is skipped: the
-                    // command has no controlling terminal, so a bind of the
-                    // host's /dev/tty node (which resolves to the *caller's*
-                    // ctty on the host) would only re-expose it. In pty mode
-                    // the ctty is the *private* pty, so /dev/tty resolves to
-                    // that and is safe to provide.
-                    let dev_names: &[&str] = if new_session && pty_slave_path.is_none() {
-                        &["null", "zero", "full", "random", "urandom"]
-                    } else {
-                        &["null", "zero", "full", "random", "urandom", "tty"]
-                    };
-                    for name in dev_names.iter().copied() {
-                        let node = dev_abs.join(name);
-                        if fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .mode(0o444)
-                            .open(&node)
-                            .is_err()
-                        {
-                            die_with_error(&format!("Can't create device placeholder {name}"));
-                        }
-                        bind_into_dev(&format!("/dev/{name}"), &dev_abs, name);
-                    }
-
-                    // The stdio symlinks and the legacy /dev/fd, /dev/core.
-                    for (name, target) in [
-                        ("stdin", "/proc/self/fd/0"),
-                        ("stdout", "/proc/self/fd/1"),
-                        ("stderr", "/proc/self/fd/2"),
-                        ("fd", "/proc/self/fd"),
-                        ("core", "/proc/kcore"),
-                    ] {
-                        let dest_c =
-                            CString::new(dev_abs.join(name).as_os_str().as_bytes()).unwrap();
-                        let target_c = CString::new(target).unwrap();
-                        if libc::symlink(target_c.as_ptr(), dest_c.as_ptr()) != 0 {
-                            die_with_error(&format!("Can't make symlink {name} -> {target}"));
-                        }
-                    }
-
-                    let dir_mode = fs::Permissions::from_mode(0o755);
-                    for name in ["shm", "pts"] {
-                        let dir = dev_abs.join(name);
-                        if fs::create_dir(&dir).is_err() {
-                            die_with_error(&format!("Can't create {name} in dev"));
-                        }
-                        let _ = fs::set_permissions(&dir, dir_mode.clone());
-                    }
-
-                    // A fresh devpts instance on /dev/pts, with the ptmx
-                    // symlink, exactly like bwrap's --dev.
-                    let pts_c = CString::new(dev_abs.join("pts").as_os_str().as_bytes()).unwrap();
-                    if libc::mount(
-                        CString::new("devpts").unwrap().as_ptr(),
-                        pts_c.as_ptr(),
-                        CString::new("devpts").unwrap().as_ptr(),
-                        libc::MS_NOSUID | libc::MS_NOEXEC,
-                        CString::new("newinstance,ptmxmode=0666,mode=620")
-                            .unwrap()
-                            .as_ptr() as *const libc::c_void,
-                    ) != 0
-                    {
-                        die_with_error("Can't mount devpts on /dev/pts");
-                    }
-                    let ptmx_c = CString::new(dev_abs.join("ptmx").as_os_str().as_bytes()).unwrap();
-                    let target_c = CString::new("pts/ptmx").unwrap();
-                    if libc::symlink(target_c.as_ptr(), ptmx_c.as_ptr()) != 0 {
-                        die_with_error("Can't make symlink ptmx -> pts/ptmx");
-                    }
-
-                    // Bind a terminal device as /dev/console so ttyname()-style paths
-                    // resolve in the sandbox (bwrap does the same; it grants
-                    // no extra access). Which device: in pty mode the
-                    // private pty's slave — *not* the caller's terminal
-                    // device; in shared (--no-new-session) mode the caller's
-                    // terminal; in plain new-session mode nothing, because
-                    // the command has no controlling tty at all.
-                    let console_src: Option<String> = if new_session {
-                        pty_slave_path.map(str::to_string)
-                    } else {
-                        let tty = libc::ttyname(0);
-                        if tty.is_null() {
-                            None
-                        } else {
-                            let host_tty = CStr::from_ptr(tty).to_string_lossy().into_owned();
-                            (!host_tty.is_empty()).then_some(host_tty)
-                        }
-                    };
-                    if let Some(src) = console_src {
-                        if fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .mode(0o444)
-                            .open(dev_abs.join("console"))
-                            .is_err()
-                        {
-                            die_with_error("Can't create device placeholder console");
-                        }
-                        bind_into_dev(&src, &dev_abs, "console");
-                    }
-                }
-                Op::Symlink { src, dest } => {
-                    if dest
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                    {
-                        die(&format!("Invalid symlink destination {}", dest.display()));
-                    }
-                    // Create the parent directories on the tmpfs root, like
-                    // bwrap does for op destinations.
-                    let parent = match dest.parent() {
-                        Some(p) if p.as_os_str().is_empty() => None,
-                        p => p,
-                    };
-                    if let Some(p) = parent {
-                        ensure_dir(&newroot, p);
-                    }
-                    let dest_abs = sandbox_path(&newroot, dest);
-                    let dest_c = cstring(dest_abs.as_os_str());
-                    let src_c = cstring(OsStr::new(src));
-                    if libc::symlink(src_c.as_ptr(), dest_c.as_ptr()) != 0 {
-                        let e = io::Error::last_os_error();
-                        if e.kind() == io::ErrorKind::AlreadyExists {
-                            // Mirror bwrap: same target is fine, otherwise it's
-                            // an error.
-                            match fs::read_link(&dest_abs) {
-                                Ok(existing) if existing == Path::new(src) => {}
-                                Ok(existing) => die(&format!(
-                                    "Can't make symlink at {}: existing destination is {}",
-                                    dest.display(),
-                                    existing.display()
-                                )),
-                                Err(_) => die(&format!(
-                                    "Can't make symlink at {}: destination exists and is not a symlink",
-                                    dest.display()
-                                )),
-                            }
-                        } else {
-                            let hint = if crate::hostfs::root_mode() {
-                                " (the hostfs root only exposes mirrored paths; the symlink \
-                                 must already exist in one)"
-                            } else {
-                                ""
-                            };
-                            die_with_error(&format!(
-                                "Can't make symlink at {}{hint}",
-                                dest.display()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
+        let newroot = build_root(ops, new_session, pty_slave_path);
         // Enter the sandbox and run the command.
         let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
         if libc::chdir(newroot_c.as_ptr()) != 0 {
@@ -1294,273 +1336,4 @@ fn apply_seccomp(policy: &SeccompPolicy) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Read one rlimit as (soft, hard).
-    fn get_rlimit(resource: libc::__rlimit_resource_t) -> (u64, u64) {
-        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::getrlimit(resource, &mut lim) }, 0);
-        (lim.rlim_cur, lim.rlim_max)
-    }
-
-    #[test]
-    fn rlimits_are_applied_to_the_process() {
-        // apply_rlimits mutates the calling process, so run it in a
-        // forked child (like the seccomp tests) and verify with
-        // getrlimit there.
-        let code = unsafe {
-            run_in_child(|| {
-                apply_rlimits(&Rlimits {
-                    nproc: Some(256),
-                    nofile: Some(128),
-                    as_: Some(1 << 28),
-                });
-                // Soft == hard for every limit, so the command cannot
-                // raise them again.
-                if get_rlimit(libc::RLIMIT_NPROC) == (256, 256)
-                    && get_rlimit(libc::RLIMIT_NOFILE) == (128, 128)
-                    && get_rlimit(libc::RLIMIT_AS) == (1 << 28, 1 << 28)
-                {
-                    libc::_exit(0);
-                }
-            })
-        };
-        assert_eq!(code, 0, "rlimits were not applied as configured");
-    }
-
-    #[test]
-    fn rlimits_absent_fields_leave_the_process_untouched() {
-        // The default (all-None) section must not change any limit.
-        let code = unsafe {
-            run_in_child(|| {
-                let before = (
-                    get_rlimit(libc::RLIMIT_NPROC),
-                    get_rlimit(libc::RLIMIT_NOFILE),
-                    get_rlimit(libc::RLIMIT_AS),
-                );
-                apply_rlimits(&Rlimits::default());
-                let after = (
-                    get_rlimit(libc::RLIMIT_NPROC),
-                    get_rlimit(libc::RLIMIT_NOFILE),
-                    get_rlimit(libc::RLIMIT_AS),
-                );
-                if before == after {
-                    libc::_exit(0);
-                }
-            })
-        };
-        assert_eq!(code, 0, "an absent rlimits section must not set anything");
-    }
-
-    #[test]
-    fn sandbox_path_joins_under_newroot() {
-        assert_eq!(
-            sandbox_path(Path::new("/tmp/xyz"), Path::new("/usr/lib"))
-                .display()
-                .to_string(),
-            "/tmp/xyz/usr/lib"
-        );
-    }
-
-    #[test]
-    fn mkdir_p_creates_nested_dirs() {
-        let base = std::env::temp_dir().join("ai-bubble-test-mkdir-p");
-        let _ = fs::remove_dir_all(&base);
-        mkdir_p(&base, Path::new("a/b/c"));
-        assert!(base.join("a/b/c").is_dir());
-        // Idempotent.
-        mkdir_p(&base, Path::new("a/b/c"));
-        assert!(base.join("a/b/c").is_dir());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn mkdir_p_keeps_absolute_dest_under_newroot() {
-        // Regression: Path::join("/usr") would replace the new root and
-        // target the host filesystem instead.
-        let base = std::env::temp_dir().join("ai-bubble-test-mkdir-abs");
-        let _ = fs::remove_dir_all(&base);
-        mkdir_p(&base, Path::new("/usr/lib"));
-        assert!(base.join("usr/lib").is_dir());
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    /// Run `body` in a forked child (so the filter cannot leak into the
-    /// test process) and return its exit status.
-    unsafe fn run_in_child<F: FnOnce()>(body: F) -> i32 {
-        unsafe {
-            let pid = libc::fork();
-            assert!(pid >= 0, "fork failed");
-            if pid == 0 {
-                // A seccomp filter without NO_NEW_PRIVS requires
-                // CAP_SYS_ADMIN; set it like every exec path does.
-                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                body();
-                libc::_exit(1);
-            }
-            let mut status: libc::c_int = 0;
-            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
-            if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else {
-                -1
-            }
-        }
-    }
-
-    #[test]
-    fn seccomp_blocklist_denies_listed_syscalls() {
-        // A blocklist denies exactly the listed syscalls: getpid fails
-        // with EPERM, an unlisted one (getuid) still succeeds.
-        let code = unsafe {
-            run_in_child(|| {
-                let policy = SeccompPolicy::Block {
-                    syscalls: vec![syscalls::Sysno::getpid as i64],
-                    on_violation: SeccompViolation::Errno,
-                    unix_sockets: true,
-                };
-                apply_seccomp(&policy);
-                // Raw syscalls: the seccomp ERRNO action makes the raw
-                // syscall return -1 with errno EPERM (glibc's wrappers
-                // for "always successful" calls don't expose that).
-                if libc::syscall(libc::SYS_getpid) == -1 && libc::syscall(libc::SYS_getuid) != -1 {
-                    libc::_exit(0);
-                }
-            })
-        };
-        assert_eq!(code, 0, "blocklist did not deny getpid as expected");
-    }
-
-    #[test]
-    fn seccomp_allowlist_permits_only_listed_syscalls() {
-        // An allowlist permits exactly the listed syscalls: getpid works,
-        // the unlisted getuid fails with EPERM.
-        let code = unsafe {
-            run_in_child(|| {
-                let policy = SeccompPolicy::Allow {
-                    syscalls: vec![
-                        syscalls::Sysno::getpid as i64,
-                        syscalls::Sysno::exit_group as i64,
-                    ],
-                    on_violation: SeccompViolation::Errno,
-                    unix_sockets: true,
-                };
-                apply_seccomp(&policy);
-                if libc::syscall(libc::SYS_getpid) >= 0 && libc::syscall(libc::SYS_getuid) == -1 {
-                    libc::_exit(0);
-                }
-            })
-        };
-        assert_eq!(code, 0, "allowlist did not gate syscalls as expected");
-    }
-
-    #[test]
-    fn unix_sockets_are_denied_unless_opted_in() {
-        // The default policy (no seccomp section, no opt-in) denies
-        // socket(2)/socketpair(2) for AF_UNIX and io_uring_setup (which
-        // can create sockets without socket(2)), while AF_INET keeps
-        // working (AUDIT.md M3).
-        let code = unsafe {
-            run_in_child(|| {
-                let policy = SeccompPolicy::Block {
-                    syscalls: vec![],
-                    on_violation: SeccompViolation::Errno,
-                    unix_sockets: false,
-                };
-                apply_seccomp(&policy);
-                let unix_fd =
-                    libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
-                let inet_fd = libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
-                let mut sv = [0 as libc::c_int; 2];
-                let paired =
-                    libc::syscall(libc::SYS_socketpair, libc::AF_UNIX, libc::SOCK_STREAM, 0,
-                                  sv.as_mut_ptr());
-                let uring = libc::syscall(libc::SYS_io_uring_setup, 4, std::ptr::null::<()>());
-                if unix_fd == -1
-                    && inet_fd >= 0
-                    && paired == -1
-                    && uring == -1
-                {
-                    libc::close(inet_fd as libc::c_int);
-                    libc::_exit(0);
-                }
-            })
-        };
-        assert_eq!(code, 0, "AF_UNIX must be denied while AF_INET keeps working");
-
-        // With the opt-in, AF_UNIX works again.
-        let code = unsafe {
-            run_in_child(|| {
-                let policy = SeccompPolicy::Block {
-                    syscalls: vec![],
-                    on_violation: SeccompViolation::Errno,
-                    unix_sockets: true,
-                };
-                apply_seccomp(&policy);
-                let fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
-                if fd >= 0 {
-                    libc::close(fd as libc::c_int);
-                    libc::_exit(0);
-                }
-            })
-        };
-        assert_eq!(code, 0, "unix_sockets opt-in must allow socket(AF_UNIX)");
-    }
-
-    #[test]
-    fn unix_socket_denial_narrows_an_allowlist() {
-        // An allowlist that lists socket(2) is narrowed: AF_UNIX is
-        // denied even though socket(2) is allowed, and unlisted syscalls
-        // stay denied.
-        let code = unsafe {
-            run_in_child(|| {
-                let policy = SeccompPolicy::Allow {
-                    syscalls: vec![
-                        syscalls::Sysno::socket as i64,
-                        syscalls::Sysno::exit_group as i64,
-                    ],
-                    on_violation: SeccompViolation::Errno,
-                    unix_sockets: false,
-                };
-                apply_seccomp(&policy);
-                let unix_fd =
-                    libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
-                let inet_fd = libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
-                let getuid = libc::syscall(libc::SYS_getuid);
-                if unix_fd == -1 && inet_fd >= 0 && getuid == -1 {
-                    libc::close(inet_fd as libc::c_int);
-                    libc::_exit(0);
-                }
-            })
-        };
-        assert_eq!(code, 0, "allowlist with socket(2) must still deny AF_UNIX");
-    }
-
-    #[test]
-    fn seccomp_kill_on_violation_kills_the_process() {
-        // With on_violation=kill the denied syscall raises SIGSYS: the
-        // child dies by signal instead of observing an error.
-        unsafe {
-            let pid = libc::fork();
-            assert!(pid >= 0, "fork failed");
-            if pid == 0 {
-                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-                let policy = SeccompPolicy::Block {
-                    syscalls: vec![syscalls::Sysno::getpid as i64],
-                    on_violation: SeccompViolation::Kill,
-                    unix_sockets: true,
-                };
-                apply_seccomp(&policy);
-                let _ = libc::getpid();
-                libc::_exit(0);
-            }
-            let mut status: libc::c_int = 0;
-            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
-            assert!(
-                libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
-                "expected the child to die from SIGSYS, status {status:#x}"
-            );
-        }
-    }
-}
+mod tests;
