@@ -57,7 +57,7 @@ fn empty_paths_are_virtual_unwritable_directories() {
     assert_eq!(f.attr(Path::new("/dev")).unwrap().perm, 0o555);
     assert_eq!(f.attr(Path::new("/dev")).unwrap().kind, FileType::Directory);
     // ...and it is empty even though the real host /dev has entries.
-    assert!(f.dir_entries(Path::new("/dev")).is_empty());
+    assert!(f.dir_entries(Path::new("/dev"), 1, 0).is_empty());
     // Deeper paths are shadowed by the precedence.
     assert!(!f.patterns.exists(Path::new("/dev/null")));
     assert!(!f.patterns.matches(Path::new("/dev/null")));
@@ -79,10 +79,10 @@ fn empty_paths_take_precedence_over_mirror() {
     assert!(f.patterns.is_empty(Path::new("/etc")));
     // Mirror contents below the empty dir are hidden.
     assert!(!f.patterns.exists(Path::new("/etc/passwd")));
-    assert!(f.dir_entries(Path::new("/etc")).is_empty());
+    assert!(f.dir_entries(Path::new("/etc"), 1, 0).is_empty());
     // But /etc still appears at the root listing.
     let names: Vec<_> = f
-        .dir_entries(Path::new("/"))
+        .dir_entries(Path::new("/"), 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -114,7 +114,7 @@ fn injected_paths_are_virtual_read_only_files() {
     assert!(f.patterns.dir_prefix(Path::new("/etc")));
     assert!(f.is_listable_dir(Path::new("/etc")));
     let names: Vec<_> = f
-        .dir_entries(Path::new("/etc"))
+        .dir_entries(Path::new("/etc"), 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -186,7 +186,7 @@ fn empty_paths_match_real_files_as_empty_files() {
     let dir = f.attr(&base.join("d")).unwrap();
     assert_eq!(dir.kind, FileType::Directory);
     assert_eq!(dir.perm, 0o555);
-    assert!(f.dir_entries(&base.join("d")).is_empty());
+    assert!(f.dir_entries(&base.join("d"), 1, 0).is_empty());
     std::fs::remove_dir_all(&base).unwrap();
 }
 
@@ -201,13 +201,13 @@ fn empty_path_ancestors_stay_navigable() {
     assert!(!f.patterns.exists(Path::new("/var/etc")));
     // The root listing contains both levels of the chain.
     let root: Vec<_> = f
-        .dir_entries(Path::new("/"))
+        .dir_entries(Path::new("/"), 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
     assert_eq!(root, ["var"]);
     let var: Vec<_> = f
-        .dir_entries(Path::new("/var"))
+        .dir_entries(Path::new("/var"), 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -220,7 +220,7 @@ fn empty_paths_coexist_with_mirror() {
     // empty path are listed together with it.
     let f = fs(&[("/etc/passwd", Permission::Ro), ("/dev", Permission::Empty)]);
     let names: Vec<_> = f
-        .dir_entries(Path::new("/"))
+        .dir_entries(Path::new("/"), 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -256,7 +256,7 @@ fn redirected_paths_show_the_source_content() {
     // Its entries are the source dir's entries, listed under the
     // redirected name.
     let mut names: Vec<_> = f
-        .dir_entries(Path::new("/virtual"))
+        .dir_entries(Path::new("/virtual"), 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -305,7 +305,7 @@ fn redirected_files_are_listed_in_their_directory() {
         ),
     ]));
     let names: Vec<_> = f
-        .dir_entries(Path::new("/conf"))
+        .dir_entries(Path::new("/conf"), 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -320,7 +320,7 @@ fn redirected_files_are_listed_in_their_directory() {
             writable: false,
         },
     )]));
-    assert!(f.dir_entries(Path::new("/conf")).is_empty());
+    assert!(f.dir_entries(Path::new("/conf"), 1, 0).is_empty());
 
     std::fs::remove_dir_all(&base).unwrap();
 }
@@ -343,7 +343,7 @@ fn readdir_filters_non_matching_entries() {
 
     // Only matching entries (and entries leading to matches) survive.
     let names: Vec<_> = f
-        .dir_entries(&base)
+        .dir_entries(&base, 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -355,7 +355,7 @@ fn readdir_filters_non_matching_entries() {
     // An entry that only leads to a match (virtual ancestor) is shown.
     let f = fs(&[(&format!("{}/c.conf.dir/x", base.display()), Permission::Ro)]);
     let names: Vec<_> = f
-        .dir_entries(&base)
+        .dir_entries(&base, 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -370,7 +370,7 @@ fn readdir_filters_non_matching_entries() {
         Permission::Ro,
     )]);
     let names: Vec<_> = f
-        .dir_entries(&base.join("c.conf.dir"))
+        .dir_entries(&base.join("c.conf.dir"), 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -383,7 +383,7 @@ fn readdir_filters_non_matching_entries() {
 fn empty_mirror_matches_nothing() {
     let f = fs(&[]);
     assert!(!f.patterns.exists(Path::new("/")));
-    assert!(f.dir_entries(Path::new("/")).is_empty());
+    assert!(f.dir_entries(Path::new("/"), 1, 0).is_empty());
 }
 
 #[test]
@@ -391,7 +391,7 @@ fn empty_patterns_only_still_show_root() {
     let f = fs_with_empties(&[("/dev", Permission::Empty)]);
     assert!(f.patterns.exists(Path::new("/")));
     assert_eq!(
-        f.dir_entries(Path::new("/"))
+        f.dir_entries(Path::new("/"), 1, 0)
             .into_iter()
             .map(|(n, _)| n.to_string_lossy().into_owned())
             .collect::<Vec<_>>(),
@@ -409,7 +409,7 @@ fn hidden_directories_hide_their_subtree() {
     // The hide pattern matches /etc last and shadows everything below.
     assert!(!f.patterns.exists(Path::new("/etc")));
     assert!(!f.patterns.exists(Path::new("/etc/passwd")));
-    assert!(f.dir_entries(Path::new("/")).is_empty());
+    assert!(f.dir_entries(Path::new("/"), 1, 0).is_empty());
     // Siblings are unaffected; the hide is scoped to /etc.
     let base =
         std::env::temp_dir().join(format!("ai-bubble-hostfs-hide-test-{}", std::process::id()));
@@ -426,7 +426,7 @@ fn hidden_directories_hide_their_subtree() {
     // The parent stays navigable for the still-mirrored matches.
     assert!(f.patterns.exists(&base));
     let names: Vec<_> = f
-        .dir_entries(&base)
+        .dir_entries(&base, 1, 0)
         .into_iter()
         .map(|(n, _)| n.to_string_lossy().into_owned())
         .collect();
@@ -793,6 +793,112 @@ fn setattr_chmod_strips_setuid_and_setgid_bits() {
         0o755,
         "the setuid/setgid bits must be stripped silently"
     );
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// The open-handle table is capped (AUDIT.md L14): a malicious command
+/// must not be able to grow the FUSE server's memory and host fd usage
+/// without bound. Opening more than `MAX_HANDLES` files fails with ENFILE
+/// (the kernel's own "table full" error), and releasing handles frees
+/// slots again.
+#[test]
+fn open_handles_are_capped() {
+    let base = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-handles-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    for i in 0..4 {
+        std::fs::write(base.join(format!("f{i}")), b"x").unwrap();
+    }
+    let f = fs(&[(&format!("{}/*", base.display()), Permission::Rw)]);
+
+    block(async {
+        let mut fhs = Vec::new();
+        for i in 0..HostFs::MAX_HANDLES + 1 {
+            let real = base.join(if i < 4 { format!("f{i}") } else { "f0".to_string() });
+            match anchored::open_at(&f.root, &real, libc::O_RDONLY, 0) {
+                Ok(file) => match f.insert_handle(file, real.clone(), false, false) {
+                    Ok(fh) => fhs.push(fh),
+                    Err(e) => {
+                        assert_eq!(i, HostFs::MAX_HANDLES, "ENFILE must come at the cap");
+                        assert_eq!(e.raw_os_error(), Some(libc::ENFILE));
+                    }
+                },
+                Err(e) => panic!("open of {real:?} failed: {e}"),
+            }
+        }
+        // Releasing frees the slots again.
+        for fh in fhs {
+            f.remove_handle(fh);
+        }
+        let file = anchored::open_at(&f.root, &base.join("f0"), libc::O_RDONLY, 0).unwrap();
+        assert!(f.insert_handle(file, base.join("f0"), false, false).is_ok());
+    });
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// The readdir name cache is validated by the directory's timestamps
+/// (AUDIT.md L14): after a host-side change, the follow-up listing must
+/// reflect it — a stale cache would advertise removed entries (ghosts) or
+/// hide new ones.
+#[test]
+fn readdir_cache_is_invalidated_when_the_host_directory_changes() {
+    let base = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-dircache-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("a"), b"1").unwrap();
+    let f = fs(&[(&format!("{}/*", base.display()), Permission::Ro)]);
+
+    block(async {
+        let mirrored: PathBuf = base.clone();
+        let before = f.dir_entries(&mirrored, inodes::ROOT_INODE, 0);
+        assert_eq!(
+            before.iter().filter(|(n, _)| n != OsStr::new(".")).count(),
+            1,
+            "exactly one entry before the change"
+        );
+        // Host-side change (ctime and mtime both move).
+        std::fs::write(base.join("b"), b"2").unwrap();
+        std::fs::remove_file(base.join("a")).unwrap();
+        let after = f.dir_entries(&mirrored, inodes::ROOT_INODE, 0);
+        let names: Vec<_> = after.iter().map(|(n, _)| n.to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"b".to_string()), "new entry must be listed: {names:?}");
+        assert!(!names.contains(&"a".to_string()), "removed entry must be gone: {names:?}");
+    });
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A redirect-only spec must still get a working root directory: the
+/// root-dir "is anything navigable" check used to omit `Redirect`, so
+/// `readdir("/")` failed with ENOENT while lookups worked (info finding).
+#[test]
+fn redirect_only_specs_have_a_listable_root() {
+    let base = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-redirect-root-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("x"), b"content").unwrap();
+    let f = fs(&[(
+        "/mirrored",
+        Permission::Redirect {
+            source: base.clone(),
+            writable: false,
+        },
+    )]);
+
+    assert!(f.patterns.dir_prefix(Path::new("/")));
+    block(async {
+        let entries = f.dir_entries(Path::new("/mirrored"), inodes::ROOT_INODE, 0);
+        let names: Vec<_> = entries.iter().map(|(n, _)| n.to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"x".to_string()), "redirected root must list its source: {names:?}");
+    });
 
     std::fs::remove_dir_all(&base).unwrap();
 }

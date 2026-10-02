@@ -200,6 +200,16 @@ impl Spec {
                 if path.exists() {
                     Self::read(&path)
                 } else {
+                    // Falling back to an empty policy is silent otherwise —
+                    // running from the wrong CWD (or after an attacker
+                    // renamed the spec dir) would quietly change the
+                    // effective policy from "restricted" to "empty tmpfs
+                    // root + host network" (AUDIT.md L9). Warn on stderr.
+                    eprintln!(
+                        "ai-bubble: warning: no spec file at {}; using an empty \
+                         policy (empty tmpfs root, host network, no mappings)",
+                        path.display()
+                    );
                     Spec::default()
                 }
             }

@@ -240,6 +240,17 @@ pub(crate) fn open_at(
     Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
+/// `fstat` of an already-open descriptor (used to stamp the pinned
+/// directory descriptor for the readdir cache).
+pub(crate) fn fstat(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: valid descriptor and a writable `stat` buffer.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` on the anchored path — the anchored
 /// equivalent of `symlink_metadata`: the final component is never followed,
 /// and (unlike the string-based call) neither is anything above it.

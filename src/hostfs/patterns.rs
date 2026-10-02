@@ -410,7 +410,11 @@ impl Patterns {
             return self.patterns.iter().any(|(_, permission)| {
                 matches!(
                     permission,
-                    Permission::Ro | Permission::Rw | Permission::Empty | Permission::Inject { .. }
+                    Permission::Ro
+                        | Permission::Rw
+                        | Permission::Empty
+                        | Permission::Inject { .. }
+                        | Permission::Redirect { .. }
                 )
             });
         }

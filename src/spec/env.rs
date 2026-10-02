@@ -77,7 +77,22 @@ impl EnvConfig {
         let file = super::file::expand_str(file)
             .map_err(|e| format!("Invalid env file path {file:?}: {e}"))?;
         let path = spec_dir.join(file);
-        let text = std::fs::read_to_string(&path)
+        // The env file holds *secrets*; the docs say "relative to the spec
+        // directory", so enforce it (AUDIT.md L10): an absolute RHS of
+        // `join` (or a `../..` path) must not load a dotenv file from
+        // anywhere else on the host.
+        let real = std::fs::canonicalize(&path)
+            .map_err(|e| format!("Can't resolve env file {}: {e}", path.display()))?;
+        let spec_real = std::fs::canonicalize(spec_dir)
+            .map_err(|e| format!("Can't resolve spec dir {}: {e}", spec_dir.display()))?;
+        if !real.starts_with(&spec_real) {
+            return Err(format!(
+                "Env file {} escapes the spec directory; env files must live \
+                 inside it (docs: \"relative to the spec directory\")",
+                path.display()
+            ));
+        }
+        let text = std::fs::read_to_string(&real)
             .map_err(|e| format!("Can't read env file {}: {e}", path.display()))?;
         let entries = parse_dotenv(&text).map_err(|e| format!("Invalid env file {path:?}: {e}"))?;
         for (name, raw) in entries {

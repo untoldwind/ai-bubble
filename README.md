@@ -564,10 +564,15 @@ command yields `128+signal`.
 Note on trust: the proxy (`P`) and the command share one user namespace,
 so `P`'s files are visible to the command's (non-root) uid — but the
 command runs with **no capabilities at all**, so it cannot exercise the
-namespace privileges that `P` keeps (loopback setup, ...). In the worst
-case a hostile command could kill `P` (cutting its own network access —
-it gains nothing else). Fully separating them would require an additional
-namespace split.
+namespace privileges that `P` keeps (loopback setup, ...). Signals are
+not a problem: the command lives in its own PID namespace, so it cannot
+even *address* `P` (P is in the parent PID namespace — a hostile command
+cannot kill it; the claim that it could was inaccurate). The real
+residual risk is `P`'s parsing of untrusted input (all length-bounded:
+CONNECT header 8 KiB, TLS ClientHello 64 KiB, DNS query 4 KiB) plus
+resource exhaustion (bounded by connection caps, timeouts and the
+`tls-cert` token bucket). Fully separating the user namespaces would
+require an additional namespace split.
 
 ### The alternative: waf mode
 
@@ -597,7 +602,8 @@ process) and injects that CA as the sandbox's trust anchor — as
 Debian/Ubuntu/Alpine), as `/etc/pki/tls/certs/ca-bundle.crt` (the
 Fedora/RHEL equivalent), and via `SSL_CERT_FILE` in the sandbox's
 environment. For every SNI the in-sandbox HTTPS server sees, the host
-signs a short-lived leaf certificate (`tls-cert` command) and the
+signs a leaf certificate per SNI (`tls-cert` command; fresh key pair per
+request, per-run CA) and the
 sandbox serves it with rustls; clients then see a chain that verifies
 against the injected CA. No fake `openssl.cnf` is needed — OpenSSL only
 reads its configuration file for creating certificates or config-driven
@@ -608,16 +614,23 @@ in proxy mode; a bare `host` entry is both resolvable (DNS) and
 connectable, and a `host:port` entry resolves the host too (the port
 restriction is applied again on every `connect`).
 
+Note the inherent limit of TCP-layer allow-listing (both modes): a
+`host:port` entry cannot distinguish *domains* served by shared
+infrastructure — `CONNECT allowed.com:443` with a TLS SNI or HTTP
+`Host:` header of `evil.com` on the same CDN reaches the disallowed
+domain (domain fronting). The waf mode exists precisely to close this:
+it sees the plaintext (SNI/`Host`) before anything is dialed.
+
 The same namespace/process tree is used as in proxy mode; only the
 in-sandbox listeners differ. No proxy variables are set in the
 environment (there is no proxy to configure).
 
 One caveat: for the sandbox's *resolver* to actually use the in-sandbox
-DNS server, it must be pointed at `127.0.0.2` — typically via an
-`/etc/resolv.conf` that says `nameserver 127.0.0.2` (provide one through
-your mappings, or pass tools their resolver explicitly, e.g.
-`unshare --dns`-style options, `dig @127.0.0.2`, ...). Making this
-automatic is future work.
+DNS server, it must be pointed at `127.0.0.2` — ai-bubble injects an
+`/etc/resolv.conf` saying `nameserver 127.0.0.2` automatically in waf
+mode (as the last mapping, so an explicit `hide` of the same path still
+wins). Unless you hide or override it, plain clients work without
+manual resolver configuration.
 
 #### The command protocol on /net/sock
 

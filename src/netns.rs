@@ -21,8 +21,12 @@
 //! from the host network (the namespace has no interfaces besides
 //! loopback). P's outbound connections to real targets are made by the
 //! original process over Unix-domain sockets, which cross network
-//! namespaces via the filesystem (the socket directory is bind-mounted
-//! at /net inside the sandbox).
+//! namespaces via the filesystem — but the socket directory is *not*
+//! mounted into the sandbox (an earlier `/net` bind mount was never
+//! implemented; see the note on `create_socket_dir`). By default the
+//! command cannot reach the connector socket at all; should a `/net`
+//! mount ever be added, it must come with a `SO_PEERCRED` check that the
+//! peer is P (AUDIT.md L11).
 //!
 //! Tokio runtimes are created strictly *after* every fork, in the process
 //! that actually runs async code — a forked child must never share a
@@ -43,9 +47,12 @@ use crate::sandbox::{
 use crate::spec::internal::{Net, NetMode, Op, SeccompPolicy};
 use crate::waf;
 
-/// Temporary host directory holding the proxy socket. It is bind-mounted
-/// at /net inside the sandbox so that the (network-isolated) child can
-/// reach the connector.
+/// Temporary host directory holding the proxy socket. It is *not* mounted
+/// into the sandbox: a `/net` bind mount was considered but never
+/// implemented (stale comments used to claim otherwise), so the command
+/// cannot reach the connector at all — the safer state (AUDIT.md L11).
+/// If the mount is ever added, verify with `SO_PEERCRED` that the peer is
+/// P before serving it.
 ///
 /// `env` is the sandbox's isolated environment (the spec's `env` section);
 /// the proxy variables are merged into it below. `cwd` is the command's
@@ -82,6 +89,10 @@ pub fn run(
         }
         if pid == 0 {
             drop(listener);
+            // P only relays `tls-cert` requests to the connector; the CA
+            // private key fork-copied into its address space is dropped
+            // here (AUDIT.md L8).
+            waf::host::wipe_after_fork();
             isolated_parent(
                 &netdir,
                 net,

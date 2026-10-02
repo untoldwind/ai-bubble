@@ -287,9 +287,27 @@ struct HostFs {
     /// stateless (injected files, directories); an unknown `fh` falls back
     /// to the stateless reopen, so a lost entry degrades instead of failing.
     handles: std::sync::Mutex<HashMap<u64, std::sync::Arc<OpenHandle>>>,
+    /// Cached real-entry names per directory inode, validated by the
+    /// directory's mtime/ctime (AUDIT.md L14: readdir must not re-list
+    /// and re-filter the whole directory on every follow-up call). The
+    /// pattern list never changes during a session, so the filtered
+    /// names stay valid as long as the host directory's timestamps do.
+    dir_cache: std::sync::Mutex<HashMap<u64, DirNames>>,
     /// The next `fh` to hand out; 0 is reserved for stateless IO.
     next_fh: AtomicU64,
 }
+
+/// A cached directory listing: the host directory's (mtime, mtime-nsec,
+/// ctime, ctime-nsec) stamp at listing time and the filtered, sorted
+/// names. Inode numbers are never reused, so a stale entry can only be
+/// memory, never a wrong listing (the stamp check re-lists on change).
+struct DirNames {
+    stamp: (libc::time_t, libc::c_long, libc::time_t, libc::c_long),
+    names: Vec<std::ffi::OsString>,
+}
+
+/// The number of cached directory listings kept at most (see `dir_cache`).
+const DIR_CACHE_MAX: usize = 64;
 
 /// One open host file behind a FUSE handle. The file is kept open for the
 /// handle's lifetime (released with it in `release`), so sequential reads
@@ -326,6 +344,7 @@ impl HostFs {
                 .unwrap_or_else(|e| die(&format!("Can't pin the host root directory: {e}"))),
             inodes: std::sync::RwLock::new(InodeMap::new()),
             handles: std::sync::Mutex::new(HashMap::new()),
+            dir_cache: std::sync::Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
         }
     }
@@ -335,28 +354,37 @@ impl HostFs {
         self.next_fh.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Register an opened host file under a fresh `fh`.
+    /// The cap on simultaneously open host-file handles (AUDIT.md L14:
+    /// unbounded open handles let a malicious command exhaust the FUSE
+    /// server's memory and host fds). An open over the cap fails with
+    /// ENFILE — the same error the kernel reports when the system-wide
+    /// table is full.
+    const MAX_HANDLES: usize = 8192;
+
+    /// Register an opened host file under a fresh `fh`. Fails with ENFILE
+    /// when the handle table is full.
     fn insert_handle(
         &self,
         file: std::fs::File,
         path: PathBuf,
         append: bool,
         writable: bool,
-    ) -> u64 {
+    ) -> std::io::Result<u64> {
+        let mut table = self.handles.lock().expect("hostfs handle table poisoned");
+        if table.len() >= Self::MAX_HANDLES {
+            return Err(std::io::Error::from_raw_os_error(libc::ENFILE));
+        }
         let fh = self.alloc_fh();
-        self.handles
-            .lock()
-            .expect("hostfs handle table poisoned")
-            .insert(
-                fh,
-                std::sync::Arc::new(OpenHandle {
-                    file: std::sync::Mutex::new(file),
-                    path,
-                    append,
-                    writable,
-                }),
-            );
-        fh
+        table.insert(
+            fh,
+            std::sync::Arc::new(OpenHandle {
+                file: std::sync::Mutex::new(file),
+                path,
+                append,
+                writable,
+            }),
+        );
+        Ok(fh)
     }
 
     /// Take a handle's file out of the table (`release`): dropping the
@@ -556,47 +584,76 @@ impl HostFs {
     /// stats the real host directory, with the directory's descriptor
     /// pinned before the entries are listed and each entry's attributes
     /// taken from that descriptor (anchored, see [`anchored`]).
-    fn dir_entries(&self, mirrored: &Path) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
+    fn dir_entries(
+        &self,
+        mirrored: &Path,
+        inode: Inode,
+        offset: usize,
+    ) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
         // A directory named by a mirrored pattern itself is a recursive
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
         let unfiltered = self.patterns.matches(mirrored);
         let base_real = self.patterns.redirect(mirrored);
         let mut dir: Option<std::os::fd::OwnedFd> = None;
-        let mut names: Vec<std::ffi::OsString> = Vec::new();
-        if let Ok(opened) = anchored::open_dir(&self.root, &base_real) {
-            // `readdir_names` consumes its descriptor (fdopendir/closedir
-            // own it), so it lists a *duplicate*; the original stays
-            // pinned below for the entries' attributes.
-            let listing = opened
-                .try_clone()
-                .map(anchored::readdir_names)
-                .unwrap_or_default();
-            dir = Some(opened);
-            for name in listing {
-                // Fail closed for names that can never match a
-                // pattern: they are not creatable through the
-                // mirror, so they must not be listed either —
-                // otherwise readdir would advertise entries lookup
-                // can never resolve (undeletable "ghost" entries).
-                if name.to_str().is_none() {
-                    continue;
-                }
-                let child = mirrored.join(&name);
-                // Empty-path precedence: nothing below an empty path is
-                // visible, not even a mirror match. Denied entries (and
-                // everything below a hidden directory) are hidden even
-                // inside a recursively mirrored directory.
-                if self.patterns.under_empty(&child) || self.patterns.hidden(&child) {
-                    continue;
-                }
-                if unfiltered || self.patterns.exists(&child) {
-                    names.push(name);
-                }
+        let names: Vec<std::ffi::OsString> = match anchored::open_dir(&self.root, &base_real) {
+            Ok(opened) => {
+                // `readdir_names` consumes its descriptor (fdopendir/closedir
+                // owns it), so it lists a *duplicate*; the original stays
+                // pinned below for the entries' attributes.
+                let stamp = match anchored::fstat(opened.as_fd()) {
+                    Ok(st) => (st.st_mtime, st.st_mtime_nsec, st.st_ctime, st.st_ctime_nsec),
+                    Err(_) => (0, 0, 0, 0),
+                };
+                let mut cache = self.dir_cache.lock().expect("hostfs dir cache poisoned");
+                let cached = cache
+                    .get(&inode)
+                    .filter(|hit| hit.stamp == stamp)
+                    .map(|hit| hit.names.clone());
+                let names = cached.unwrap_or_else(|| {
+                    if cache.len() > DIR_CACHE_MAX {
+                        // Inode numbers are never reused, so entries are
+                        // never wrong — they are just memory. Cap the cache
+                        // with a blunt clear instead of an LRU.
+                        cache.clear();
+                    }
+                    let mut names: Vec<std::ffi::OsString> = Vec::new();
+                    let listing = opened
+                        .try_clone()
+                        .map(anchored::readdir_names)
+                        .unwrap_or_default();
+                    for name in listing {
+                        // Fail closed for names that can never match a
+                        // pattern: they are not creatable through the
+                        // mirror, so they must not be listed either —
+                        // otherwise readdir would advertise entries lookup
+                        // can never resolve (undeletable "ghost" entries).
+                        if name.to_str().is_none() {
+                            continue;
+                        }
+                        let child = mirrored.join(&name);
+                        // Empty-path precedence: nothing below an empty path is
+                        // visible, not even a mirror match. Denied entries (and
+                        // everything below a hidden directory) are hidden even
+                        // inside a recursively mirrored directory.
+                        if self.patterns.under_empty(&child) || self.patterns.hidden(&child) {
+                            continue;
+                        }
+                        if unfiltered || self.patterns.exists(&child) {
+                            names.push(name);
+                        }
+                    }
+                    names.sort();
+                    cache.insert(inode, DirNames { stamp, names: names.clone() });
+                    names
+                });
+                dir = Some(opened);
+                names
             }
             // Not a listable directory (or not a real one): the empty
             // listing only leaves the virtual entries below.
-        }
+            Err(_) => Vec::new(),
+        };
         // Virtual entries living directly under this directory (also when
         // the real directory itself cannot be listed): every `empty`,
         // `inject` or `redirect` pattern with a purely literal next
@@ -605,6 +662,7 @@ impl HostFs {
         // (`stat`/`open` resolve it through its redirect) but never
         // listed — readdir would advertise a directory without its
         // visible entries.
+        let mut names = names;
         for (name, permission) in self.patterns.virtual_children(mirrored) {
             let child = mirrored.join(&name);
             if names.iter().any(|n| n.as_os_str() == OsStr::new(&name))
@@ -623,13 +681,21 @@ impl HostFs {
             names.push(OsString::from(name));
         }
         names.sort();
-        let mut entries = Vec::with_capacity(names.len());
-        for name in names {
-            let child = mirrored.join(&name);
-            let attr = self.child_attr(dir.as_ref().map(|d| d.as_fd()), &base_real, &child, &name);
-            entries.push((name, attr));
-        }
-        entries
+        // Only the requested slice is attributed: the per-call cost is
+        // proportional to the reply, not the directory (AUDIT.md L14 —
+        // the previous `skip()` re-listed and re-stat'ed the whole
+        // directory on every call, making readdir of a large directory
+        // quadratic). The sorted, stamp-validated name cache above keeps
+        // the repeated listing of one directory to O(1) per follow-up call.
+        names
+            .into_iter()
+            .skip(offset)
+            .map(|name| {
+                let child = mirrored.join(&name);
+                let attr = self.child_attr(dir.as_ref().map(|d| d.as_fd()), &base_real, &child, &name);
+                (name, attr)
+            })
+            .collect()
     }
 
     /// The attributes of one listed child. Fast path: when the child's
@@ -1102,7 +1168,10 @@ impl Filesystem for HostFs {
             .expect("hostfs inode map poisoned")
             .open_handle(inode);
         let writable = self.patterns.writable(&mirrored);
-        let fh = self.insert_handle(file, mirrored, append, writable);
+        let fh = match self.insert_handle(file, mirrored, append, writable) {
+            Ok(fh) => fh,
+            Err(e) => return Err(e.into()),
+        };
         Ok(ReplyOpen { fh, flags: 0 })
     }
 
@@ -1468,9 +1537,8 @@ impl Filesystem for HostFs {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
-            .dir_entries(&mirrored)
+            .dir_entries(&mirrored, parent, offset.max(0) as usize)
             .into_iter()
-            .skip(offset.max(0) as usize)
             .enumerate()
             .collect();
         // Every listed entry needs a nodeid for the kernel's dentry cache:
@@ -1520,9 +1588,8 @@ impl Filesystem for HostFs {
             return Err(libc::ENOENT.into());
         }
         let entries: Vec<_> = self
-            .dir_entries(&mirrored)
+            .dir_entries(&mirrored, parent, offset as usize)
             .into_iter()
-            .skip(offset as usize)
             .enumerate()
             .collect();
         // Every listed entry needs a nodeid for the kernel's dentry cache:
@@ -2286,7 +2353,10 @@ impl Filesystem for HostFs {
                 .write()
                 .expect("hostfs inode map poisoned")
                 .open_handle(inode);
-            let fh = self.insert_handle(file, mirrored, append, writable);
+            let fh = match self.insert_handle(file, mirrored, append, writable) {
+            Ok(fh) => fh,
+            Err(e) => return Err(e.into()),
+        };
             let mut attr = attr_from_metadata(&md);
             attr.ino = inode;
             return Ok(ReplyCreated {
@@ -2326,7 +2396,10 @@ impl Filesystem for HostFs {
             .write()
             .expect("hostfs inode map poisoned")
             .open_handle(inode);
-        let fh = self.insert_handle(file, mirrored, append, writable);
+        let fh = match self.insert_handle(file, mirrored, append, writable) {
+            Ok(fh) => fh,
+            Err(e) => return Err(e.into()),
+        };
         attr.ino = inode;
         Ok(ReplyCreated {
             ttl: TTL,
@@ -2492,6 +2565,9 @@ pub fn start_host_fs(patterns: &Patterns) {
             libc::close(read_fd);
             disarm_signals();
         }
+        // The FUSE server never signs certificates; drop the waf CA private
+        // key fork-copied into this address space (AUDIT.md L8).
+        crate::waf::host::wipe_after_fork();
         serve(patterns.clone(), mountpoint, write_fd);
         // serve never returns
     }

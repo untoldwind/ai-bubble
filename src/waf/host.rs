@@ -1,8 +1,10 @@
 //! The host side of the waf command protocol.
 //!
 //! This code runs in the original ai-bubble process, i.e. in the host
-//! network namespace. It listens on a Unix-domain socket mounted into
-//! the sandbox and executes the simple command protocol of
+//! network namespace. It listens on a Unix-domain socket that is *not*
+//! mounted into the sandbox (the command cannot reach it directly; see
+//! `netns.rs` — a `/net` mount was never implemented) and executes the
+//! simple command protocol of
 //! [`super`](crate::waf): `resolve-dns <name>`, `connect <host>:<port>`,
 //! `tls-cert <name>` and `tls-connect <host>:<port>`. Every request is
 //! checked against the allow-list here — the single enforcement point of
@@ -14,6 +16,13 @@
 //! server asks for (`tls-cert`), and terminates the *upstream* TLS
 //! connection itself (`tls-connect`) — the sandbox has no real trust
 //! anchors, so only the host can verify the real server's certificate.
+//!
+//! Known information-leak trade-offs (AUDIT.md L12, accepted): the
+//! `resolve-dns` command is an allow-list membership oracle (also
+//! enumerable via the DNS front-end), and the `connect`/`tls-connect`
+//! error strings relay host-side OS/TLS errors, revealing port state on
+//! allowed hosts' resolved IPs. Both are inherent to relaying host-side
+//! network decisions to an untrusted client that needs the answers.
 
 use std::io;
 use std::sync::{Arc, OnceLock};
@@ -351,53 +360,75 @@ struct Pki {
     client: Arc<ClientConfig>,
 }
 
-static PKI: OnceLock<Pki> = OnceLock::new();
+/// The PKI is kept in an `Option` behind a mutex so that a forked child
+/// that must never sign (P, FS — they only relay or serve the FUSE tree)
+/// can *take* and drop it (AUDIT.md L8): `fork` copies the parent's whole
+/// address space, so a plain `OnceLock` would leave the CA private key in
+/// every child's memory. `wipe_after_fork` runs immediately after the fork
+/// in such children; dropping the key pair releases its key material
+/// (ring zeroizes private keys on drop). The original process keeps its
+/// own `Arc` clone — it is the only signer.
+static PKI: std::sync::Mutex<Option<Arc<Pki>>> = std::sync::Mutex::new(None);
 
-/// The waf fake PKI, generated once per process. Must run before the
-/// sandbox is forked so every child inherits the installed crypto
-/// provider state.
-fn pki() -> &'static Pki {
-    PKI.get_or_init(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let ca_key = rcgen::KeyPair::generate().unwrap_or_else(|e| {
-            crate::sandbox::die(&format!("Can't generate the waf CA key: {e}"))
-        });
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
-            .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't set up the waf CA: {e}")));
-        params.distinguished_name.push(
-            rcgen::DnType::CommonName,
-            "ai-bubble waf sandbox CA (not a real authority)",
-        );
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.key_usages = vec![
-            rcgen::KeyUsagePurpose::KeyCertSign,
-            rcgen::KeyUsagePurpose::CrlSign,
-            rcgen::KeyUsagePurpose::DigitalSignature,
-        ];
-        let ca = rcgen::CertifiedIssuer::self_signed(params, ca_key)
-            .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't create the waf CA: {e}")));
+/// The waf fake PKI, generated once per process (lazily, via [`pki`]).
+/// The crypto provider must be installed before the sandbox is forked so
+/// every child inherits the provider state; forked children that never
+/// sign drop the key again via [`wipe_after_fork`].
+fn pki() -> Arc<Pki> {
+    let mut slot = PKI.lock().expect("PKI poisoned");
+    if let Some(pki) = slot.as_ref() {
+        return pki.clone();
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca_key = rcgen::KeyPair::generate().unwrap_or_else(|e| {
+        crate::sandbox::die(&format!("Can't generate the waf CA key: {e}"))
+    });
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+        .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't set up the waf CA: {e}")));
+    params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        "ai-bubble waf sandbox CA (not a real authority)",
+    );
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca = rcgen::CertifiedIssuer::self_signed(params, ca_key)
+        .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't create the waf CA: {e}")));
 
-        let mut roots = RootCertStore::empty();
-        let result = rustls_native_certs::load_native_certs();
-        for cert in result.certs {
-            let _ = roots.add(cert);
-        }
-        if !result.errors.is_empty() {
-            crate::sandbox::die(&format!(
-                "Can't load the system root certificates: {:?}",
-                result.errors
-            ));
-        }
-        let builder =
-            ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-                .with_safe_default_protocol_versions()
-                .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't set up TLS: {e}")));
-        let client = builder.with_root_certificates(roots).with_no_client_auth();
-        Pki {
-            ca,
-            client: Arc::new(client),
-        }
-    })
+    let mut roots = RootCertStore::empty();
+    let result = rustls_native_certs::load_native_certs();
+    for cert in result.certs {
+        let _ = roots.add(cert);
+    }
+    if !result.errors.is_empty() {
+        crate::sandbox::die(&format!(
+            "Can't load the system root certificates: {:?}",
+            result.errors
+        ));
+    }
+    let builder =
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't set up TLS: {e}")));
+    let client = builder.with_root_certificates(roots).with_no_client_auth();
+    let pki = Arc::new(Pki {
+        ca,
+        client: Arc::new(client),
+    });
+    *slot = Some(pki.clone());
+    pki
+}
+
+/// Drop the CA private key from this process's memory (AUDIT.md L8). Must
+/// be called by every forked child that never signs anything (the network
+/// parent P, the FUSE server FS) directly after the fork: `fork` copied
+/// the parent's address space, key material and all. The original process
+/// — the only signer — keeps its `Arc` and is unaffected.
+pub fn wipe_after_fork() {
+    let _ = PKI.lock().expect("PKI poisoned").take();
 }
 
 /// The CA certificate in PEM form, for injection into the sandbox as its
@@ -413,10 +444,12 @@ pub fn ca_certificate_der() -> Vec<u8> {
     pki().ca.der().to_vec()
 }
 
-/// Sign a short-lived leaf certificate for `name` (a SAN, and the SNI the
+/// Sign a leaf certificate for `name` (a SAN, and the SNI the
 /// sandbox client used). Returns the DER-encoded certificate and the
 /// DER-encoded PKCS#8 key. The key exists only for this handshake —
-/// freshly generated per request.
+/// freshly generated per request. (Note: the *validity window* is
+/// rcgen's default — not deliberately short; per-run CA generation,
+/// not leaf expiry, is what limits the blast radius.)
 pub fn sign_leaf(name: &str) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let pki = pki();
     let mut params = rcgen::CertificateParams::new(vec![name.to_string()])
@@ -664,4 +697,30 @@ mod tests {
         assert!(!valid_target("example.com:notaport"));
         assert!(!valid_target("evil .com:443"));
     }
+}
+
+/// The CA private key is dropped in forked children that never sign
+/// (AUDIT.md L8): after `wipe_after_fork`, the PKI slot must be empty —
+/// the forked child no longer holds key material — and the *parent's* PKI
+/// must be unaffected. Runs in a forked child so the wipe cannot race the
+/// other tests' use of the process-global PKI.
+#[test]
+fn wipe_after_fork_drops_the_private_key_in_the_child() {
+    // Ensure the parent has a PKI before forking.
+    let _ = ca_certificate_pem();
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        wipe_after_fork();
+        let dropped = PKI.lock().unwrap().is_none();
+        unsafe { libc::_exit(if dropped { 0 } else { 1 }) };
+    }
+    let mut status: libc::c_int = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "the child must drop the PKI (status {status:#x})"
+    );
+    // The parent keeps its own copy: signing still works.
+    assert!(sign_leaf("wipe-test.example.com").is_ok());
 }

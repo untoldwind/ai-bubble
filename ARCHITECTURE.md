@@ -111,7 +111,8 @@ The FUSE mount is consumed in one of two ways:
 
 * **hostfs-root mode** (the mirror *is* the sandbox root): `S` chroots
   directly into the mountpoint.
-* otherwise: `S` bind-mounts it at `/host` inside the sandbox before chroot.
+* otherwise: `S` bind-mounts it at `/mirrored` inside the sandbox before
+  chroot (`SANDBOX_MOUNT_POINT` in `hostfs/mod.rs`).
 
 Because `S` performs these mounts, the mount must be visible from `S`'s
 mount namespace — which it is, since `S`'s mount namespace is a slave of the

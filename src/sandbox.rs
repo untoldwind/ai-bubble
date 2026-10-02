@@ -3,6 +3,16 @@
 //!
 //! Everything in this module runs *inside* the namespace-building process;
 //! it never touches the network (that is `netns`/`proxy` territory).
+//!
+//! Capability-regain invariant (verified in `kernel/user_namespace.c`,
+//! see AUDIT.md L2): `set_cred_user_ns()` resets `cap_bset` to
+//! `CAP_FULL_SET` when a process creates a new user namespace, so the
+//! bounding-set drop below does **not** protect against a nested-userns
+//! capability regain. The backstop is the **chroot**:
+//! `create_user_ns()` refuses with EPERM when `current_chrooted()` is
+//! true. Every exec path in this module chroots before the command runs;
+//! any future chroot-less mode would silently reopen full capability
+//! regain and must not be added without a replacement control.
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsStr};
@@ -151,6 +161,35 @@ fn ensure_dir(newroot: &Path, dest: &Path) {
     }
 }
 
+/// Mount destinations must not traverse symlinks (AUDIT.md L4): `mount(2)`
+/// follows symlinks in the destination, so an earlier `symlink` op could
+/// silently redirect a later bind/tmpfs/proc mount onto a host path inside
+/// the sandbox's (slaved) mount namespace — exposing paths the spec's
+/// mapping list never mentions. Every component of the destination is
+/// lstat'ed under the new root; any symlink fails the run with a pointed
+/// message. (The final component is checked too: mounting *on* a symlink
+/// would bind the link's target.)
+fn refuse_symlink_dest(newroot: &Path, dest: &Path) {
+    let dest_abs = sandbox_path(newroot, dest);
+    for prefix in dest_abs.ancestors() {
+        // The root itself is never a symlink.
+        if prefix == newroot {
+            continue;
+        }
+        match fs::symlink_metadata(prefix) {
+            Ok(md) if md.file_type().is_symlink() => die(&format!(
+                "Mount destination {} traverses a symlink created by an earlier \
+                 symlink op; mounts must not resolve through symlinks. Fix the spec.",
+                dest.display()
+            )),
+            Ok(_) => {}
+            // Not existing yet: the components above it cannot exist
+            // either, so no symlink can hide below — mkdir will create it.
+            Err(_) => break,
+        }
+    }
+}
+
 /// Write a map file for the current process, following bwrap's order
 /// (uid_map, then setgroups, then gid_map) and semantics.
 pub(crate) fn write_id_map(file: &str, data: &str) {
@@ -249,10 +288,23 @@ pub(crate) fn handle_die_with_parent(enabled: bool) {
 /// root 0.
 pub(crate) const SANDBOX_ID: libc::c_uint = 65535;
 
-/// Highest capability number on the Linux versions this supports; passing
-/// unknown values to PR_CAPBSET_DROP only yields a harmless EINVAL, which
-/// is tolerated, so a slightly stale constant is safe.
-const CAP_LAST: libc::c_ulong = 40; // CAP_CHECKPOINT_RESTORE
+/// Highest capability number, read from `/proc/sys/kernel/cap_last_cap`
+/// like bwrap (AUDIT.md L2). Passing unknown values to `PR_CAPBSET_DROP`
+/// only yields a harmless EINVAL, which is tolerated, so a stale constant
+/// would be safe — but a too-low constant would silently leave *newer*
+/// capabilities in the bounding set, so the kernel's own answer is read.
+/// Fallback: the highest cap on the Linux versions this supports
+/// (`CAP_CHECKPOINT_RESTORE` = 40).
+const CAP_LAST_FALLBACK: libc::c_ulong = 40;
+
+/// The effective highest capability number: `/proc/sys/kernel/cap_last_cap`
+/// when readable, the fallback otherwise.
+fn cap_last() -> libc::c_ulong {
+    fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(CAP_LAST_FALLBACK)
+}
 
 /// Non-isolated entry point: new user + mount namespaces with fresh id
 /// mappings, then the sandbox filesystem and exec.
@@ -480,7 +532,8 @@ pub(crate) unsafe fn drop_all_capabilities() {
     unsafe {
         // Remove every capability from the bounding set so it can never be
         // regained. EINVAL for caps the kernel doesn't know is tolerable.
-        for cap in 0..=CAP_LAST {
+        let cap_last = cap_last();
+        for cap in 0..=cap_last {
             if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0
                 && io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL)
             {
@@ -503,8 +556,10 @@ pub(crate) unsafe fn drop_all_capabilities() {
             }
         }
 
-        // Explicitly empty permitted/effective/inheritable (caps v1: one
-        // 32-bit set each), so nothing is left even before execve.
+        // Explicitly empty permitted/effective/inheritable (caps v3: two
+        // 64-bit set pairs, covering all 41+ capability bits — v1 only
+        // covers caps 0-31, AUDIT.md L1), so nothing is left even before
+        // execve.
         #[repr(C)]
         struct CapHeader {
             version: libc::c_int,
@@ -517,18 +572,25 @@ pub(crate) unsafe fn drop_all_capabilities() {
             inheritable: libc::c_uint,
         }
         let hdr = CapHeader {
-            version: 0x19980330, // _LINUX_CAPABILITY_VERSION_1
+            version: 0x20080522, // _LINUX_CAPABILITY_VERSION_3
             pid: 0,
         };
-        let data = CapData {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        };
+        let data = [
+            CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+            CapData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+        ];
         if libc::syscall(
             libc::SYS_capset,
             &hdr as *const CapHeader,
-            &data as *const CapData,
+            &data as *const [CapData; 2],
         ) != 0
         {
             die_with_error("Can't clear capability sets");
@@ -649,7 +711,11 @@ pub(crate) unsafe fn mount_and_exec(
                 CString::new("tmpfs").unwrap().as_ptr(),
                 newroot_c.as_ptr(),
                 CString::new("tmpfs").unwrap().as_ptr(),
-                0,
+                // NOSUID|NODEV like `mount_tmpfs` (AUDIT.md L5): the root is
+                // attacker-writable inside the sandbox, so it must not honor
+                // set-id bits or device nodes (unreachable today —
+                // no_new_privs, no CAP_MKNOD — but the flags cost nothing).
+                libc::MS_NOSUID | libc::MS_NODEV,
                 std::ptr::null(),
             ) != 0
             {
@@ -705,6 +771,7 @@ pub(crate) unsafe fn mount_and_exec(
                     // In hostfs-root mode they must already exist in the
                     // mirror (the FUSE filesystem only exposes mirrored paths).
                     ensure_dir(&newroot, dest);
+                    refuse_symlink_dest(&newroot, dest);
                     let dest_c = cstring(dest_abs.as_os_str());
                     if libc::mount(
                         src_c.as_ptr(),
@@ -744,6 +811,7 @@ pub(crate) unsafe fn mount_and_exec(
                         die(&format!("Invalid proc mount point {}", dest.display()));
                     }
                     ensure_dir(&newroot, dest);
+                    refuse_symlink_dest(&newroot, dest);
                     let dest_abs = sandbox_path(&newroot, dest);
                     let dest_c = cstring(dest_abs.as_os_str());
                     // Mount a *fresh* procfs, like bwrap's --proc does when a
@@ -770,6 +838,7 @@ pub(crate) unsafe fn mount_and_exec(
                         die(&format!("Invalid tmpfs mount point {}", dest.display()));
                     }
                     ensure_dir(&newroot, dest);
+                    refuse_symlink_dest(&newroot, dest);
                     let dest_abs = sandbox_path(&newroot, dest);
                     mount_tmpfs(&dest_abs, perms.unwrap_or(TmpfsPerms::DEFAULT), *size, dest);
                 }
@@ -781,6 +850,7 @@ pub(crate) unsafe fn mount_and_exec(
                         die(&format!("Invalid dev mount point {}", dest.display()));
                     }
                     ensure_dir(&newroot, dest);
+                    refuse_symlink_dest(&newroot, dest);
                     let dev_abs = sandbox_path(&newroot, dest);
                     // Like bwrap's --dev: a fresh mode-0755 tmpfs, populated
                     // with the standard device nodes and symlinks below.
@@ -1057,6 +1127,11 @@ pub(crate) unsafe fn mount_and_exec(
             if key.is_empty() || key.contains('=') || key.contains('\0') {
                 die(&format!("Invalid environment variable name {key:?}"));
             }
+            if value.contains('\0') {
+                // set_var panics on interior NULs; the values were never
+                // validated (AUDIT.md L10).
+                die(&format!("Invalid environment value for {key:?} (contains NUL)"));
+            }
             std::env::set_var(key, value);
         }
 
@@ -1084,6 +1159,25 @@ pub(crate) unsafe fn mount_and_exec(
         argv_ptrs.push(std::ptr::null());
 
         let _ = io::Write::flush(&mut io::stdout());
+
+        // Close every inherited fd above stderr (AUDIT.md L3): a caller-
+        // leaked host *directory* fd would let `fchdir` move the command's
+        // cwd outside the chroot — full host-fs access within this mount
+        // namespace. ai-bubble's own fds are all CLOEXEC; this closes fds
+        // the *caller* leaked into the run. `close_range` is one syscall
+        // and atomic; on older kernels fall back to a plain close sweep
+        // (a hole between the sweep's table read and exec is not a concern:
+        // the sweeper holds no racing threads).
+        if libc::syscall(libc::SYS_close_range, 3u64, libc::c_uint::MAX, 0u64) != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ENOSYS) && e.raw_os_error() != Some(libc::EINVAL) {
+                die_with_error("Can't close inherited file descriptors");
+            }
+            for fd in 3..4096 {
+                libc::close(fd);
+            }
+        }
+
         libc::execvp(argv[0].as_ptr(), argv_ptrs.as_ptr());
         die_with_error(&format!("Can't exec {}", command[0]));
     }

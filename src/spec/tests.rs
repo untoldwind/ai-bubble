@@ -632,3 +632,40 @@ fn unset_env_var_in_a_mapping_field_is_a_deserialize_error() {
         .is_ok()
     );
 }
+
+/// The env file must live inside the spec directory (AUDIT.md L10): an
+/// absolute path or a `..`-escape would load a dotenv file — i.e. secrets
+/// and env values — from anywhere on the host, contradicting the docs
+/// ("relative to the spec directory").
+#[test]
+fn env_file_outside_the_spec_dir_is_refused() {
+    use super::env::EnvConfig;
+    let dir = std::env::temp_dir().join(format!("ai-bubble-spec-envdir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("inner.env"), "A=1").unwrap();
+    let outside = format!("ai-bubble-outside-{}.env", std::process::id());
+    std::fs::write(std::env::temp_dir().join(&outside), "A=1").unwrap();
+
+    for file in [
+        format!("../{outside}"),
+        std::env::temp_dir().join(&outside).to_string_lossy().into_owned(),
+    ] {
+        let mut env = EnvConfig {
+            env_file: Some(file),
+            values: Default::default(),
+        };
+        let err = env
+            .load_env_file(&dir)
+            .expect_err("an env file outside the spec dir must be refused");
+        assert!(err.contains("escapes the spec directory"), "{err}");
+    }
+
+    // Inside the spec dir still works.
+    let mut env = EnvConfig {
+        env_file: Some("inner.env".to_string()),
+        values: Default::default(),
+    };
+    env.load_env_file(&dir).expect("an env file inside the spec dir is fine");
+    std::fs::remove_dir_all(&dir).unwrap();
+    let _ = std::fs::remove_file(std::env::temp_dir().join(&outside));
+}
