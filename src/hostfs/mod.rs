@@ -1665,12 +1665,53 @@ impl Filesystem for HostFs {
             f.set_len(size)?;
         }
         if let Some(mode) = set_attr.mode {
-            // fchmodat without AT_SYMLINK_NOFOLLOW keeps the old chmod
-            // semantics for the final component (it follows a symlink
-            // standing there, see finding M4); the anchored parent keeps
-            // every intermediate component honest.
-            if unsafe { libc::fchmodat(dirfd, name, mode as libc::mode_t, 0) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
+            // chmod must not follow a final-component symlink: applied to
+            // a mirrored path that is a host symlink at a writable location,
+            // a following chmod would change the permissions of the symlink's
+            // TARGET, which may live outside every mapping (finding M4).
+            // Prefer `fchmodat(AT_SYMLINK_NOFOLLOW)` (glibc 2.32+ forwards it
+            // to `fchmodat2`, Linux ≥ 6.6), which changes the mode of the
+            // symlink inode itself. On older glibc/kernel combinations the
+            // flag is unsupported (EINVAL/ENOSYS/EOPNOTSUPP); fall back to a
+            // lstat check: refuse to chmod a symlink at all (EACCES, matching
+            // the sibling denial style above) and otherwise chmod the regular
+            // file/directory with the historic flags.
+            //
+            // The requested mode is masked to `0o7777` and its setuid/setgid
+            // bits (0o6000) are stripped silently: for an unprivileged user
+            // fchmod cannot set them anyway, but ai-bubble may legitimately
+            // run elevated (root in a container), and then a mode like 0o4755
+            // through the mirror would plant dangerous privilege bits on the
+            // host.
+            let mode = (mode & 0o7777 & !0o6000) as libc::mode_t;
+            if unsafe { libc::fchmodat(dirfd, name, mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) => {}
+                    _ => return Err(err.into()),
+                }
+                // Flag unsupported: make sure the final component is not a
+                // symlink before chmod-following it.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::fstatat(
+                        dirfd,
+                        name,
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+                    // Deny: the entry is a host symlink, its target is not
+                    // guaranteed to be mirrored.
+                    return Err(libc::EACCES.into());
+                }
+                if unsafe { libc::fchmodat(dirfd, name, mode, 0) } != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
             }
         }
         if set_attr.uid.is_some() || set_attr.gid.is_some() {

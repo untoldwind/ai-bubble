@@ -1,6 +1,7 @@
 use super::*;
 use crate::hostfs::pattern::{Pattern, Walk};
 use crate::hostfs::patterns::Permission;
+use std::os::unix::fs::PermissionsExt;
 
 fn fs(entries: &[(&str, Permission)]) -> HostFs {
     HostFs::collect(&Patterns::new(
@@ -673,6 +674,125 @@ fn open_of_an_empty_path_never_opens_the_real_file() {
 
     // The real file is untouched and its content never left the host side.
     assert_eq!(std::fs::read(&secret).unwrap(), b"HOST-SECRET");
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A chmod (`setattr` with a mode) on a mirrored path that is a host symlink
+/// at a writable location must never chmod the symlink's TARGET: the target
+/// may live outside every mapping (audit finding M4). Before the fix,
+/// `fchmodat` without `AT_SYMLINK_NOFOLLOW` followed the link and changed the
+/// permissions of the file it pointed at.
+#[test]
+fn setattr_chmod_does_not_follow_a_final_symlink() {
+    let base = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-m4-chmod-link-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("target"), b"HOST-SECRET").unwrap();
+    std::os::unix::fs::symlink("target", base.join("evil")).unwrap();
+    let f = fs(&[(base.to_str().unwrap(), Permission::Rw)]);
+
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+    let evil_ino = block(async {
+        f.lookup(Request::default(), base_ino, OsStr::new("evil"))
+            .await
+            .expect("lookup evil")
+            .attr
+            .ino
+    });
+
+    // chmod through the mirror: either refused, or applied to the link
+    // itself — but the target must keep its mode either way.
+    let res = block(async {
+        f.setattr(
+            Request::default(),
+            evil_ino,
+            None,
+            SetAttr {
+                mode: Some(0o700),
+                ..SetAttr::default()
+            },
+        )
+        .await
+    });
+    if let Err(res) = &res {
+        assert_eq!(
+            <fuse3::Errno>::from(libc::EACCES),
+            *res,
+            "chmod of a mirror symlink must fail with EACCES"
+        );
+    }
+
+    // The symlink is still a symlink, and its target's permissions are
+    // exactly what they were before the attempted chmod.
+    let link_meta = std::fs::symlink_metadata(base.join("evil")).unwrap();
+    assert!(link_meta.file_type().is_symlink(), "evil stays a symlink");
+    let target_mode = std::fs::metadata(base.join("target")).unwrap().permissions().mode();
+    assert_eq!(
+        target_mode & 0o7777,
+        0o644,
+        "the symlink target's mode must be unchanged"
+    );
+    assert_eq!(std::fs::read(base.join("target")).unwrap(), b"HOST-SECRET");
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A chmod through the mirror must not be able to plant setuid/setgid bits
+/// on a real host file: the requested mode is masked to `0o7777` with the
+/// `0o6000` bits stripped (audit finding L6 — harmless for unprivileged
+/// users, dangerous if ai-bubble runs as root).
+#[test]
+fn setattr_chmod_strips_setuid_and_setgid_bits() {
+    let base = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-l6-setuid-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("file"), b"data").unwrap();
+    let f = fs(&[(base.to_str().unwrap(), Permission::Rw)]);
+
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+    let file_ino = block(async {
+        f.lookup(Request::default(), base_ino, OsStr::new("file"))
+            .await
+            .expect("lookup file")
+            .attr
+            .ino
+    });
+
+    block(async {
+        f.setattr(
+            Request::default(),
+            file_ino,
+            None,
+            SetAttr {
+                mode: Some(0o4755),
+                ..SetAttr::default()
+            },
+        )
+        .await
+        .expect("chmod of a regular file succeeds")
+    });
+
+    let mode = std::fs::metadata(base.join("file")).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o7777,
+        0o755,
+        "the setuid/setgid bits must be stripped silently"
+    );
 
     std::fs::remove_dir_all(&base).unwrap();
 }

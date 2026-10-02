@@ -17,6 +17,7 @@
 
 use std::io;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use rustls::pki_types::ServerName;
@@ -24,6 +25,7 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 
+use crate::connlimit::ConnLimit;
 use crate::proxy::allowlist::{host_allowed, target_allowed};
 use crate::proxy::ipfilter::connect_checked;
 
@@ -31,13 +33,30 @@ use crate::proxy::ipfilter::connect_checked;
 /// address, inside the sandbox network namespace).
 pub const REDIRECT_ADDR: &str = "127.0.0.2";
 
+/// How long a sandbox-side client may take to send its one command line.
+/// A command that opens command connections but never sends must not
+/// hold a task (and a supervisor file descriptor) forever — part of
+/// AUDIT.md M10. The timeout guards only the command line; a piped
+/// connection after a successful `connect`/`tls-connect` is never
+/// timed out.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Accept loop on the host side: one command per connection.
+/// Concurrent connections are capped (see [`crate::connlimit`]): each
+/// accepted connection holds a file descriptor of the supervisor, so an
+/// unbounded number of idle connections would exhaust them. At capacity
+/// the new connection is dropped immediately.
 pub async fn serve_host(listener: UnixListener, allow: Vec<String>, allow_private: bool) {
+    let limit = ConnLimit::new();
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                let Some(guard) = limit.try_acquire() else {
+                    continue; // at capacity: drop the connection
+                };
                 let allow = allow.clone();
                 tokio::spawn(async move {
+                    let _guard = guard;
                     handle_host_conn(stream, &allow, allow_private).await;
                 });
             }
@@ -50,7 +69,13 @@ pub async fn serve_host(listener: UnixListener, allow: Vec<String>, allow_privat
 /// a single reply line (`OK ...` / `ERR <reason>`). A `connect` command
 /// turns the connection into a raw bidirectional pipe after `OK`.
 async fn handle_host_conn(mut stream: UnixStream, allow: &[String], allow_private: bool) {
-    let Some(cmd) = read_line(&mut stream).await else {
+    // The command line must arrive within COMMAND_TIMEOUT (see the
+    // constant's doc); a timed-out read is handled like a closed one.
+    let cmd = match tokio::time::timeout(COMMAND_TIMEOUT, read_line(&mut stream)).await {
+        Ok(cmd) => cmd,
+        Err(_) => return,
+    };
+    let Some(cmd) = cmd else {
         return;
     };
     let cmd = cmd.trim();
@@ -107,6 +132,17 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String], allow_privat
             eprintln!("ai-bubble waf: TLS certificate for {name} denied");
             crate::audit::record("waf", "tls-cert", Some(name), Some("denied"), None).await;
             let _ = stream.write_all(b"ERR name not on the allow list\n").await;
+            return;
+        }
+        // Keygen costs real host CPU (a fresh RSA-grade key pair plus a
+        // signature per request). Rate-limit it so the sandbox cannot
+        // burn the supervisor's CPU by requesting certificates in a
+        // loop (AUDIT.md M10); excess requests get an ERR, which the
+        // in-sandbox HTTPS server already handles as a failed MITM.
+        if !take_keygen_token().await {
+            eprintln!("ai-bubble waf: tls-cert for {name} rate-limited");
+            crate::audit::record("waf", "tls-cert", Some(name), Some("rate-limited"), None).await;
+            let _ = stream.write_all(b"ERR too many certificate requests\n").await;
             return;
         }
         let (cert, key) = match sign_leaf(name) {
@@ -228,6 +264,63 @@ async fn read_line(stream: &mut UnixStream) -> Option<String> {
         return None;
     }
     Some(t)
+}
+
+/// A token bucket throttling leaf-key generation (`tls-cert`). Each
+/// request consumes one token; tokens refill at one per
+/// [`KEYGEN_INTERVAL`] up to [`KEYGEN_BURST`], so a burst of
+/// [`KEYGEN_BURST`] immediate requests is served and the sustained rate
+/// is one keygen every [`KEYGEN_INTERVAL`]. This bounds the host CPU a
+/// malicious sandbox can burn with certificate requests (AUDIT.md M10):
+/// leaf keygen is expensive (fresh key pair + signature per request).
+struct KeygenThrottle {
+    tokens: u32,
+    last: Instant,
+}
+
+/// Refill rate: one new keygen token per interval.
+const KEYGEN_INTERVAL: Duration = Duration::from_millis(250);
+/// Burst allowance: how many keygens may run back-to-back before the
+/// throttle kicks in.
+const KEYGEN_BURST: u32 = 4;
+
+impl KeygenThrottle {
+    fn new() -> Self {
+        KeygenThrottle {
+            tokens: KEYGEN_BURST,
+            last: Instant::now(),
+        }
+    }
+
+    /// Consume one token, refilling first. `false` when throttled.
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last);
+        if elapsed >= KEYGEN_INTERVAL {
+            // Refill every fully elapsed interval, keeping the remainder
+            // in `last` so the sustained rate is honored exactly.
+            let ticks = (elapsed.as_millis() / KEYGEN_INTERVAL.as_millis()) as u32;
+            self.tokens = self.tokens.saturating_add(ticks).min(KEYGEN_BURST);
+            self.last += KEYGEN_INTERVAL * ticks;
+        }
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The process-wide throttle, shared by all command connections.
+static KEYGEN_THROTTLE: OnceLock<tokio::sync::Mutex<KeygenThrottle>> = OnceLock::new();
+
+/// Take one keygen token (see [`KeygenThrottle`]). `false` when the
+/// request is throttled and should be answered with an ERR.
+async fn take_keygen_token() -> bool {
+    let throttle = KEYGEN_THROTTLE.get_or_init(|| tokio::sync::Mutex::new(KeygenThrottle::new()));
+    let mut throttle = throttle.lock().await;
+    throttle.take()
 }
 
 /// Sanity-check a DNS name before it reaches the allow-list matcher.
@@ -539,6 +632,21 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// The keygen throttle serves its burst allowance, then refuses,
+    /// and refills one token per interval (AUDIT.md M10).
+    #[test]
+    fn keygen_throttle_bounds_burst_and_refills() {
+        let mut t = KeygenThrottle::new();
+        for _ in 0..KEYGEN_BURST {
+            assert!(t.take());
+        }
+        assert!(!t.take(), "burst exhausted but a token was still granted");
+        // After one interval a fresh token appears (and only one).
+        std::thread::sleep(KEYGEN_INTERVAL + Duration::from_millis(30));
+        assert!(t.take());
+        assert!(!t.take());
     }
 
     #[test]

@@ -13,6 +13,11 @@
 //! - `**` **inside** a longer component (`a**b`) degrades to `*` (like in
 //!   the shell) — it never spans directories; spell `dir/**/part` when
 //!   spanning is intended,
+//! - `\` escapes the next character when it is a metacharacter (`*`,
+//!   `?`, `[`, `]` or `\` itself) — `\*` matches a literal `*`; a `\`
+//!   before anything else (or at the end of a component) is a literal
+//!   backslash. This lets patterns name paths that *contain* wildcard
+//!   characters (see [`escape_glob`]),
 //! - matching is **case-sensitive** and operates on UTF-8 text: a path
 //!   component that is not valid UTF-8 can never match, so every
 //!   pattern-derived decision about it fails closed (not visible, not
@@ -346,6 +351,19 @@ fn tokenize(part: &str) -> Result<Vec<Token>, String> {
     let mut chars = part.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            '\\' => {
+                // An escape: a backslash before a metacharacter makes it
+                // literal. Before anything else (or at the end of the
+                // component) it stays a literal backslash, so existing
+                // patterns that merely contain a `\` keep their meaning.
+                match chars.peek() {
+                    Some(m @ ('*' | '?' | '[' | ']' | '\\')) => {
+                        tokens.push(Token::Literal(*m));
+                        chars.next();
+                    }
+                    _ => tokens.push(Token::Literal('\\')),
+                }
+            }
             '*' => {
                 // Collapse runs of stars; `**` inside a longer component
                 // behaves like a single `*` (see the module docs).
@@ -399,6 +417,25 @@ fn parse_class(
             items.push(ClassItem::Single(c));
         }
     }
+}
+
+/// Escape the glob metacharacters in `text` so it can be used as a
+/// (fragment of a) **literal** pattern: `*`, `?`, `[`, `]` and `\` are
+/// prefixed with a `\`, which [`Pattern::new`]'s tokenizer interprets as
+/// "the next character is literal". Used wherever a host path (which may
+/// legitimately contain wildcard characters, e.g. a directory named
+/// `job[42]`) must match itself exactly rather than as a glob — notably
+/// the spec directory's auto-hide pattern (see
+/// [`crate::spec::file::Spec::hide_spec_dir`]).
+pub fn escape_glob(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Match one path component against its tokens. `Star` needs the classic

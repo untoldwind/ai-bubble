@@ -13,8 +13,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::OnceLock;
 
 use crate::spec::internal::{Op, SeccompPolicy, SeccompViolation};
+use crate::spec::rlimits::Rlimits;
 use crate::spec::tmpfs::TmpfsPerms;
 
 pub(crate) fn die(msg: &str) -> ! {
@@ -25,6 +27,71 @@ pub(crate) fn die(msg: &str) -> ! {
 pub(crate) fn die_with_error(msg: &str) -> ! {
     eprintln!("ai-bubble: {msg}: {}", io::Error::last_os_error());
     exit(1)
+}
+
+/// The spec's `rlimits` section, registered when the spec is compiled
+/// ([`crate::spec::internal::SandboxConfig::compile`]) and applied by
+/// `mount_and_exec` in the sandboxed child (see [`apply_rlimits`]).
+///
+/// Why a static: the compiled `SandboxConfig` is not handed down the
+/// exec pipeline as a whole — `setup_and_exec`/`netns::run` receive
+/// individual pieces (`ops`, `net`, `env`, seccomp) — and the compile
+/// runs in the original ai-bubble process before every fork, so the
+/// registration is inherited across fork with the rest of the address
+/// space, exactly like the values that are handed down explicitly.
+static RLIMITS: OnceLock<Rlimits> = OnceLock::new();
+
+/// Record the spec's `rlimits` for the exec path (see [`RLIMITS`]).
+/// Called from the spec compile step; the first compile wins (a re-run
+/// in the same process is not a supported scenario).
+pub(crate) fn register_rlimits(rlimits: Rlimits) {
+    let _ = RLIMITS.set(rlimits);
+}
+
+/// The registered rlimits (the inert default when nothing was
+/// registered).
+fn current_rlimits() -> Rlimits {
+    *RLIMITS.get().unwrap_or(&Rlimits::default())
+}
+
+/// Apply the spec's `rlimits` section to this process with setrlimit:
+/// every present field is set with **soft == hard**, so the sandboxed
+/// command cannot raise the limit back up after exec. Absent fields are
+/// left untouched — the sandbox does not guess limits the operator did
+/// not configure (a too-low limit turns a legitimate build into a
+/// mysterious `EMFILE`/`EAGAIN`/`ENOMEM`). A failed setrlimit is a hard
+/// error: a limit the operator asked for but that cannot be applied
+/// must not silently go missing.
+///
+/// These limits protect the *host* (AUDIT.md M10, resource isolation):
+/// they bound the command's process count (`RLIMIT_NPROC`, the fork-bomb
+/// brake), its file-descriptor table (`RLIMIT_NOFILE`) and its address
+/// space (`RLIMIT_AS`, the memory brake). They are applied only to the
+/// sandboxed process — `mount_and_exec` runs in the PID-1 child after
+/// all forks — so ai-bubble's supervisor and its host-side servers are
+/// never restricted by them, and the command inherits them across
+/// exec, covering everything it forks.
+pub(crate) fn apply_rlimits(rlimits: &Rlimits) {
+    if let Some(value) = rlimits.nproc {
+        set_rlimit(libc::RLIMIT_NPROC, value, "RLIMIT_NPROC");
+    }
+    if let Some(value) = rlimits.nofile {
+        set_rlimit(libc::RLIMIT_NOFILE, value, "RLIMIT_NOFILE");
+    }
+    if let Some(value) = rlimits.as_ {
+        set_rlimit(libc::RLIMIT_AS, value, "RLIMIT_AS");
+    }
+}
+
+/// Set one resource limit, soft == hard (see [`apply_rlimits`]).
+fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64, name: &str) {
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
+    };
+    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+        die_with_error(&format!("Can't set {name} to {value}"));
+    }
 }
 
 /// A CString for a spec-supplied path (or any other OS string). NUL bytes
@@ -964,6 +1031,12 @@ pub(crate) unsafe fn mount_and_exec(
             die_with_error("Can't join a fresh anonymous session keyring");
         }
 
+        // Resource limits (the spec's `rlimits` section): applied only
+        // to this sandboxed process, after all forks, so the supervisor
+        // is never restricted by them (see `apply_rlimits` and
+        // AUDIT.md M10). Absent fields are left untouched.
+        apply_rlimits(&current_rlimits());
+
         // All privileged work is done; run the command with as little
         // authority as possible: no capabilities at all, and as a uid/gid
         // that does not exist on the host.
@@ -1129,6 +1202,62 @@ fn apply_seccomp(policy: &SeccompPolicy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read one rlimit as (soft, hard).
+    fn get_rlimit(resource: libc::__rlimit_resource_t) -> (u64, u64) {
+        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrlimit(resource, &mut lim) }, 0);
+        (lim.rlim_cur, lim.rlim_max)
+    }
+
+    #[test]
+    fn rlimits_are_applied_to_the_process() {
+        // apply_rlimits mutates the calling process, so run it in a
+        // forked child (like the seccomp tests) and verify with
+        // getrlimit there.
+        let code = unsafe {
+            run_in_child(|| {
+                apply_rlimits(&Rlimits {
+                    nproc: Some(256),
+                    nofile: Some(128),
+                    as_: Some(1 << 28),
+                });
+                // Soft == hard for every limit, so the command cannot
+                // raise them again.
+                if get_rlimit(libc::RLIMIT_NPROC) == (256, 256)
+                    && get_rlimit(libc::RLIMIT_NOFILE) == (128, 128)
+                    && get_rlimit(libc::RLIMIT_AS) == (1 << 28, 1 << 28)
+                {
+                    libc::_exit(0);
+                }
+            })
+        };
+        assert_eq!(code, 0, "rlimits were not applied as configured");
+    }
+
+    #[test]
+    fn rlimits_absent_fields_leave_the_process_untouched() {
+        // The default (all-None) section must not change any limit.
+        let code = unsafe {
+            run_in_child(|| {
+                let before = (
+                    get_rlimit(libc::RLIMIT_NPROC),
+                    get_rlimit(libc::RLIMIT_NOFILE),
+                    get_rlimit(libc::RLIMIT_AS),
+                );
+                apply_rlimits(&Rlimits::default());
+                let after = (
+                    get_rlimit(libc::RLIMIT_NPROC),
+                    get_rlimit(libc::RLIMIT_NOFILE),
+                    get_rlimit(libc::RLIMIT_AS),
+                );
+                if before == after {
+                    libc::_exit(0);
+                }
+            })
+        };
+        assert_eq!(code, 0, "an absent rlimits section must not set anything");
+    }
 
     #[test]
     fn sandbox_path_joins_under_newroot() {

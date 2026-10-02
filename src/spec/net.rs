@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn unix_sockets_compile_into_the_seccomp_policy() {
-        use super::super::internal::{SandboxConfig, SeccompPolicy};
+        use super::super::internal::SandboxConfig;
         use super::super::tests::parse;
         // Default (denied): a filter exists even without a `seccomp`
         // section — the AF_UNIX denial is its only content.

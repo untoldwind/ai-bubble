@@ -58,9 +58,13 @@ fn starter_spec(project_dir: &Path) -> String {
 /// starter `spec.json` and the JSON Schema for it. An existing directory
 /// is left completely untouched.
 ///
-/// When the current directory is a git repository, the spec directory is
-/// also added to its `.gitignore` (created if missing, extended
-/// otherwise), so the bootstrap stays out of version control.
+/// When the current directory is a git repository, the spec directory's
+/// project-cache backing store (`.ai-bubble/cache/`) is added to its
+/// `.gitignore` (created if missing, extended otherwise) — cache content
+/// is disposable and stays out of version control. The spec directory
+/// *itself* is deliberately **not** ignored: `spec.json` is the security
+/// policy, so tampering by an agent must show up in `git status`; the
+/// spec directory should be committed (or at least reviewed).
 pub fn init(spec_dir: Option<&Path>) {
     let dir = spec_dir
         .map(Path::to_path_buf)
@@ -93,6 +97,18 @@ pub fn init(spec_dir: Option<&Path>) {
 
     ensure_ignored(&project_dir, &absolute(&dir));
 
+    // The spec directory holds the entire security policy (`spec.json`,
+    // the env file with its secrets, the cache): it is a trusted,
+    // tamper-sensitive asset. Keep it in version control (minus the
+    // disposable cache backing store) so any tampering is visible in
+    // `git status` — an agent able to rewrite the policy can grant itself
+    // arbitrary access on the next run.
+    eprintln!(
+        "warning: {} holds the security policy (spec.json, env file, cache) and is a trusted, \
+         tamper-sensitive asset — commit it (or review it) rather than gitignoring it",
+        dir.display()
+    );
+
     eprintln!(
         "Bootstrapped {} ({} + {})",
         dir.display(),
@@ -116,11 +132,15 @@ fn absolute(path: &Path) -> PathBuf {
     })
 }
 
-/// Adds `spec_dir` to the `.gitignore` of `project_dir` when that is a git
-/// repository. A missing `.gitignore` is created; an existing one is kept
-/// and only extended. Nothing happens when `project_dir` is not a git
-/// repository or when `spec_dir` lies outside it (an ignore rule can only
-/// describe paths below the `.gitignore`'s own directory).
+/// Adds the spec directory's cache backing store (`<spec_dir>/cache/`) to
+/// the `.gitignore` of `project_dir` when that is a git repository. The
+/// spec directory itself is deliberately *not* ignored: `spec.json` is
+/// the security policy, and gitignoring it would let an agent tamper with
+/// the policy without leaving a trace in `git status`. A missing
+/// `.gitignore` is created; an existing one is kept and only extended.
+/// Nothing happens when `project_dir` is not a git repository or when
+/// `spec_dir` lies outside it (an ignore rule can only describe paths
+/// below the `.gitignore`'s own directory).
 fn ensure_ignored(project_dir: &Path, spec_dir: &Path) {
     if !project_dir.join(".git").exists() {
         return;
@@ -132,13 +152,25 @@ fn ensure_ignored(project_dir: &Path, spec_dir: &Path) {
     let path = project_dir.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
-    // Already ignored? Accept the entry with and without the trailing
-    // slash, and tolerate surrounding whitespace.
+    // Already ignored? Accept the cache entry with and without the
+    // trailing slash, and tolerate surrounding whitespace. A line naming
+    // the whole spec directory covers its cache too — no need to append
+    // anything (that is the previous, now-discouraged behavior).
     let bare = entry.trim_end_matches('/');
-    if existing
-        .lines()
-        .any(|line| line.trim() == entry || line.trim() == bare)
-    {
+    // The whole spec directory being ignored covers its cache too —
+    // no need to append anything (that is the previous, now-discouraged
+    // behavior, tolerated for idempotence).
+    let spec_dir_entry = entry
+        .strip_suffix("cache/")
+        .unwrap_or(entry.as_str());
+    let spec_dir_bare = spec_dir_entry.trim_end_matches('/');
+    if existing.lines().any(|line| {
+        let line = line.trim();
+        line == entry
+            || line == bare
+            || line == spec_dir_entry
+            || line == spec_dir_bare
+    }) {
         return;
     }
 
@@ -154,9 +186,12 @@ fn ensure_ignored(project_dir: &Path, spec_dir: &Path) {
     }
 }
 
-/// The `.gitignore` line that ignores `spec_dir`, relative to
-/// `project_dir` and slash-terminated (so it matches a directory), or
-/// `None` when `spec_dir` is not inside `project_dir`.
+/// The `.gitignore` line that ignores the spec directory's project-cache
+/// backing store, relative to `project_dir` and slash-terminated (so it
+/// matches a directory), or `None` when `spec_dir` is not inside
+/// `project_dir`. Only the `cache` subdirectory is ignored — the spec
+/// directory itself (and above all `spec.json`, the security policy)
+/// must stay visible to version control.
 fn gitignore_entry(project_dir: &Path, spec_dir: &Path) -> Option<String> {
     let relative = spec_dir.strip_prefix(project_dir).ok()?;
     if relative.as_os_str().is_empty() {
@@ -164,6 +199,7 @@ fn gitignore_entry(project_dir: &Path, spec_dir: &Path) -> Option<String> {
     }
     let mut entry = relative.to_string_lossy().replace('\\', "/");
     entry.push('/');
+    entry.push_str("cache/");
     Some(entry)
 }
 
@@ -247,9 +283,11 @@ mod tests {
 
     #[test]
     fn gitignore_entry_is_relative_and_slash_terminated() {
+        // Only the cache backing store is ignored, never the spec
+        // directory itself (spec.json is the security policy).
         assert_eq!(
             gitignore_entry(Path::new("/repo"), Path::new("/repo/.ai-bubble")),
-            Some(".ai-bubble/".to_string())
+            Some(".ai-bubble/cache/".to_string())
         );
         assert_eq!(
             gitignore_entry(Path::new("/repo"), Path::new("/repo")),
@@ -270,7 +308,9 @@ mod tests {
         ensure_ignored(&dir.0, &dir.0.join(".ai-bubble"));
 
         let text = std::fs::read_to_string(dir.0.join(".gitignore")).unwrap();
-        assert!(text.lines().any(|line| line == ".ai-bubble/"), "{text:?}");
+        assert!(text.lines().any(|line| line == ".ai-bubble/cache/"), "{text:?}");
+        // The spec directory itself must NOT be ignored.
+        assert!(!text.lines().any(|line| line == ".ai-bubble/"), "{text:?}");
     }
 
     #[test]
@@ -284,22 +324,40 @@ mod tests {
 
         let text = std::fs::read_to_string(dir.0.join(".gitignore")).unwrap();
         assert!(text.starts_with("/target\n"), "{text:?}");
-        assert!(text.lines().any(|line| line == ".ai-bubble/"), "{text:?}");
+        assert!(text.lines().any(|line| line == ".ai-bubble/cache/"), "{text:?}");
     }
 
     #[test]
     fn ensure_ignored_is_idempotent_and_respects_a_bare_entry() {
         let dir = TempDir::new("gitignore-idempotent");
         std::fs::create_dir_all(dir.0.join(".git")).unwrap();
-        std::fs::create_dir_all(dir.0.join(".ai-bubble")).unwrap();
-        std::fs::write(dir.0.join(".gitignore"), ".ai-bubble\n").unwrap();
+        std::fs::create_dir_all(dir.0.join(".ai-bubble/cache")).unwrap();
+        std::fs::write(dir.0.join(".gitignore"), ".ai-bubble/cache\n").unwrap();
 
         ensure_ignored(&dir.0, &dir.0.join(".ai-bubble"));
 
-        // The existing bare entry already covers it: nothing is appended.
+        // The existing bare entry already covers the cache: nothing is
+        // appended.
         assert_eq!(
             std::fs::read_to_string(dir.0.join(".gitignore")).unwrap(),
-            ".ai-bubble\n"
+            ".ai-bubble/cache\n"
+        );
+    }
+
+    #[test]
+    fn ensure_ignored_respects_an_entry_covering_the_whole_spec_dir() {
+        let dir = TempDir::new("gitignore-whole-dir");
+        std::fs::create_dir_all(dir.0.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.0.join(".ai-bubble/cache")).unwrap();
+        // An old-style entry ignoring the whole spec directory (the
+        // previous behavior) also covers the cache.
+        std::fs::write(dir.0.join(".gitignore"), ".ai-bubble/\n").unwrap();
+
+        ensure_ignored(&dir.0, &dir.0.join(".ai-bubble"));
+
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(".gitignore")).unwrap(),
+            ".ai-bubble/\n"
         );
     }
 

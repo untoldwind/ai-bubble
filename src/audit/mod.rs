@@ -29,9 +29,21 @@
 //!   do not tear lines apart.
 //! * Without an audit log configured the whole subsystem is inert:
 //!   `record` returns immediately and no writer task is ever spawned.
+//! * The log path is constrained at startup (see [`configure`]): it must
+//!   live inside the spec directory, or point at a file that already
+//!   exists. Otherwise the writer — running with the operator's uid —
+//!   would let sandbox-influenced event content create and append to an
+//!   arbitrary host file (e.g. the operator's shell rc). The log is also
+//!   size-capped: once it outgrows [`MAX_LOG_BYTES`] it is rotated to
+//!   `<name>.1` (one previous generation kept) before the next batch is
+//!   written, so a sandbox spraying events cannot fill the host disk.
+//!   Write errors are surfaced on stderr (once per process) instead of
+//!   being discarded silently — losing audit events is worth knowing
+//!   about even when the run cannot be stopped for it.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -48,6 +60,17 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Never batch more than this many events before flushing.
 const MAX_EVENTS: usize = 4096;
+
+/// The audit log's size cap: once the file outgrows this, it is rotated
+/// to `<name>.1` (the previous backup is replaced) before the next batch
+/// is appended. Generous enough that normal runs never rotate; small
+/// enough that a sandbox spraying audit events cannot fill the host
+/// disk.
+const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Set on the first failed write in this process, so the error is
+/// surfaced on stderr once instead of spamming or being discarded.
+static WRITE_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Start a write once a batch exceeds roughly this size: small enough
 /// for a single `write(2)` on an `O_APPEND` file (which concurrent
@@ -66,8 +89,63 @@ static SENDER: OnceLock<Option<Sender<Event>>> = OnceLock::new();
 
 /// Store the audit log path. Called once by `main`, before any fork;
 /// every forked process sets up its own writer lazily on first use.
-pub fn configure(path: Option<PathBuf>) {
-    let _ = LOG_PATH.set(path);
+///
+/// The path is validated here, with the operator's authority, before any
+/// untrusted work runs: the writer appends with the operator's uid, so
+/// without this check sandbox-influenced event content could be appended
+/// to an arbitrary operator-writable file. The path must either live
+/// inside the spec directory (created automatically — the spec directory
+/// is the run's trusted configuration area) or point at a file that
+/// already exists (append-only, nothing new is created). Anything else
+/// is a hard startup error.
+pub fn configure(log: Option<PathBuf>, spec_dir: &Path) {
+    let _ = LOG_PATH.set(log.inspect(|path| {
+        if let Err(e) = validate_path(path, spec_dir) {
+            crate::sandbox::die(&e);
+        }
+    }));
+}
+
+/// Check the audit log path against the constraint described in
+/// [`configure`]. Returns a human-readable error on violation.
+fn validate_path(path: &Path, spec_dir: &Path) -> Result<(), String> {
+    // Resolve symlinks and `..` as far as the path exists: an existing
+    // file (or one whose parent exists) is judged by what it really is.
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            // The file itself does not exist yet: judge by its parent
+            // directory (which must exist for the writer to create the
+            // file later anyway).
+            match path.parent().zip(path.file_name()) {
+                Some((parent, name)) => {
+                    let parent = std::fs::canonicalize(parent)
+                        .unwrap_or_else(|_| parent.to_path_buf());
+                    parent.join(name)
+                }
+                // No parent component (e.g. a bare file name): judge the
+                // path as written.
+                None => path.to_path_buf(),
+            }
+        }
+    };
+    let spec_dir = std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf());
+    // Inside the spec directory: fine, the writer may create it there.
+    if resolved.starts_with(&spec_dir) {
+        return Ok(());
+    }
+    // Outside the spec directory: only a pre-existing file is allowed.
+    if resolved.exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "audit log {} is not inside the spec directory {} and does not exist; \
+         the audit log must live in the spec directory (it is created there \
+         automatically) or point at an already existing file — refusing to \
+         create or append to an arbitrary host path",
+        path.display(),
+        spec_dir.display()
+    ))
 }
 
 /// Record one audit event. When the buffer is full, the producing task
@@ -181,18 +259,18 @@ async fn writer(path: PathBuf, mut rx: mpsc::Receiver<Event>) {
                 Some(event) => {
                     batch.push(event);
                     if batch.len() >= MAX_EVENTS {
-                        flush(&file, std::mem::take(&mut batch)).await;
+                        flush(&path, &file, std::mem::take(&mut batch)).await;
                     }
                 }
                 // All senders are gone: flush what is left and end.
                 None => {
-                    flush(&file, batch).await;
+                    flush(&path, &file, batch).await;
                     return;
                 }
             },
             // A quiet stream must still reach the file in bounded time.
             _ = tokio::time::sleep(FLUSH_INTERVAL), if !batch.is_empty() => {
-                flush(&file, std::mem::take(&mut batch)).await;
+                flush(&path, &file, std::mem::take(&mut batch)).await;
             }
         }
     }
@@ -203,7 +281,13 @@ async fn writer(path: PathBuf, mut rx: mpsc::Receiver<Event>) {
 /// [`MAX_BYTES`]: every chunk is one `write(2)` on the `O_APPEND` file,
 /// which concurrent writers (the other forked ai-bubble processes)
 /// cannot interleave into.
-async fn flush(file: &Arc<Mutex<std::fs::File>>, batch: Vec<Event>) {
+///
+/// Before the batch is written, the file size is checked against
+/// [`MAX_LOG_BYTES`]: an oversized log is rotated to `<name>.1` first,
+/// so a sandbox spraying audit events cannot fill the host disk. Write
+/// errors are surfaced on stderr (once per process) — they are not
+/// fatal, but silently losing audit events would be worse.
+async fn flush(path: &Path, file: &Arc<Mutex<std::fs::File>>, batch: Vec<Event>) {
     if batch.is_empty() {
         return;
     }
@@ -220,15 +304,61 @@ async fn flush(file: &Arc<Mutex<std::fs::File>>, batch: Vec<Event>) {
         chunks.push(chunk);
     }
     let file = file.clone();
+    let path = path.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
         let mut file = file.lock().unwrap();
+        // Size cap: rotate before this batch pushes the log further past
+        // it. The rename keeps the (still open) old file as the backup.
+        if let Ok(meta) = file.metadata()
+            && meta.len() >= MAX_LOG_BYTES {
+                rotate(&path, &mut file);
+            }
         for chunk in chunks {
-            let _ = file.write_all(chunk.as_bytes());
+            if let Err(e) = file.write_all(chunk.as_bytes())
+                && !WRITE_ERROR_REPORTED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "warning: can't write the audit log {}: {e} (further errors are silent)",
+                        path.display()
+                    );
+                }
         }
     })
     .await;
     if result.is_err() {
         crate::sandbox::die("The audit writer panicked while writing the log");
+    }
+}
+
+/// Rotate the audit log at `path`: move the (possibly still open) file
+/// to `<name>.1`, replacing any previous backup, and point `file` at a
+/// fresh log. Failures are ignored — rotating is best effort, and it is
+/// always better to keep appending (to the old or the fresh file) than
+/// to lose audit events.
+fn rotate(path: &Path, file: &mut std::fs::File) {
+    let backup = match path.file_name() {
+        Some(name) => {
+            let mut backup = name.to_os_string();
+            backup.push(".1");
+            path.with_file_name(backup)
+        }
+        // A path without a file name component cannot be rotated.
+        None => return,
+    };
+    // `rename` atomically replaces an earlier `<name>.1`. If it fails
+    // (e.g. a concurrent rotation by one of the other forked ai-bubble
+    // processes won the race), fall through: the fresh open below either
+    // finds the rotated-away file (and creates a new one) or the
+    // original.
+    if std::fs::rename(path, &backup).is_ok()
+        && let Ok(fresh) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            *file = fresh;
+            return;
+        }
+    // Renaming or re-opening failed: try to re-open the original path so
+    // `file` at least tracks the canonical location again. When even that
+    // fails, keep writing to the old descriptor (the renamed backup).
+    if let Ok(reopened) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        *file = reopened;
     }
 }
 
@@ -242,6 +372,66 @@ mod tests {
     async fn inert_without_config() {
         record("test", "op", None, None, None).await;
         assert!(SENDER.get_or_init(|| None).is_none());
+    }
+
+    /// The audit log path must live inside the spec directory or point
+    /// at an already existing file: the writer appends with the
+    /// operator's uid, so an arbitrary creatable path would be an
+    /// arbitrary file create/append primitive (finding M8).
+    #[test]
+    fn audit_log_must_live_in_the_spec_dir_or_pre_exist() {
+        let dir = std::env::temp_dir().join(format!("ai-bubble-audit-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec_dir = dir.join("spec");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+
+        // Inside the spec directory: allowed even though the file does
+        // not exist yet (the writer creates it there).
+        assert!(validate_path(&spec_dir.join("audit.jsonl"), &spec_dir).is_ok());
+
+        // Outside, but pre-existing: allowed (append-only, nothing new
+        // is created).
+        let outside = dir.join("existing.jsonl");
+        std::fs::write(&outside, b"").unwrap();
+        assert!(validate_path(&outside, &spec_dir).is_ok());
+
+        // Outside and missing: refused.
+        assert!(validate_path(&dir.join("missing.jsonl"), &spec_dir).is_err());
+
+        // A `..` inside the path that would escape the spec directory:
+        // the parent is canonicalized, so this is judged as
+        // `<dir>/escape.jsonl` — outside, missing, refused.
+        assert!(validate_path(&spec_dir.join("../escape.jsonl"), &spec_dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rotating an oversized log moves the old file to `<name>.1` and
+    /// points the writer at a fresh log.
+    #[test]
+    fn rotate_moves_the_log_to_a_backup() {
+        let dir = std::env::temp_dir().join(format!("ai-bubble-audit-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+        let backup = dir.join("audit.jsonl.1");
+
+        std::fs::write(&log, b"first\n").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+
+        rotate(&log, &mut file);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "first\n");
+
+        // The writer now appends to a fresh log at the original path.
+        file.write_all(b"second\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "second\n");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "first\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Events end up as JSON lines in the file, in order.

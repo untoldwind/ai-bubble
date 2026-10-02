@@ -31,23 +31,46 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use super::connect_target;
+use crate::connlimit::ConnLimit;
 
 /// The response body type: the upstream's streamed body, or an empty
 /// one for the proxy's own error responses.
 type BodyT = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
+/// The whole-connection timeout of the plain HTTP proxy. This proxy
+/// serves exactly one request per connection (responses carry
+/// `Connection: close`, see `Proxy::handle`), so a hard cap on the
+/// connection's total lifetime is a safe slowloris guard (AUDIT.md M10):
+/// a client that connects but never sends a request — or dribbles one —
+/// is cut off here instead of holding a task forever. It also bounds
+/// long-running downloads through this test-only frontend; the real
+/// traffic path is HTTPS (see `super::https`), which has no such cap.
+const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Accept loop on `127.0.0.2:80`. One HTTP request (or one connection,
-/// once the target is known) per connection.
+/// once the target is known) per connection. Concurrent connections are
+/// capped (see [`crate::connlimit`]); at capacity the newly accepted
+/// connection is dropped immediately instead of spawning a task for it.
 pub async fn serve_http(listener: TcpListener, sock: PathBuf) {
     let sock = Arc::new(sock);
+    let limit = ConnLimit::new();
     loop {
         match listener.accept().await {
             Ok((tcp, _)) => {
+                let Some(guard) = limit.try_acquire() else {
+                    continue; // at capacity: drop the connection
+                };
                 let sock = sock.clone();
                 tokio::spawn(async move {
-                    let _ = http1::Builder::new()
-                        .serve_connection(TokioIo::new(tcp), Proxy { sock })
-                        .await;
+                    let _guard = guard;
+                    // hyper has no built-in read timer; the one-request-
+                    // per-connection shape (see CONNECTION_TIMEOUT) makes
+                    // a whole-connection timeout the simplest equivalent.
+                    let _ = tokio::time::timeout(
+                        CONNECTION_TIMEOUT,
+                        http1::Builder::new().serve_connection(TokioIo::new(tcp), Proxy { sock }),
+                    )
+                    .await;
                 });
             }
             Err(_) => return,

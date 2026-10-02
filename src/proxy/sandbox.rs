@@ -12,17 +12,38 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 
 use super::allowlist::target_allowed;
+use crate::connlimit::ConnLimit;
+
+/// How long a client may take to deliver a complete HTTP CONNECT request
+/// head. A client that opens a connection but never sends (or trickles
+/// bytes) must not hold a task and its connection forever — that is the
+/// slowloris half of AUDIT.md M10. The timeout guards *only* this
+/// request-head read: bytes after `connect` (part of the piped payload,
+/// see `super::connector` and AUDIT.md Verified-safe #7) are read later,
+/// without a timeout.
+const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Accept loop inside the sandbox network namespace: handle one HTTP
 /// CONNECT request per connection. The actual connection is made by the
 /// connector process (host network namespace) over the Unix socket.
+/// Concurrent connections are capped (see [`crate::connlimit`]); when
+/// the cap is reached the newly accepted connection is dropped instead
+/// of spawning a task for it.
 pub async fn serve_sandbox_proxy(listener: TcpListener, sock: PathBuf, allow: Vec<String>) {
+    let limit = ConnLimit::new();
     loop {
         match listener.accept().await {
             Ok((tcp, _)) => {
+                // At capacity: drop the new connection immediately. The
+                // client sees a plain close, as for any refused request.
+                let Some(guard) = limit.try_acquire() else {
+                    continue;
+                };
                 let sock = sock.clone();
                 let allow = allow.clone();
                 tokio::spawn(async move {
+                    // Hold the connection slot for the task's lifetime.
+                    let _guard = guard;
                     handle_connect_proxy(tcp, &sock, &allow).await;
                 });
             }
@@ -32,9 +53,14 @@ pub async fn serve_sandbox_proxy(listener: TcpListener, sock: PathBuf, allow: Ve
 }
 
 async fn handle_connect_proxy(mut tcp: TcpStream, sock: &Path, allow: &[String]) {
-    let Some(target) = read_connect_target(&mut tcp).await else {
-        let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-        return;
+    // The request head must arrive within HEADER_TIMEOUT (see the
+    // constant's doc); a timed-out or malformed head gets the same 400.
+    let target = match tokio::time::timeout(HEADER_TIMEOUT, read_connect_target(&mut tcp)).await {
+        Ok(Some(target)) => target,
+        _ => {
+            let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            return;
+        }
     };
     if !target_allowed(&target, allow) {
         eprintln!("ai-bubble proxy: CONNECT to {target} denied");

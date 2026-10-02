@@ -22,6 +22,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use super::command;
+use crate::connlimit::ConnLimit;
+
+/// How long a DNS-over-TCP client may take to send the length prefix and
+/// the query of one message. A client that opens a TCP connection but
+/// never sends must not hold a task forever (the slowloris half of
+/// AUDIT.md M10); UDP is connectionless and needs no such guard.
+const TCP_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The redirect address as an [`std::net::Ipv4Addr`] (parsed from
 /// [`super::host::REDIRECT_ADDR`] once per use; it is a compile-time
@@ -49,29 +56,51 @@ pub async fn serve_udp(socket: UdpSocket, sock: PathBuf) {
 
 /// Serve DNS over TCP (2-byte length-prefixed messages): the fallback
 /// transport resolvers use for larger replies. Runs until the listener
-/// errors out.
+/// errors out. Concurrent connections are capped (see
+/// [`crate::connlimit`]); at capacity the newly accepted connection is
+/// dropped immediately instead of spawning a task for it.
 pub async fn serve_tcp(listener: TcpListener, sock: PathBuf) {
+    let limit = ConnLimit::new();
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
             return;
         };
+        let Some(guard) = limit.try_acquire() else {
+            continue; // at capacity: drop the connection
+        };
         let sock = sock.clone();
         tokio::spawn(async move {
+            let _guard = guard;
             let _ = serve_tcp_conn(tcp, &sock).await;
         });
+    }
+}
+
+/// `read_exact` with the per-message [`TCP_QUERY_TIMEOUT`]: a client that
+/// stalls between (or within) messages is dropped instead of holding the
+/// task forever.
+async fn read_exact_timed(tcp: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
+    match tokio::time::timeout(TCP_QUERY_TIMEOUT, tcp.read_exact(buf)).await {
+        // `read_exact` filled `buf` (the byte count is irrelevant here);
+        // a plain I/O error is propagated as-is.
+        Ok(result) => result.map(|_| ()),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "DNS-over-TCP message did not arrive in time",
+        )),
     }
 }
 
 async fn serve_tcp_conn(mut tcp: TcpStream, sock: &Path) -> std::io::Result<()> {
     let mut len_buf = [0u8; 2];
     loop {
-        tcp.read_exact(&mut len_buf).await?;
+        read_exact_timed(&mut tcp, &mut len_buf).await?;
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 || len > 4096 {
             return Ok(());
         }
         let mut query = vec![0u8; len];
-        tcp.read_exact(&mut query).await?;
+        read_exact_timed(&mut tcp, &mut query).await?;
         let response = reply(sock, &query).await;
         tcp.write_all(
             u16::try_from(response.len())

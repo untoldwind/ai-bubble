@@ -27,15 +27,30 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use super::{tls_cert, tls_connect_target};
+use crate::connlimit::ConnLimit;
 
-/// Accept loop on `127.0.0.2:443`.
+/// How long a client may take to deliver a complete TLS ClientHello (and
+/// then finish the TLS handshake). A client that opens a connection but
+/// never sends — or trickles hello bytes — must not hold a task forever
+/// (the slowloris half of AUDIT.md M10). The timeout guards only these
+/// initial reads; the tunneled traffic afterwards is never timed out.
+const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Accept loop on `127.0.0.2:443`. Concurrent connections are capped
+/// (see [`crate::connlimit`]); at capacity the newly accepted connection
+/// is dropped immediately instead of spawning a task for it.
 pub async fn serve_https(listener: TcpListener, sock: PathBuf) {
     let sock = Arc::new(sock);
+    let limit = ConnLimit::new();
     loop {
         match listener.accept().await {
             Ok((tcp, _)) => {
+                let Some(guard) = limit.try_acquire() else {
+                    continue; // at capacity: drop the connection
+                };
                 let sock = sock.clone();
                 tokio::spawn(async move {
+                    let _guard = guard;
                     handle_tls(tcp, &sock).await;
                 });
             }
@@ -50,8 +65,13 @@ pub async fn serve_https(listener: TcpListener, sock: PathBuf) {
 /// Anything that is not a ClientHello with a SNI (or whose SNI is denied)
 /// is dropped.
 async fn handle_tls(mut tcp: TcpStream, sock: &Path) {
-    let Some((hello, sni)) = read_client_hello(&mut tcp).await else {
-        return; // not a usable TLS hello: just close
+    // Slowloris guard (AUDIT.md M10): the ClientHello — and the rest of
+    // the TLS handshake, which the client could equally stall — must
+    // complete within HELLO_TIMEOUT. On timeout the connection is simply
+    // dropped.
+    let (hello, sni) = match tokio::time::timeout(HELLO_TIMEOUT, read_client_hello(&mut tcp)).await {
+        Ok(Some(pair)) => pair,
+        _ => return, // timeout, EOF or not a usable TLS hello: just close
     };
     let Some(sni) = sni else {
         return; // no SNI: we cannot know the target, so nothing to forward
@@ -72,13 +92,20 @@ async fn handle_tls(mut tcp: TcpStream, sock: &Path) {
     };
     let acceptor = TlsAcceptor::from(Arc::new(config));
     // The hello bytes were already consumed from the socket; hand them
-    // back to rustls via a prefix stream.
-    let mut tls = match acceptor.accept(PrefixedStream::new(hello, tcp)).await {
-        Ok(t) => t,
-        Err(e) => {
+    // back to rustls via a prefix stream. The client's side of the
+    // handshake is time-boxed too (see the HELLO_TIMEOUT doc).
+    let mut tls = match tokio::time::timeout(
+        HELLO_TIMEOUT,
+        acceptor.accept(PrefixedStream::new(hello, tcp)),
+    )
+    .await
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
             eprintln!("ai-bubble waf: TLS handshake with client for {sni} failed: {e}");
             return;
         }
+        Err(_) => return, // handshake timed out: drop the connection
     };
     let mut upstream = match tls_connect_target(sock, &format!("{sni}:443")).await {
         Ok(pipe) => pipe,

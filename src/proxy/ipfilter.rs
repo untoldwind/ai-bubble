@@ -174,7 +174,7 @@ pub async fn connect_checked(target: &str, allow_private: bool) -> io::Result<Tc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    
 
     fn blocked(s: &str) -> &'static str {
         blocked_reason(s.parse().unwrap()).expect("must be blocked")

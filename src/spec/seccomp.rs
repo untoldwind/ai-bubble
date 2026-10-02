@@ -52,6 +52,21 @@
 //! syscall numbers when the spec is compiled (see
 //! [`super::internal::SandboxConfig::compile`]), and an unknown name is
 //! a hard error there.
+//!
+//! **Known limitation (the ia32 ABI).** The filter is a single-arch
+//! program: seccompiler prepends an architecture check that kills
+//! foreign-arch syscalls — that handles real 32-bit binaries. However, a
+//! 64-bit process issuing `int $0x80` gets the *ia32 syscall table*
+//! while the kernel still reports `AUDIT_ARCH_X86_64` (the task is not
+//! marked compat): the arch check passes, but the numbers are the ia32
+//! ones — e.g. ia32 `io_uring_setup` is 425, not the x86_64 number the
+//! blocklist denies. A blocklist preset can therefore be bypassed via
+//! `int 0x80` for syscalls whose ia32 numbers differ. Residual risk is
+//! kernel attack-surface exposure (an LPE primitive), not an immediate
+//! breakout: the capability/namespace isolation backstops the filter.
+//! Kernels without `CONFIG_IA32_EMULATION` are unaffected; an allowlist
+//! filter is largely unaffected too (the ia32 table's low numbers mostly
+//! correspond to syscalls the allowlist also denies).
 
 use std::sync::LazyLock;
 

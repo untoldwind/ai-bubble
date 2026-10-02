@@ -14,6 +14,7 @@ use crate::hostfs::patterns::Patterns;
 
 use super::Spec;
 use super::net::NetConfig;
+use super::rlimits::Rlimits;
 use super::seccomp::{SeccompConfig, Violation};
 use super::tmpfs::TmpfsPerms;
 
@@ -196,6 +197,12 @@ pub struct SandboxConfig {
     /// and AUDIT.md M3), a minimal policy carrying only that denial.
     /// `None` when nothing needs a filter.
     pub seccomp: Option<SeccompPolicy>,
+    /// The resource limits (setrlimit) for the sandboxed command,
+    /// compiled down verbatim from the spec's `rlimits` section (there
+    /// are no names to resolve, so the file type is the internal type,
+    /// see [`super::rlimits`]). All-`None` (the default) applies
+    /// nothing.
+    pub rlimits: Rlimits,
 }
 
 impl SandboxConfig {
@@ -211,7 +218,7 @@ impl SandboxConfig {
     /// mounted when the spec says so: a `proc` mapping chooses where (and
     /// whether at all) a fresh procfs instance appears.
     pub fn compile(spec: &Spec) -> SandboxConfig {
-        SandboxConfig {
+        let config = SandboxConfig {
             ops: spec.hostfs.ops(),
             net: Net::from(&spec.net),
             patterns: spec.hostfs.patterns(),
@@ -224,7 +231,18 @@ impl SandboxConfig {
                 .unwrap_or_else(|e| crate::sandbox::die(&e)),
             audit_log: spec.audit.log.as_deref().map(PathBuf::from),
             seccomp: compile_seccomp(&spec.seccomp, spec.net.unix_sockets()),
-        }
+            rlimits: spec.rlimits,
+        };
+        // The rlimits are applied by `mount_and_exec` (crate::sandbox)
+        // in the sandboxed child, whose call chain — `setup_and_exec` /
+        // `netns::run` — does not carry the whole compiled config, so
+        // the exec path reads them from here. compile() runs in the
+        // original ai-bubble process before every fork, and the
+        // registration is inherited across fork with the rest of the
+        // address space — exactly like the ops, env and seccomp values
+        // handed down explicitly.
+        crate::sandbox::register_rlimits(config.rlimits);
+        config
     }
 }
 

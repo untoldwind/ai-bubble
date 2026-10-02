@@ -25,7 +25,8 @@
 //!     "env_file": ".env"
 //!   },
 //!   "cwd": "/work",
-//!   "seccomp": { "block": ["ptrace", "mount"], "on_violation": "errno" }
+//!   "seccomp": { "block": ["ptrace", "mount"], "on_violation": "errno" },
+//!   "rlimits": { "nproc": 256, "nofile": 1024, "as": 536870912 }
 //! }
 //! ```
 //!
@@ -170,6 +171,13 @@ pub struct Spec {
     /// filter is installed.
     #[serde(default)]
     pub seccomp: SeccompConfig,
+    /// Resource limits (setrlimit) for the sandboxed command, applied
+    /// right before exec (see [`super::rlimits`]). They protect the host
+    /// supervisor from a resource-hungry or malicious command (fork
+    /// bombs, fd exhaustion, memory hoarding — AUDIT.md M10); every
+    /// field is optional and absent fields mean the limit is not set.
+    #[serde(default)]
+    pub rlimits: super::rlimits::Rlimits,
     /// Accepted for editor tooling only: it names the JSON schema
     /// (`--print-schema`) so the spec file can get completion and
     /// validation. Never serialized back out.
@@ -209,6 +217,13 @@ impl Spec {
                 // relative to the directory the spec file lives in.
                 if let Some(dir) = path.parent() {
                     spec.hostfs.resolve_relative_sources(dir);
+                    // Bind and redirect sources bypass the pattern list
+                    // (see `validate_sources`): reject any that cover the
+                    // spec directory — now, after the relative sources
+                    // have been resolved to absolute host paths.
+                    if let Err(e) = spec.validate_sources(dir) {
+                        crate::sandbox::die(&e);
+                    }
                     // Same for the env file: it is resolved against the
                     // spec directory and its entries merged into
                     // `env.values` (the values are still unexpanded; see
@@ -247,14 +262,85 @@ impl Spec {
     /// unaffected: they resolve the host path directly, without consulting
     /// the pattern list, so `project-cache` mappings keep working.
     ///
-    /// The pattern is the spec directory's absolute host path, matched
-    /// literally by every ordinary component (a glob metacharacter in a
-    /// directory name would be interpreted as a wildcard — which can only
-    /// ever hide *more*, never expose the spec directory).
+    /// The pattern is the spec directory's absolute host path, escaped
+    /// **per component** with [`crate::hostfs::pattern::escape_glob`]: a
+    /// glob metacharacter in a directory name (e.g. a path segment
+    /// `job[42]` — `[` always opens a character class in the matcher) must
+    /// match itself literally, or the auto-hide pattern would silently
+    /// fail to name the real directory and the spec directory would be
+    /// exposed by any mapping that mirrors its parent.
     pub fn hide_spec_dir(&mut self, spec_dir: &Path) {
+        let dir = absolute_dir(spec_dir);
+        // Rebuild the absolute path as a pattern: a `/` root plus one
+        // escaped component per directory level. Non-UTF-8 components are
+        // lossy-converted (as before); they can never match a pattern in
+        // the first place, so every derived decision fails closed.
+        let pattern = format!(
+            "/{}",
+            dir.components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(name) => {
+                        Some(crate::hostfs::pattern::escape_glob(&name.to_string_lossy()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        );
         self.hostfs.mappings.push(super::hostfs::Mapping::Hide {
-            glob: super::hostfs::Globs(vec![absolute_dir(spec_dir).to_string_lossy().into_owned()]),
+            glob: super::hostfs::Globs(vec![pattern]),
         });
+    }
+
+    /// Security validation of the mappings whose host paths bypass the
+    /// pattern list entirely: `bind` mounts resolve directly on the host
+    /// (no FUSE policy applies to them), and `redirect-ro`/`redirect-rw`
+    /// sources resolve directly too — the redirect destination is what
+    /// the patterns govern, not the source. A bind or redirect whose
+    /// source is the spec directory itself (or an ancestor of it) would
+    /// therefore expose `.ai-bubble/` — the spec file, the env file with
+    /// its secrets, and the cache — no matter how carefully the auto-hide
+    /// patterns are built; with `rw: true` (or a redirect-rw) the
+    /// sandboxed command could even rewrite `spec.json`, escalating the
+    /// policy persistently across runs. Such mappings are rejected as a
+    /// hard error at spec load time.
+    ///
+    /// Deliberately *not* checked: `session-cache` (its backing store is a
+    /// per-run tmp directory) and `project-cache` (its backing store is
+    /// `spec_dir/cache`, which is exactly the intended, hidden location).
+    /// Called by [`Spec::read`] after [`HostFsConfig::
+    /// resolve_relative_sources`], so redirect sources are already
+    /// absolute.
+    fn validate_sources(&self, spec_dir: &Path) -> Result<(), String> {
+        let spec_dir = absolute_dir(spec_dir);
+        for mapping in &self.hostfs.mappings {
+            let (kind, source) = match mapping {
+                super::hostfs::Mapping::Bind { src, .. } => ("bind", src.as_str()),
+                super::hostfs::Mapping::RedirectRo { source, .. } => ("redirect-ro", source.as_str()),
+                super::hostfs::Mapping::RedirectRw { source, .. } => ("redirect-rw", source.as_str()),
+                _ => continue,
+            };
+            // Resolve like `absolute_dir` does, so the comparison is
+            // against the same canonical form as the spec dir. Redirect
+            // sources are absolute by now; a bind source is required to
+            // be absolute anyway.
+            let source = absolute_dir(Path::new(source));
+            // `starts_with` is component-wise: it is true when the source
+            // *is* the spec directory and when it is a strict ancestor
+            // (e.g. the project dir or `/`), but not for mere string
+            // prefixes (`/repo/.ai-bubble-x`).
+            if spec_dir.starts_with(&source) {
+                return Err(format!(
+                    "the {kind} source {} covers the spec directory {}: bind and redirect \
+                     sources must not cover the spec directory — it holds the security policy \
+                     (spec.json, the env file and the cache), which bind mounts and redirect \
+                     sources reach without the pattern-based write policy",
+                    source.display(),
+                    spec_dir.display()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Expand and validate the [`Spec::cwd`] field for compilation: the
@@ -300,4 +386,155 @@ pub(crate) fn expand_str(s: &str) -> Result<String, String> {
             e.var_name
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a spec from JSON text (the file-level view only; the
+    /// `${VAR}` expansion happens later, at compile time).
+    fn parse(text: &str) -> Spec {
+        serde_json::from_str(text).expect("valid spec JSON")
+    }
+
+    #[test]
+    fn hide_spec_dir_escapes_metacharacters_per_component() {
+        let mut spec = Spec::default();
+        spec.hide_spec_dir(Path::new("/builds/job[42]/proj*2"));
+        match spec.hostfs.mappings.last() {
+            Some(crate::spec::hostfs::Mapping::Hide { glob }) => {
+                let [pattern] = &glob.0[..] else {
+                    panic!("expected a single glob")
+                };
+                // Every metacharacter is escaped, per component: the
+                // pattern names the literal directory, not a glob.
+                assert_eq!(pattern, "/builds/job\\[42\\]/proj\\*2");
+            }
+            other => panic!("expected a trailing hide mapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_metacharacter_spec_dir_is_hidden_and_a_lookalike_is_not() {
+        use crate::spec::hostfs::Mapping;
+
+        // A spec directory whose name contains `[2]` and `*`, under a
+        // spec that mirrors everything.
+        let parent =
+            std::env::temp_dir().join(format!("ai-bubble-spec-glob-{}", std::process::id()));
+        let dir = parent.join("proj[2]*");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::spec::file::SPEC_FILE),
+            r#"{ "hostfs": { "mappings": [ { "type": "rw", "glob": "/**" } ] } }"#,
+        )
+        .unwrap();
+        // A lookalike sibling without the metacharacters.
+        let sibling = parent.join("proj2");
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let spec = crate::spec::Spec::load(Some(&dir));
+        use crate::hostfs::patterns::Permission as P;
+        match spec.hostfs.mappings.last() {
+            Some(Mapping::Hide { glob }) => {
+                let [pattern] = &glob.0[..] else {
+                    panic!("expected a single glob")
+                };
+                assert_eq!(pattern.as_str(), format!("{}/proj\\[2\\]\\*", parent.display()));
+            }
+            other => panic!("expected a trailing hide mapping, got {other:?}"),
+        }
+
+        // Through the pattern engine: the literal directory is hidden
+        // (despite the rw /** mirror), the lookalike sibling is not —
+        // it stays covered by the rw mirror.
+        let compiled = crate::spec::internal::SandboxConfig::compile(&spec);
+        let spec_path = std::fs::canonicalize(&dir).unwrap();
+        let sibling_path = std::fs::canonicalize(&sibling).unwrap();
+        assert_eq!(
+            compiled.patterns.permission_of(&spec_path),
+            Some(&P::Hide)
+        );
+        assert!(compiled.patterns.hidden(&spec_path));
+        assert!(!compiled.patterns.hidden(&sibling_path));
+        assert_eq!(
+            compiled.patterns.permission_of(&sibling_path),
+            Some(&P::Rw)
+        );
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn a_bind_source_covering_the_spec_dir_is_rejected() {
+        // Binding `/` exposes everything — including the spec directory —
+        // regardless of the hide patterns.
+        let spec = parse(r#"{ "hostfs": { "mappings": [ { "type": "bind", "src": "/" } ] } }"#);
+        let err = spec
+            .validate_sources(Path::new("/repo/.ai-bubble"))
+            .expect_err("a bind of / must be rejected");
+        assert!(err.contains("bind"), "{err}");
+        assert!(err.contains("spec directory"), "{err}");
+
+        // The spec directory itself as a bind source is rejected, too.
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [ { "type": "bind", "src": "/repo/.ai-bubble" } ] } }"#,
+        );
+        assert!(spec
+            .validate_sources(Path::new("/repo/.ai-bubble"))
+            .is_err());
+    }
+
+    #[test]
+    fn a_redirect_source_resolving_to_the_spec_dir_is_rejected() {
+        // A relative source `.` resolves against the spec directory —
+        // exactly the directory the auto-hide protects.
+        let parent =
+            std::env::temp_dir().join(format!("ai-bubble-spec-src-{}", std::process::id()));
+        let spec_dir = parent.join(".ai-bubble");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "redirect-ro", "dest": "/x", "source": "." }
+            ] } }"#,
+        );
+        // Mirror what `Spec::read` does: resolve the relative source first.
+        let mut spec = spec;
+        spec.hostfs.resolve_relative_sources(&spec_dir);
+        let err = spec
+            .validate_sources(&spec_dir)
+            .expect_err("a redirect onto the spec dir must be rejected");
+        assert!(err.contains("redirect-ro"), "{err}");
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn a_sibling_directory_source_is_accepted() {
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "bind", "src": "/repo/other" },
+                { "type": "redirect-rw", "dest": "/out", "source": "/repo/other/out" }
+            ] } }"#,
+        );
+        // The sources are outside the spec directory: no error.
+        spec.validate_sources(Path::new("/repo/.ai-bubble"))
+            .expect("sources outside the spec dir are fine");
+    }
+
+    #[test]
+    fn reading_a_spec_with_a_safe_bind_source_succeeds() {
+        let parent =
+            std::env::temp_dir().join(format!("ai-bubble-spec-read-{}", std::process::id()));
+        let spec_dir = parent.join(".ai-bubble");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        std::fs::write(
+            spec_dir.join(crate::spec::file::SPEC_FILE),
+            r#"{ "hostfs": { "mappings": [ { "type": "bind", "src": "/repo/other" } ] } }"#,
+        )
+        .unwrap();
+        let spec = crate::spec::Spec::load(Some(&spec_dir));
+        // The bind mapping survives (plus the appended auto-hide).
+        assert_eq!(spec.hostfs.mappings.len(), 2);
+        std::fs::remove_dir_all(&parent).ok();
+    }
 }

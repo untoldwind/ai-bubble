@@ -12,6 +12,15 @@ use schemars::JsonSchema;
 /// Audit logging configuration. Without a `log` path (the default) the
 /// audit subsystem is disabled entirely: no events are collected and no
 /// file is written.
+///
+/// The path is constrained at startup: it must live inside the spec
+/// directory (where it is created automatically) or point at a file that
+/// already exists. This keeps the audit writers — which append with the
+/// operator's uid — from turning a spec-controlled path into an
+/// arbitrary file create/append primitive on the host. The log is also
+/// size-capped: when it outgrows 64 MiB it is rotated to `<name>.1`
+/// before the next batch is appended, so a sandbox spraying audit
+/// events cannot fill the host disk.
 #[derive(Debug, Default, PartialEq, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuditConfig {

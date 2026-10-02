@@ -72,8 +72,14 @@ pub fn run(
 
     // Store the audit log path (if any) before any fork: every
     // forked process (FUSE server, network frontends) sets up its
-    // own audit writer against the same file.
-    audit::configure(sandbox_config.audit_log.clone());
+    // own audit writer against the same file. The path is validated
+    // here (inside the spec directory, or an already existing file):
+    // the writers append with the operator's uid, so an arbitrary
+    // path would be an arbitrary file create/append primitive.
+    audit::configure(
+        sandbox_config.audit_log.clone(),
+        spec_dir,
+    );
 
     // Start the host FUSE filesystem server (in its own child
     // process) before any namespace setup: its filesystem becomes
