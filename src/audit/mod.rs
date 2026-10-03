@@ -145,7 +145,7 @@ pub fn configure(log: Option<PathBuf>, spec_dir: &Path) {
                 Ok(resolved) => resolved,
                 Err(e) => crate::sandbox::die(&e),
             };
-            let file = match safe_open(&path) {
+            let file = match safe_open(&path, "audit log") {
                 Ok(file) => file,
                 Err(e) => crate::sandbox::die(&format!(
                     "Can't open audit log {}: {e}",
@@ -200,21 +200,24 @@ fn validate_path(path: &Path, spec_dir: &Path) -> Result<PathBuf, String> {
     ))
 }
 
-/// Open the audit log safely: `O_CREAT|O_APPEND` plus `O_NOFOLLOW` (a
+/// Open a log file safely: `O_CREAT|O_APPEND` plus `O_NOFOLLOW` (a
 /// swapped-in symlink must never be followed) and `O_NONBLOCK` (an
 /// unfortunately named FIFO must not block the open), then a
 /// regular-file check — anything else (FIFO, device, socket) is refused
 /// with an error instead of being written to or hung on (AUDIT.md H4).
-fn safe_open(path: &Path) -> std::io::Result<std::fs::File> {
+/// `what` names the log in error messages. Also `O_CLOEXEC`: the fd is
+/// opened before the forks and must not leak into the executed command
+/// (the sandbox's fd sweep covers the same thing, this is belt and braces).
+pub(crate) fn safe_open(path: &Path, what: &str) -> std::io::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
     if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other(
-            "not a regular file (the audit log must be one)",
-        ));
+        return Err(std::io::Error::other(format!(
+            "not a regular file (the {what} must be one)"
+        )));
     }
     Ok(file)
 }
@@ -426,14 +429,16 @@ fn rotate(path: &Path, file: &mut std::fs::File) {
     // FIFO must not be followed or hung on — and when the safe open
     // fails, the writer keeps appending to the descriptor it already
     // holds, which the sandbox cannot touch (AUDIT.md H4).
-    if std::fs::rename(path, &backup).is_ok() && let Ok(fresh) = safe_open(path) {
+    if std::fs::rename(path, &backup).is_ok()
+        && let Ok(fresh) = safe_open(path, "audit log")
+    {
             *file = fresh;
             return;
         }
     // Renaming or re-opening failed: try to re-open the original path so
     // `file` at least tracks the canonical location again. When even that
     // fails, keep writing to the old descriptor (the renamed backup).
-    if let Ok(reopened) = safe_open(path) {
+    if let Ok(reopened) = safe_open(path, "audit log") {
         *file = reopened;
     }
 }
@@ -578,7 +583,7 @@ mod tests {
         let fifo = dir.join("audit.jsonl");
         nix_fifo(&fifo);
 
-        assert!(safe_open(&fifo).is_err());
+        assert!(safe_open(&fifo, "audit log").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -597,7 +602,7 @@ mod tests {
         let link = dir.join("audit.jsonl");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        assert!(safe_open(&link).is_err());
+        assert!(safe_open(&link, "audit log").is_err());
         // The target must not have been written (append-only guarantee
         // applies to the validated file, not to whatever the path points
         // at when the swap happened).

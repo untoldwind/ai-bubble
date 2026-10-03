@@ -66,6 +66,12 @@ unsafe fn disarm_signals() {
 /// On success the mountpoint path is stored in `HOST_MOUNT_POINT` (inherited
 /// by every later fork). On any failure the process dies.
 pub fn start_host_fs(patterns: &Patterns) {
+    // Open the request log (if requested) eagerly, before the fork: the
+    // server child inherits the fd and never opens the path itself — a
+    // lazy open inside the single-threaded FUSE server could hang on a
+    // FIFO, follow a swapped-in symlink or panic the server (AUDIT.md M3).
+    crate::hostfs::fuselog::init();
+
     // Create the mountpoint directory in the parent so both the server and the
     // sandbox (and its children) can agree on a stable path.
     let mountpoint = crate::sandbox::mkdtemp_dir(
@@ -148,7 +154,7 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let outcome = {
         let mp = mountpoint.clone();
         let server_mountpoint = mountpoint.clone();
-        fuselog::event!("SERVER start mountpoint={}", mountpoint.display());
+        fuselog::event!("SERVER start mountpoint={}", fuselog::path_string(mountpoint.as_os_str()));
         runtime.block_on(async move {
             let handle =
                 match mount_with_fallback(&mp, uid, gid, &patterns, !patterns.any_writable()).await

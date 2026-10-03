@@ -363,7 +363,12 @@ command line.
   `path`, `src`, `dest`, `source`) may reference environment variables
   as `${VAR}` or `$VAR` (e.g. `"glob": "${HOME}/project"`); the
   references are expanded while the spec is read, so everything
-  downstream only ever sees the fully expanded text. Other mapping
+  downstream only ever sees the fully expanded text. Referencing an
+  unset variable is an error. Only plain references are supported:
+  the shell's parameter-expansion extras (`${VAR:-default}`,
+  `$$`, other operators) and unterminated `${` are rejected, so a
+  spec field can never silently expand to a literal that was not a
+  variable reference. Other mapping
   fields (`content`, ...), `net.allow` and the like are never expanded.
   Referencing an unset variable is an error.
 

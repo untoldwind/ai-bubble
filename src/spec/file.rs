@@ -453,12 +453,91 @@ impl Spec {
 /// fields (see [`Spec::expand_cwd`]); unset variables are errors, so
 /// typos don't silently produce bogus paths.
 pub(crate) fn expand_str(s: &str) -> Result<String, String> {
+    validate_expansion(s)?;
     shellexpand::env(s).map(Cow::into_owned).map_err(|e| {
         format!(
             "environment variable {:?} referenced as {s:?} is not set",
             e.var_name
         )
     })
+}
+
+/// Strict pre-validation of the `${VAR}` expansion syntax.
+///
+/// [`shellexpand`] implements more of the shell's parameter expansion than
+/// this spec's promise ("referencing an unset variable is an error") allows:
+/// `${VAR:-default}` silently expands an unset (or empty) variable to the
+/// operator's default literal instead of erroring — which lets a
+/// programmatically assembled spec smuggle an operator-unintended absolute
+/// path (e.g. `${X:-/etc}`) past the post-expansion validation — and an
+/// unterminated `${BOGUS` passes through expansion *verbatim*, producing a
+/// bogus path instead of an error. Both (and a few more ambiguous shell
+/// forms) are rejected here, fail-closed, before the expansion runs; only
+/// plain `${NAME}` / `$NAME` references and a literal `$` survive:
+///
+/// * `${NAME:-default}` (the default-value operator) — error: unset
+///   variables must error, not fall back to a literal,
+/// * an unterminated `${` without a closing `}` — error,
+/// * `$$` — error (in a shell this is the PID; ambiguous, and a literal
+///   `$` next to a reference must be written differently),
+/// * anything but a plain ASCII variable name inside `${...}` — error
+///   (closes nested braces and the remaining shell operators such as
+///   `:+`, `#`, `%` that would otherwise be looked up as weird names or
+///   mis-parsed by shellexpand's first-`}` brace search),
+/// * a bare `$` not starting a reference (before a space, punctuation,
+///   or at the end of the string) — left verbatim, as before.
+fn validate_expansion(s: &str) -> Result<(), String> {
+    let bytes = s.as_bytes();
+    let mut idx = 0;
+    while let Some(off) = s[idx..].find('$') {
+        let dollar = idx + off;
+        idx = dollar + 1;
+        match bytes.get(idx) {
+            // A trailing `$` stays literal, exactly as shellexpand leaves it.
+            None => break,
+            Some(b'{') => {
+                let content_start = idx + 1;
+                let Some(close_off) = s[content_start..].find('}') else {
+                    return Err(format!(
+                        "unterminated `${{` in {s:?}: the reference must be closed with `}}`, \
+                         otherwise the text passes through expansion verbatim"
+                    ));
+                };
+                let name = &s[content_start..content_start + close_off];
+                if name.contains(":-") {
+                    return Err(format!(
+                        "the default-value operator `:-` in {s:?} is not supported: \
+                         an unset variable must be an error, not silently expand to a default"
+                    ));
+                }
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err(format!(
+                        "invalid variable name {name:?} in {s:?}: only ASCII letters, digits \
+                         and `_` are allowed between `${{` and `}}`"
+                    ));
+                }
+                idx = content_start + close_off + 1;
+            }
+            Some(b'$') => {
+                return Err(format!(
+                    "`$$` in {s:?} is not supported: write a plain literal `$` instead"
+                ));
+            }
+            Some(_) => {
+                // A bare `$VAR` reference: skip its name exactly the way
+                // shellexpand delimits it (Unicode alphanumeric or `_`), so
+                // the scan continues behind it.
+                idx = s[idx..]
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .map_or(s.len(), |end| idx + end);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -705,5 +784,43 @@ mod tests {
         // The bind mapping survives (plus the appended auto-hide).
         assert_eq!(spec.hostfs.mappings.len(), 2);
         std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// AUDIT.md M2: `shellexpand` implements more of the shell's parameter
+    /// expansion than the spec's promise ("referencing an unset variable is
+    /// an error") allows. `${VAR:-default}` silently expands an unset (or
+    /// empty) variable to the default literal — a programmatically assembled
+    /// spec can smuggle an absolute path past post-expansion validation —
+    /// and an unterminated `${BOGUS` passes through verbatim. Both (and
+    /// other ambiguous shell forms) must be hard errors before expansion.
+    #[test]
+    fn expansion_rejects_shell_extras_and_keeps_plain_references() {
+        // The documented behavior still works: set variables expand, unset
+        // ones error, and a literal `$` away from a name stays verbatim.
+        unsafe { std::env::set_var("RS_BUBBLE_TEST_EXP", "value") };
+        assert_eq!(
+            expand_str("x${RS_BUBBLE_TEST_EXP}y/$RS_BUBBLE_TEST_EXP/$ z$").unwrap(),
+            "xvaluey/value/$ z$"
+        );
+        assert!(expand_str("${RS_BUBBLE_TEST_UNSET_VAR}").is_err());
+        unsafe { std::env::remove_var("RS_BUBBLE_TEST_EXP") };
+
+        // The default-value operator: the audit's exact smuggling vector.
+        // (Live-verified against shellexpand 3.1.2: this used to expand to
+        // `x/etcy` with `UNSET` unset.)
+        assert!(expand_str("x${UNSET:-/etc}y").is_err());
+        assert!(expand_str("${HOME:-/root}").is_err(), "even a set variable \
+            must not silently switch to the operator's default");
+        // Unterminated braces used to pass through verbatim.
+        assert!(expand_str("x${BOGUS").is_err());
+        // The remaining ambiguous shell forms: PID-style `$$` and non-name
+        // content inside the braces (nested braces, other operators).
+        assert!(expand_str("$$").is_err());
+        assert!(expand_str("$$HOME").is_err());
+        assert!(expand_str("${A${B}}").is_err());
+        assert!(expand_str("${HOME:+/other}").is_err());
+        assert!(expand_str("${HOME#prefix}").is_err());
+        assert!(expand_str("${}").is_err());
+        assert!(expand_str("${HOME /a/b}").is_err());
     }
 }

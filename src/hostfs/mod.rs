@@ -121,8 +121,8 @@ use patterns::Patterns;
 async fn log_op_err(op: &str, mirrored: &Path, real: Option<&Path>, err: &std::io::Error) {
     fuselog::event!(
         "FS {op} err={err} mirrored={} real={}",
-        mirrored.display(),
-        real.map(|p| p.display().to_string())
+        fuselog::path_string(mirrored.as_os_str()),
+        real.map(|p| fuselog::path_string(p.as_os_str()))
             .unwrap_or_else(|| "-".into()),
     );
     crate::audit::record(
@@ -140,8 +140,8 @@ async fn log_op_err(op: &str, mirrored: &Path, real: Option<&Path>, err: &std::i
 async fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
     fuselog::event!(
         "FS {op} ok mirrored={} real={}",
-        mirrored.display(),
-        real.display()
+        fuselog::path_string(mirrored.as_os_str()),
+        fuselog::path_string(real.as_os_str())
     );
     crate::audit::record(
         "hostfs",

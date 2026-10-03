@@ -484,19 +484,40 @@ impl Patterns {
         mirrored.to_path_buf()
     }
 
-    /// Whether some `hide` or `ro` pattern might apply to a path strictly
-    /// below the given directory — without being uniformly shadowed there
-    /// by a writable pattern that covers the whole subtree.
+    /// Whether some `hide`, `ro`, `empty` or `inject` pattern might apply
+    /// to a path strictly below the given directory — without being
+    /// uniformly shadowed there by a writable pattern that covers the
+    /// whole subtree.
     ///
     /// This is the rename-restriction check: a directory rename carries
-    /// every child from one pattern context to another, so a `hide` or
-    /// `ro` rule that might govern a child must block the move — moving
-    /// the directory out of such a rule's reach would expose (or make
-    /// writable) content that the spec hides or keeps read-only, and
-    /// moving *into* such a subtree would plant content that a later
-    /// move back out could expose the same way. Checked for both the
-    /// source and the destination of a directory rename.
+    /// every child from one pattern context to another, so a rule that
+    /// might govern a child must block the move — moving the directory
+    /// out of such a rule's reach would expose (or make writable) content
+    /// that the spec hides, keeps read-only or blanks, and moving *into*
+    /// such a subtree would plant content that a later move back out
+    /// could expose the same way. Checked for both the source and the
+    /// destination of a directory rename.
     pub fn subtree_restricted(&self, dir: &Path) -> bool {
+        // `empty`/`inject` first: their shadowing ("nothing below an empty
+        // path is visible", see `permission_of`) applies *unconditionally*,
+        // regardless of list order — no later writable pattern can shadow
+        // it. So any relation that could govern something below `dir`
+        // (the path itself, a `**` cover, or a deeper match) blocks the
+        // rename outright: after a move out of reach, the real host
+        // content would appear at the new location (e.g.
+        // `{rw /work/**}, {empty /work/vault}` — renaming `/work` would
+        // expose the real vault read-write under the new name).
+        for (pattern, permission) in &self.patterns {
+            if !matches!(permission, Permission::Empty | Permission::Inject { .. }) {
+                continue;
+            }
+            if matches!(
+                pattern.walk_depth(dir).map(|(walk, _)| walk),
+                Some(Walk::Exact | Walk::StarStar | Walk::CouldReach)
+            ) {
+                return true;
+            }
+        }
         for (idx, (pattern, permission)) in self.patterns.iter().enumerate() {
             if !matches!(permission, Permission::Ro | Permission::Hide) {
                 continue;
@@ -870,6 +891,56 @@ mod tests {
         assert!(patterns.subtree_restricted(Path::new("/project")));
         // A sibling subtree without the ro rule inside stays free.
         assert!(!patterns.subtree_restricted(Path::new("/project/other")));
+    }
+
+    #[test]
+    fn empty_and_inject_subtrees_block_directory_renames() {
+        // The `empty`/`inject` analog of `restricted_subtrees_block_directory_
+        // renames`: their "nothing below is visible" shadowing is
+        // order-independent (`permission_of` applies it unconditionally), so
+        // no later writable pattern can shadow it — a directory rename out
+        // of an empty path's reach would expose the real host content
+        // read-write under the new name (audit M1).
+        let patterns = ps(&[
+            ("/work/**", Permission::Rw),
+            ("/work/vault", Permission::Empty),
+        ]);
+        assert_eq!(
+            patterns.permission_of(Path::new("/work/vault/secret.key")),
+            None
+        );
+        // Renaming the writable parent carries the real vault along.
+        assert!(patterns.subtree_restricted(Path::new("/work")));
+        // Renaming a subtree that does *not* contain the empty path stays free.
+        assert!(!patterns.subtree_restricted(Path::new("/work/sub")));
+
+        // An `**` empty pattern covering the directory: restricted as well.
+        let patterns = ps(&[
+            ("/work/**", Permission::Rw),
+            ("/work/v/**", Permission::Empty),
+        ]);
+        assert!(patterns.subtree_restricted(Path::new("/work/v")));
+
+        // Injected files are virtual: no rename may carry their context either.
+        let patterns = ps(&[
+            ("/work/**", Permission::Rw),
+            ("/work/vault", Permission::Inject { content: "x".into() }),
+        ]);
+        assert!(patterns.subtree_restricted(Path::new("/work")));
+
+        // A later rw pattern cannot shadow the empty path (unlike ro/hide,
+        // whose shadowing analysis below `subtree_restricted`'s first loop
+        // applies): still restricted, fail-closed.
+        let patterns = ps(&[
+            ("/work/vault", Permission::Empty),
+            ("/work/**", Permission::Rw),
+        ]);
+        assert!(patterns.subtree_restricted(Path::new("/work")));
+
+        // An empty path naming the directory itself blocks too (the whole
+        // subtree is blanked).
+        let patterns = ps(&[("/work/**", Permission::Rw), ("/work", Permission::Empty)]);
+        assert!(patterns.subtree_restricted(Path::new("/work")));
     }
 
     #[test]
