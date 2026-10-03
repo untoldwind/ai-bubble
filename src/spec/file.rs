@@ -668,8 +668,8 @@ mod tests {
     /// `<spec-dir>/cache/`.
     #[test]
     fn a_source_inside_the_spec_dir_is_restricted() {
-        let parent =
-            std::env::temp_dir().join(format!("ai-bubble-spec-src-{}", std::process::id()));
+        let parent = std::env::temp_dir()
+            .join(format!("ai-bubble-spec-src-inside-{}", std::process::id()));
         let spec_dir = parent.join(".ai-bubble");
         std::fs::create_dir_all(&spec_dir).unwrap();
 

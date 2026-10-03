@@ -216,6 +216,16 @@ pub(crate) fn open_full(root: &RootDir, path: &Path, flags: libc::c_int) -> io::
 /// parent, always with `O_NOFOLLOW` (and `O_CLOEXEC`). This is the anchored
 /// equivalent of the old `OpenOptions::…custom_flags(O_NOFOLLOW).open(path)`.
 /// `mode` only matters together with `O_CREAT`.
+///
+/// The open itself is made with `O_NONBLOCK` (AUDIT.md L8): the FUSE
+/// server is single-threaded, and a plain open of a mirrored host **FIFO**
+/// for reading would block it — every later sandbox filesystem request
+/// stalls — until some host-side writer appears. Opening non-blocking
+/// returns immediately; the flag is cleared again on the descriptor before
+/// it is handed out, so the sandbox keeps the normal blocking I/O
+/// semantics on the open file (for regular files/directories `O_NONBLOCK`
+/// is a no-op all along). A FIFO opened *for writing* with no reader
+/// fails with `ENXIO` — fail-closed instead of hanging the server.
 pub(crate) fn open_at(
     root: &RootDir,
     path: &Path,
@@ -223,7 +233,7 @@ pub(crate) fn open_at(
     mode: libc::mode_t,
 ) -> io::Result<std::fs::File> {
     let anchored = anchor_parent(root, path)?;
-    flags |= libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    flags |= libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
     // SAFETY: valid descriptor and NUL-terminated name.
     let fd = unsafe {
         libc::openat(
@@ -235,6 +245,13 @@ pub(crate) fn open_at(
     };
     if fd < 0 {
         return Err(io::Error::last_os_error());
+    }
+    // Clear `O_NONBLOCK` again: only the *open* must not block, not the
+    // subsequent I/O on the descriptor.
+    // SAFETY: `fd` is a freshly opened, owned descriptor we still hold.
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if fl >= 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK) };
     }
     // SAFETY: `fd` is a freshly opened, owned descriptor.
     Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
@@ -412,5 +429,36 @@ pub(crate) fn read_link(root: &RootDir, path: &Path) -> io::Result<std::ffi::OsS
             return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
         }
         size *= 2;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Opening a mirrored host FIFO must not block the (single-threaded)
+    /// server (AUDIT.md L8): `open_at` opens it `O_NONBLOCK` and clears
+    /// the flag again, so the open returns immediately while the
+    /// descriptor keeps normal blocking I/O semantics.
+    #[test]
+    fn open_at_does_not_block_on_a_fifo() {
+        let dir = std::env::temp_dir().join(format!("ai-bubble-fifo-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+        let root = RootDir::open().unwrap();
+        // The FIFO has no writer; a plain blocking open would hang here.
+        let f = open_at(&root, &fifo, libc::O_RDONLY, 0).unwrap();
+
+        // The descriptor is not left in non-blocking mode: the flag is
+        // cleared after the open, so sandbox-side I/O keeps its normal
+        // blocking semantics.
+        let fl = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(fl & libc::O_NONBLOCK, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

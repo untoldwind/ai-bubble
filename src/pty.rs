@@ -54,7 +54,18 @@
 //! terminal-emulator escape-parsing weaknesses are therefore reachable
 //! from untrusted command output (in pty mode and in plain new-session
 //! runs with a tty on stdout alike). The TIOCSTI analysis above is
-//! unaffected; this is output-side only, documented rather than filtered.
+//! unaffected.
+//!
+//! The relay is also transparent **towards the command**: it is a plain
+//! bidirectional byte pipe, so a command can issue terminal *queries*
+//! (DA, XTGETTCAP, palette/cursor reports) and **receive the real
+//! terminal's replies** — the user's terminal answers its stdin, the relay
+//! forwards the bytes to the pty. A reply arriving after the relay exits
+//! can even land in the user's shell input buffer. This is the same
+//! exposure class as `ssh`/`script(1)` (which cannot distinguish a
+//! legitimate keystroke from a query reply either) and is documented
+//! rather than filtered: query replies cannot be told apart from real
+//! keyboard input at the byte level.
 
 use std::process::exit;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -176,10 +187,45 @@ static PIPE_W: AtomicI32 = AtomicI32::new(-1);
 /// First fatal signal not yet consumed by the relay loop.
 static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+/// The user's terminal attributes as they were before the relay switched
+/// them to raw mode. Kept in a global so the restore can also happen on
+/// `die` paths (AUDIT.md L5): after `tcsetattr(raw)` succeeded, any
+/// `die_with_error` (pipe creation, signal-handler installation, a `poll`
+/// failure in the relay) would otherwise `exit(1)` with the terminal left
+/// in raw mode — no echo, no line editing. The `atexit` hook below runs
+/// on every `std::process::exit`, which is how all `die` paths leave.
+static SAVED_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+
+/// `atexit` hook: put the user's terminal back the way it was. Runs on
+/// every normal (non-`SIGKILL`) exit of the process — including all
+/// `die` paths — and is idempotent (the relay epilogue restores the
+/// terminal too; applying the same saved attributes twice is harmless).
+extern "C" fn restore_tty_atexit() {
+    if let Ok(saved) = SAVED_TERMIOS.lock()
+        && let Some(saved) = saved.as_ref()
+    {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, saved);
+        }
+    }
+}
+
 extern "C" fn on_signal(sig: libc::c_int) {
     unsafe {
         let w = PIPE_W.load(Ordering::Relaxed);
         if w < 0 {
+            // AUDIT.md L5: before (or after) the self-pipe is installed
+            // the handler must not silently swallow a fatal signal. With
+            // the pipe gone, restore the default action and re-raise:
+            // the signal kills (or otherwise defaults) this process the
+            // way it would without the relay handler. Both syscalls are
+            // async-signal-safe. SIGWINCH's default disposition is to
+            // do nothing harmful — just return.
+            if sig != libc::SIGWINCH {
+                let dfl: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(sig, &dfl, std::ptr::null_mut());
+                libc::kill(libc::getpid(), sig);
+            }
             return;
         }
         if sig == libc::SIGWINCH {
@@ -219,6 +265,14 @@ pub(crate) unsafe fn parent_relay(pty: &Pty, child_pid: libc::pid_t) {
             if libc::tcsetattr(0, libc::TCSANOW, &raw) != 0 {
                 die_with_error("Can't switch the terminal to raw mode");
             }
+            // From here on every `die` path must restore the terminal:
+            // register the `atexit` hook (it runs on `std::process::exit`,
+            // which is how every `die_with_error` leaves) *after* raw mode
+            // is live (AUDIT.md L5).
+            *SAVED_TERMIOS.lock().unwrap() = Some(saved);
+            if libc::atexit(restore_tty_atexit) != 0 {
+                die_with_error("Can't register the terminal restore hook");
+            }
             // Start with the terminal's current window size; resizes are
             // relayed while the command runs (see the relay loop).
             forward_winsize(pty.master);
@@ -247,7 +301,10 @@ pub(crate) unsafe fn parent_relay(pty: &Pty, child_pid: libc::pid_t) {
         // Restore the user's terminal on every path out of the relay.
         // (Only a SIGKILL to this process — the PDEATHSIG chain — can
         // skip this, exactly like script(1); `reset` fixes the terminal.)
-        PIPE_W.store(-1, Ordering::Relaxed);
+        // The terminal is restored *before* the relay handler is
+        // disarmed (AUDIT.md L5): with `PIPE_W` still set, a signal in
+        // this window is recorded in `PENDING_SIGNAL` and delivered below;
+        // nothing is swallowed.
         if have_termios {
             libc::tcsetattr(0, libc::TCSANOW, &saved);
         }
@@ -271,6 +328,21 @@ pub(crate) unsafe fn parent_relay(pty: &Pty, child_pid: libc::pid_t) {
         }
         let _ = libc::close(pipe_r);
         let _ = libc::close(pipe_w);
+
+        // Disarm the self-pipe only after the handlers are back to their
+        // defaults: a signal from here on takes the default action
+        // directly, and `PIPE_W = -1` makes the handler's fallback
+        // (SIG_DFL + re-raise) cover any window that remains.
+        PIPE_W.store(-1, Ordering::Relaxed);
+
+        // AUDIT.md L5: a fatal signal that arrived while the relay handler
+        // was still installed (after the loop, during the restore above)
+        // was recorded but never acted on — deliver it now, under the
+        // default dispositions just restored.
+        let pending = PENDING_SIGNAL.swap(0, Ordering::Relaxed);
+        if pending != 0 {
+            libc::kill(libc::getpid(), pending);
+        }
 
         match end {
             RelayEnd::MasterClosed => {} // fall through: reap the command

@@ -37,7 +37,13 @@ pub struct Cli {
     /// Path to the sandbox spec directory (expected to contain a
     /// `spec.json` file). Defaults to `.ai-bubble` in the current
     /// directory.
-    #[arg(long = "spec-dir", value_name = "DIR", global = true)]
+    ///
+    /// Deliberately *not* a clap `global` option (AUDIT.md L6): it must
+    /// appear **before** the sub-command. A wrapper that passes untrusted
+    /// arguments to `run` without a leading `--` must not be able to swap
+    /// the entire security policy with a stray `--spec-dir` (same class as
+    /// `run --no-new-session`).
+    #[arg(long = "spec-dir", value_name = "DIR")]
     pub spec: Option<PathBuf>,
 
     /// Print the JSON Schema for the spec file to stdout and exit. Useful
@@ -244,6 +250,18 @@ mod tests {
             err.contains("unexpected") || err.contains("--bind"),
             "{err}"
         );
+    }
+
+    /// `--spec-dir` is deliberately not a global option (AUDIT.md L6): a
+    /// wrapper passing untrusted arguments to `run` without a leading
+    /// `--` must not be able to swap the security policy with a stray
+    /// `--spec-dir` after the sub-command.
+    #[test]
+    fn spec_dir_after_the_subcommand_is_rejected() {
+        let err = Cli::try_parse_from(["ai-bubble", "run", "--spec-dir", "/tmp/evil", "sh"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--spec-dir"), "{err}");
     }
 
     #[test]

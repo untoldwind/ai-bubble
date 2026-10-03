@@ -42,6 +42,25 @@ pub(crate) fn die_with_error(msg: &str) -> ! {
     exit(1)
 }
 
+/// Upper bound (exclusive) of the plain `close()` sweep used when the
+/// kernel has no `close_range` (< 5.9, AUDIT.md L4). The old fixed 4096
+/// cap let caller-leaked fds at or above it survive into the command —
+/// and a leaked host *directory* fd defeats the chroot via `fchdir`.
+/// Sweep to the fd table's soft limit when it is finite, and to a generous
+/// fixed bound otherwise: `close()` on an unused fd is just an `EBADF`, so
+/// over-sweeping costs only a few microseconds per fd.
+fn fd_sweep_limit() -> u32 {
+    const FALLBACK: u32 = 1 << 20;
+    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } == 0
+        && rlim.rlim_cur != libc::RLIM_INFINITY
+    {
+        (rlim.rlim_cur as u64).min(FALLBACK as u64) as u32
+    } else {
+        FALLBACK
+    }
+}
+
 /// Create a fresh directory under `/tmp` with `mkdtemp(3)`, like bwrap's
 /// temp directories. `template` must end in `XXXXXX` (a NUL is appended
 /// here); `msg` is the `die_with_error` context on failure.
@@ -1271,8 +1290,8 @@ pub(crate) unsafe fn mount_and_exec(
             if e.raw_os_error() != Some(libc::ENOSYS) && e.raw_os_error() != Some(libc::EINVAL) {
                 die_with_error("Can't close inherited file descriptors");
             }
-            for fd in 3..4096 {
-                libc::close(fd);
+            for fd in 3..fd_sweep_limit() {
+                libc::close(fd as libc::c_int);
             }
         }
 

@@ -15,6 +15,23 @@ use super::*;
 /// (e.g. in a container). The `setattr` chmod path applies the same mask.
 pub(super) const SAFE_MODE: libc::mode_t = 0o7777 & !0o6000;
 
+/// The process's own group IDs (primary plus supplementary groups), for
+/// the `setattr` chown clamp (AUDIT.md L2). An empty supplementary list
+/// (or a `getgroups` error) leaves only the primary gid — fail closed.
+fn self_groups() -> Vec<libc::gid_t> {
+    let mut gids = vec![unsafe { libc::getgid() }];
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if n > 0 {
+        let mut buf = vec![0 as libc::gid_t; n as usize];
+        let got = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
+        if got > 0 {
+            buf.truncate(got as usize);
+            gids.extend(buf);
+        }
+    }
+    gids
+}
+
 /// [`attr_from_metadata`], for the dirfd-anchored stat results (see
 /// [`anchored`]). `ino` is filled in by the reply sites that know it.
 pub(super) fn attr_from_stat(st: &libc::stat) -> FileAttr {
@@ -1049,10 +1066,13 @@ impl Filesystem for HostFs {
             // Prefer `fchmodat(AT_SYMLINK_NOFOLLOW)` (glibc 2.32+ forwards it
             // to `fchmodat2`, Linux ≥ 6.6), which changes the mode of the
             // symlink inode itself. On older glibc/kernel combinations the
-            // flag is unsupported (EINVAL/ENOSYS/EOPNOTSUPP); fall back to a
-            // lstat check: refuse to chmod a symlink at all (EACCES, matching
-            // the sibling denial style above) and otherwise chmod the regular
-            // file/directory with the historic flags.
+            // flag is unsupported (EINVAL/ENOSYS/EOPNOTSUPP); fall back to
+            // opening the final component `O_NOFOLLOW` and chmodding the
+            // pinned descriptor: a symlink is refused outright (`EACCES`,
+            // matching the sibling denial style above) and the chmod
+            // otherwise applies to the regular file/directory, race-free
+            // (see the fallback below for why the old
+            // lstat-then-`fchmodat` shape is gone).
             //
             // The requested mode is masked with `SAFE_MODE` (`0o7777` with
             // the setuid/setgid bits (0o6000) stripped silently): for an
@@ -1067,26 +1087,36 @@ impl Filesystem for HostFs {
                     Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) => {}
                     _ => return Err(err.into()),
                 }
-                // Flag unsupported: make sure the final component is not a
-                // symlink before chmod-following it.
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe {
-                    libc::fstatat(
+                // Flag unsupported: the fallback must never follow a final-
+                // component symlink — and it must not race one either. The
+                // historic lstat-then-`fchmodat(flags=0)` sequence left a
+                // TOCTOU window (AUDIT.md L3): a host-side writer swapping a
+                // symlink in between the two syscalls made the chmod follow
+                // it to an unmirrored target. Instead, open the final
+                // component itself with `O_NOFOLLOW` — a symlink fails with
+                // `ELOOP` (reported as `EACCES`, matching the sibling denial
+                // style) — and chmod the pinned descriptor: an already-open
+                // fd can never be re-pointed by a later rename.
+                let fd = unsafe {
+                    libc::openat(
                         dirfd,
                         name,
-                        &mut st,
-                        libc::AT_SYMLINK_NOFOLLOW,
+                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        0,
                     )
-                } != 0
-                {
-                    return Err(std::io::Error::last_os_error().into());
+                };
+                if fd < 0 {
+                    let open_err = std::io::Error::last_os_error();
+                    if open_err.raw_os_error() == Some(libc::ELOOP) {
+                        // The entry is a host symlink (or a symlink raced
+                        // in): deny, its target is not guaranteed mirrored.
+                        return Err(libc::EACCES.into());
+                    }
+                    return Err(open_err.into());
                 }
-                if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
-                    // Deny: the entry is a host symlink, its target is not
-                    // guaranteed to be mirrored.
-                    return Err(libc::EACCES.into());
-                }
-                if unsafe { libc::fchmodat(dirfd, name, mode, 0) } != 0 {
+                // SAFETY: `fd` is a freshly opened, owned descriptor.
+                let f = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+                if unsafe { libc::fchmod(f.as_raw_fd(), mode) } != 0 {
                     return Err(std::io::Error::last_os_error().into());
                 }
             }
@@ -1094,6 +1124,22 @@ impl Filesystem for HostFs {
         if set_attr.uid.is_some() || set_attr.gid.is_some() {
             let uid = set_attr.uid.unwrap_or(u32::MAX);
             let gid = set_attr.gid.unwrap_or(u32::MAX);
+            // AUDIT.md L2: the chown goes to the host with the server's
+            // privileges. For an unprivileged invoker the kernel already
+            // constrains it, but ai-bubble may run elevated (root in a
+            // container), and then a chown through the mirror could hand
+            // rw-mapped host files to any uid/gid — the analogue of the
+            // setuid/setgid masking (`SAFE_MODE`) on chmod. Only ownership
+            // the process itself legitimately holds is allowed: its own
+            // uid, and its own gid or one of its supplementary groups
+            // (u32::MAX means "leave unchanged" — the kernel's -1).
+            let self_uid = unsafe { libc::getuid() };
+            if uid != u32::MAX && uid != self_uid {
+                return Err(libc::EACCES.into());
+            }
+            if gid != u32::MAX && !self_groups().contains(&gid) {
+                return Err(libc::EACCES.into());
+            }
             if unsafe { libc::fchownat(dirfd, name, uid, gid, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }

@@ -63,7 +63,10 @@ async fn handle_connect_proxy(mut tcp: TcpStream, sock: &Path, allow: &[String])
         }
     };
     if !target_allowed(&target, allow) {
-        eprintln!("ai-bubble proxy: CONNECT to {target} denied");
+        eprintln!(
+            "ai-bubble proxy: CONNECT to {} denied",
+            super::log_target(&target)
+        );
         crate::audit::record("proxy", "CONNECT", Some(&target), Some("denied"), None).await;
         let _ = tcp.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
         return;

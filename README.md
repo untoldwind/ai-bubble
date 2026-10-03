@@ -8,7 +8,7 @@ Key differences:
 
 * The sandbox is configured through a **spec file** (JSON), not through
   command-line options. By default ai-bubble looks for `.ai-bubble/spec.json`
-  in the current directory; the global `--spec-dir DIR` option points it at a
+  in the current directory; the `--spec-dir DIR` option points it at a
   different spec directory. The spec directory itself (and everything in it —
   `spec.json`, the env file, the project cache) is **always hidden** from the
   sandboxed command: ai-bubble appends an internal `hide` mapping for it, so
@@ -29,9 +29,10 @@ Key differences:
 
 ## Usage
 
-ai-bubble has sub-commands; `--spec-dir DIR` is a global option that selects
-which spec directory to use (default: `.ai-bubble` in the current
-directory).
+ai-bubble has sub-commands; `--spec-dir DIR` selects which spec directory to
+use (default: `.ai-bubble` in the current directory). It must appear
+**before** the sub-command — a wrapper passing untrusted arguments to
+`run` should still insert `--` before them (AUDIT.md L6).
 
 ```sh
 # Run COMMAND inside the sandbox configured by the spec file.

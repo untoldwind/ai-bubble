@@ -20,6 +20,17 @@ pub mod sandbox;
 pub use self::connector::serve_connector;
 pub use self::sandbox::serve_sandbox_proxy;
 
+/// Render a sandbox-controlled target for the operator's stderr: the
+/// target line is only NUL/length-checked at the protocol level, so it may
+/// contain control bytes — printed raw they would forge log lines
+/// (embedded newlines) and inject terminal escape sequences when the
+/// operator views the output (AUDIT.md L1). Rust's `Debug` for `str`
+/// escapes `\n`, `\x1b`, `\"` and friends while leaving ordinary printable
+/// text readable.
+pub(crate) fn log_target(target: &str) -> String {
+    format!("{target:?}")
+}
+
 /// Address of the in-sandbox HTTP CONNECT proxy.
 pub const PROXY_ADDR: &str = "127.0.0.2:3128";
 
@@ -30,6 +41,19 @@ pub const PROXY_URL: &str = "http://127.0.0.2:3128";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sandbox-supplied target with control bytes must not be printable
+    /// as-is (AUDIT.md L1): forged log lines and terminal escape
+    /// injection are closed by the `Debug` escaping.
+    #[test]
+    fn log_target_escapes_control_bytes() {
+        assert_eq!(log_target("example.com:443"), "\"example.com:443\"");
+        assert_eq!(
+            log_target("a\nFOO \u{1b}[31m bar"),
+            "\"a\\nFOO \\u{1b}[31m bar\""
+        );
+    }
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream, UnixListener};
 

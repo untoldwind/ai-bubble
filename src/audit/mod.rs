@@ -112,7 +112,16 @@ struct AuditLog {
 /// disabled (no `audit.log` in the spec) — `record` then does nothing.
 /// The writer task is spawned lazily, on the first `record` (which runs
 /// inside a runtime); the static is filled then.
-static SENDER: OnceLock<Option<Sender<Event>>> = OnceLock::new();
+///
+/// The sender is held behind a `Mutex<Option<_>>` so [`drain`] can take
+/// (and drop) it: the writer ends — after a final flush — when all
+/// senders are gone, which is exactly what drain awaits.
+static SENDER: OnceLock<Option<SenderCell>> = OnceLock::new();
+
+struct SenderCell {
+    tx: std::sync::Mutex<Option<Sender<Event>>>,
+    writer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
 
 /// Open the audit log eagerly and store path + descriptor. Called once
 /// by `main`, before any fork; every forked process clones the
@@ -182,6 +191,29 @@ fn validate_path(path: &Path, spec_dir: &Path) -> Result<PathBuf, String> {
         }
     };
     let spec_dir = std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf());
+    // AUDIT.md L7: audit appends must never land on the policy itself —
+    // the spec file (`spec.json`) and the default env file (`.env`) hold
+    // the security policy and secrets; a log configured onto either would
+    // corrupt them event by event. Same for the spec directory itself
+    // (a directory cannot be a log anyway, but the rejection message
+    // should say so up front).
+    if resolved == spec_dir {
+        return Err(format!(
+            "audit log {} is the spec directory itself; it must be a file inside \
+             it (or a pre-existing file elsewhere)",
+            path.display()
+        ));
+    }
+    if resolved.parent() == Some(spec_dir.as_path()) {
+        let name = resolved.file_name().map(|n| n.to_string_lossy().into_owned());
+        if name.as_deref() == Some("spec.json") || name.as_deref() == Some(".env") {
+            return Err(format!(
+                "audit log {} would overwrite the spec's policy file; pick a \
+                 different name inside the spec directory",
+                path.display()
+            ));
+        }
+    }
     // Inside the spec directory: fine, the writer may create it there.
     if resolved.starts_with(&spec_dir) {
         return Ok(resolved);
@@ -208,10 +240,15 @@ fn validate_path(path: &Path, spec_dir: &Path) -> Result<PathBuf, String> {
 /// `what` names the log in error messages. Also `O_CLOEXEC`: the fd is
 /// opened before the forks and must not leak into the executed command
 /// (the sandbox's fd sweep covers the same thing, this is belt and braces).
+/// Created files get `0600` (AUDIT.md L7): the log records
+/// security-relevant events (paths, targets) and must not be
+/// world-readable on a shared host — the `umask` would otherwise leave it
+/// `0644`.
 pub(crate) fn safe_open(path: &Path, what: &str) -> std::io::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
     if !file.metadata()?.is_file() {
@@ -232,7 +269,11 @@ pub async fn record(
     result: Option<&str>,
     detail: Option<String>,
 ) {
-    let Some(sender) = SENDER.get_or_init(setup).as_ref() else {
+    let Some(sender) = SENDER
+        .get_or_init(setup)
+        .as_ref()
+        .and_then(|cell| cell.tx.lock().unwrap().clone())
+    else {
         return;
     };
     // A closed channel can only mean the writer task is gone (it dies
@@ -253,7 +294,7 @@ pub async fn record(
 /// async); `None` when auditing is disabled. The writer clones the
 /// descriptor opened in [`configure`] — it never opens the log path
 /// itself.
-fn setup() -> Option<Sender<Event>> {
+fn setup() -> Option<SenderCell> {
     let log = LOG.get()?.as_ref()?;
     // A fresh descriptor per process (`try_clone` dups the fd): forked
     // processes must not share the mutex guarding the file.
@@ -262,27 +303,37 @@ fn setup() -> Option<Sender<Event>> {
         Err(e) => crate::sandbox::die(&format!("Can't open the audit log for writing: {e}")),
     };
     let (tx, rx) = mpsc::channel(CAPACITY);
-    tokio::spawn(writer(log.path.clone(), file, rx));
-    Some(tx)
+    let writer = tokio::spawn(writer(log.path.clone(), file, rx));
+    Some(SenderCell {
+        tx: std::sync::Mutex::new(Some(tx)),
+        writer: std::sync::Mutex::new(Some(writer)),
+    })
 }
 
 /// Wait for the writer to catch up. Call on any clean process exit
-/// path, inside the process's runtime: the writer batches with
-/// [`FLUSH_INTERVAL`] granularity, and a plain `exit(0)` would kill the
-/// task before the last batch reaches the file. Inert when auditing is
-/// off (and never spawns a writer on its own).
+/// path, inside the process's runtime: the sender is dropped so the
+/// writer's `rx.recv()` returns `None` (it then flushes its final batch
+/// and ends), and the writer task is awaited — no fixed sleeps, no
+/// guessing about backlogs (AUDIT.md L7): every event recorded before
+/// `drain` is in the file when it returns. Inert when auditing is off
+/// (and never spawns a writer on its own).
 pub async fn drain() {
     // Only act when this process already has a writer: if auditing is
     // disabled (or nothing was ever recorded) there is nothing to wait
     // for — and drain must not spawn one on its own.
-    if SENDER.get().and_then(|s| s.as_ref()).is_none() {
+    let Some(cell) = SENDER.get().and_then(|s| s.as_ref()) else {
         return;
-    }
-    // Two rounds of "wait one flush interval": the writer flushes at
-    // most one interval after the last event, and events may still
-    // trickle in while we wait.
-    for _ in 0..2 {
-        tokio::time::sleep(FLUSH_INTERVAL).await;
+    };
+    // Drop this process's sender: the writer ends when all senders are
+    // gone. (Other senders may still exist from concurrent `record`
+    // callers; `await` below waits until *they* are done too — the
+    // writer only returns after a final flush.)
+    let handle = {
+        cell.tx.lock().unwrap().take();
+        cell.writer.lock().unwrap().take()
+    };
+    if let Some(handle) = handle {
+        let _ = handle.await;
     }
 }
 
@@ -484,6 +535,72 @@ mod tests {
         // the parent is canonicalized, so this is judged as
         // `<dir>/escape.jsonl` — outside, missing, refused.
         assert!(validate_path(&spec_dir.join("../escape.jsonl"), &spec_dir).is_err());
+
+        // AUDIT.md L7: the spec's policy and secret files must not be log
+        // targets — an audit append on `spec.json` or the env file would
+        // corrupt the security policy event by event.
+        assert!(validate_path(&spec_dir.join("spec.json"), &spec_dir).is_err());
+        assert!(validate_path(&spec_dir.join(".env"), &spec_dir).is_err());
+        // The spec directory itself is not a file, reject it up front.
+        assert!(validate_path(&spec_dir, &spec_dir).is_err());
+        // Other names inside the spec directory are still fine.
+        assert!(validate_path(&spec_dir.join("audit.jsonl"), &spec_dir).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `safe_open` creates new files with mode `0600` (AUDIT.md L7): the
+    /// audit log records security-relevant events and must not be
+    /// world-readable on a shared host (the umask would give `0644`).
+    #[test]
+    fn safe_open_creates_files_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ai-bubble-audit-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+
+        let f = safe_open(&log, "audit log").unwrap();
+        drop(f);
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `drain` drops the sender and awaits the writer (AUDIT.md L7): every
+    /// event recorded before it is in the file when it returns, without
+    /// fixed sleeps.
+    #[tokio::test]
+    async fn drain_awaits_the_writer() {
+        let dir = std::env::temp_dir().join(format!("ai-bubble-audit-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+
+        let (tx, rx) = mpsc::channel::<Event>(CAPACITY);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        let writer = tokio::spawn(writer(log.clone(), file, rx));
+
+        tx.send(Event {
+            source: "test".into(),
+            op: "op".into(),
+            path: None,
+            result: None,
+            detail: None,
+        })
+        .await
+        .unwrap();
+        // Drop the sender exactly like `drain` does, then await the
+        // writer; the event must already be flushed when the await ends.
+        drop(tx);
+        writer.await.unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
