@@ -27,7 +27,7 @@ const STARTER_SPEC_TEMPLATE: &str = r#"{
   "hostfs": {
     "mappings": [
       { "type": "rw", "glob": {{PROJECT_DIR}} },
-      { "type": "ro", "globs": ["/bin", "/etc", "/lib", "/lib64", "/usr"] },
+      { "type": "ro", "glob": ["/bin", "/etc", "/lib", "/lib64", "/usr"] },
       { "type": "project-cache", "path": ["${HOME}/.cargo", "${HOME}/.local", "${HOME}/.config/opencode"] },
       { "type": "session-cache", "path": "${HOME}/.cache" },
       { "type": "dev" },
@@ -102,7 +102,10 @@ pub fn init(spec_dir: Option<&Path>) {
         sandbox::die(&format!("Can't write {}: {e}", spec_path.display()));
     }
     if let Err(e) = std::fs::set_permissions(&spec_path, std::fs::Permissions::from_mode(0o600)) {
-        sandbox::die(&format!("Can't set the mode of {}: {e}", spec_path.display()));
+        sandbox::die(&format!(
+            "Can't set the mode of {}: {e}",
+            spec_path.display()
+        ));
     }
 
     let schema_path = dir.join(SCHEMA_FILE);
@@ -175,16 +178,11 @@ fn ensure_ignored(project_dir: &Path, spec_dir: &Path) {
     // The whole spec directory being ignored covers its cache too —
     // no need to append anything (that is the previous, now-discouraged
     // behavior, tolerated for idempotence).
-    let spec_dir_entry = entry
-        .strip_suffix("cache/")
-        .unwrap_or(entry.as_str());
+    let spec_dir_entry = entry.strip_suffix("cache/").unwrap_or(entry.as_str());
     let spec_dir_bare = spec_dir_entry.trim_end_matches('/');
     if existing.lines().any(|line| {
         let line = line.trim();
-        line == entry
-            || line == bare
-            || line == spec_dir_entry
-            || line == spec_dir_bare
+        line == entry || line == bare || line == spec_dir_entry || line == spec_dir_bare
     }) {
         return;
     }
@@ -323,7 +321,10 @@ mod tests {
         ensure_ignored(&dir.0, &dir.0.join(".ai-bubble"));
 
         let text = std::fs::read_to_string(dir.0.join(".gitignore")).unwrap();
-        assert!(text.lines().any(|line| line == ".ai-bubble/cache/"), "{text:?}");
+        assert!(
+            text.lines().any(|line| line == ".ai-bubble/cache/"),
+            "{text:?}"
+        );
         // The spec directory itself must NOT be ignored.
         assert!(!text.lines().any(|line| line == ".ai-bubble/"), "{text:?}");
     }
@@ -339,7 +340,10 @@ mod tests {
 
         let text = std::fs::read_to_string(dir.0.join(".gitignore")).unwrap();
         assert!(text.starts_with("/target\n"), "{text:?}");
-        assert!(text.lines().any(|line| line == ".ai-bubble/cache/"), "{text:?}");
+        assert!(
+            text.lines().any(|line| line == ".ai-bubble/cache/"),
+            "{text:?}"
+        );
     }
 
     #[test]
@@ -392,8 +396,8 @@ mod tests {
     #[test]
     fn starter_spec_is_valid_and_sets_resource_limits() {
         let rendered = starter_spec(std::path::Path::new("/home/me/project"));
-        let spec: crate::spec::Spec = serde_json::from_str(&rendered)
-            .expect("the starter spec must parse as a Spec");
+        let spec: crate::spec::Spec =
+            serde_json::from_str(&rendered).expect("the starter spec must parse as a Spec");
 
         assert_eq!(spec.rlimits.nproc, Some(1024));
         assert_eq!(spec.rlimits.nofile, Some(4096));
@@ -411,6 +415,10 @@ mod tests {
                 _ => None,
             })
             .expect("the starter spec has a /tmp tmpfs mapping");
-        assert_eq!(tmpfs, Some(1073741824), "the /tmp tmpfs must be size-capped");
+        assert_eq!(
+            tmpfs,
+            Some(1073741824),
+            "the /tmp tmpfs must be size-capped"
+        );
     }
 }
