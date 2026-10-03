@@ -319,6 +319,18 @@ impl Spec {
     /// policy persistently across runs. Such mappings are rejected as a
     /// hard error at spec load time.
     ///
+    /// Sources *inside* the spec directory are restricted, not outright
+    /// rejected: targeting a **subdirectory** of the spec directory (and
+    /// anything below it) is a deliberate, supported design — e.g. a
+    /// `conf/` folder the sandbox may rewrite. But a **top-level file**
+    /// inside the spec directory (its parent is the spec directory
+    /// itself) is rejected — that is where `spec.json` and the env file
+    /// live — and so is a top-level *entry* whose type cannot be verified
+    /// as a directory (nonexistent, or a symlink to a file). Use with
+    /// care: a writable source inside the spec directory is still outside
+    /// the pattern-based policy and hidden from the sandbox except at its
+    /// redirect destination.
+    ///
     /// Deliberately *not* checked: `session-cache` (its backing store is a
     /// per-run tmp directory) and `project-cache` (its backing store is
     /// `spec_dir/cache`, which is exactly the intended, hidden location).
@@ -356,6 +368,49 @@ impl Spec {
                     source.display(),
                     spec_dir.display()
                 ));
+            }
+            // A source strictly *inside* the spec directory is restricted
+            // rather than rejected (see the doc comment above): the design
+            // deliberately allows rewriting a conf directory kept inside
+            // `.ai-bubble/`. Everything at least two levels below the spec
+            // directory is allowed. A top-level entry (its parent *is* the
+            // spec directory) is allowed only if it is verifiably a
+            // directory — a nonexistent entry or a file (including a
+            // symlink to one, since `absolute_dir` canonicalized the
+            // source) is rejected, fail-closed: that is the layer where
+            // `spec.json` and the env file live.
+            if source.starts_with(&spec_dir) {
+                let depth = source
+                    .strip_prefix(&spec_dir)
+                    .unwrap_or(&source)
+                    .components()
+                    .count();
+                if depth == 1 {
+                    match std::fs::metadata(&source) {
+                        Ok(md) if md.is_dir() => {}
+                        Ok(_) => {
+                            return Err(format!(
+                                "the {kind} source {} is a file directly inside the spec \
+                                 directory {}: files there — spec.json, the env file — hold the \
+                                 security policy and its secrets; target a path inside a \
+                                 subdirectory of the spec directory instead",
+                                source.display(),
+                                spec_dir.display()
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "the {kind} source {} is directly inside the spec directory \
+                                 {} and cannot be verified to be a directory ({e}); files \
+                                 there — spec.json, the env file — hold the security policy \
+                                 and its secrets, so only a subdirectory of the spec \
+                                 directory may be targeted",
+                                source.display(),
+                                spec_dir.display()
+                            ));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -524,14 +579,16 @@ mod tests {
         std::fs::remove_dir_all(&parent).ok();
     }
 
-    /// AUDIT.md M6: a bind/redirect source *strictly inside* the spec
-    /// directory (e.g. the spec file itself, or the env file) bypasses the
-    /// pattern list and the auto-hide just like a source covering the spec
-    /// directory — and with `rw: true`/`redirect-rw` it lets the sandboxed
-    /// command rewrite the policy persistently. Such sources are rejected,
-    /// except the project-cache backing store `<spec-dir>/cache/`.
+    /// AUDIT.md H1/M6: a bind/redirect source *strictly inside* the spec
+    /// directory bypasses the pattern list and the auto-hide just like a
+    /// source covering the spec directory. Top-level entries are rejected
+    /// (that is where `spec.json` and the env file live); a directory
+    /// directly inside the spec directory is allowed by design (the conf
+    /// directory a sandbox may rewrite), and so is anything inside a
+    /// subdirectory — including the project-cache backing store
+    /// `<spec-dir>/cache/`.
     #[test]
-    fn a_source_inside_the_spec_dir_is_rejected() {
+    fn a_source_inside_the_spec_dir_is_restricted() {
         let parent =
             std::env::temp_dir().join(format!("ai-bubble-spec-src-{}", std::process::id()));
         let spec_dir = parent.join(".ai-bubble");
@@ -568,6 +625,54 @@ mod tests {
         );
         spec.validate_sources(Path::new("/repo/.ai-bubble"))
             .expect("the cache backing store may be targeted");
+
+        // A file two levels below the spec directory is allowed by design
+        // (the conf-directory use case): the sandbox may rewrite it.
+        let conf = spec_dir.join("conf");
+        std::fs::create_dir_all(&conf).unwrap();
+        std::fs::write(conf.join("settings.json"), "{}").unwrap();
+        let mut spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "redirect-rw", "dest": "/conf", "source": "conf/settings.json" }
+            ] } }"#,
+        );
+        spec.hostfs.resolve_relative_sources(&spec_dir);
+        spec.validate_sources(&spec_dir)
+            .expect("a file inside a subdirectory of the spec dir may be targeted");
+
+        // A directory directly inside the spec directory is allowed, too.
+        let mut spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "redirect-rw", "dest": "/conf", "source": "conf" }
+            ] } }"#,
+        );
+        spec.hostfs.resolve_relative_sources(&spec_dir);
+        spec.validate_sources(&spec_dir)
+            .expect("a subdirectory of the spec dir may be targeted");
+
+        // A top-level file is rejected — spec.json and the env file live
+        // at that level.
+        std::fs::write(spec_dir.join("secrets.env"), "TOKEN=x").unwrap();
+        let mut spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "redirect-rw", "dest": "/loot", "source": "secrets.env" }
+            ] } }"#,
+        );
+        spec.hostfs.resolve_relative_sources(&spec_dir);
+        let err = spec
+            .validate_sources(&spec_dir)
+            .expect_err("a redirect-rw onto a top-level file must be rejected");
+        assert!(err.contains("inside the spec directory"), "{err}");
+
+        // A nonexistent top-level entry fails closed as well: it cannot
+        // be verified to be a directory.
+        let mut spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "redirect-rw", "dest": "/x", "source": "maybe-a-dir" }
+            ] } }"#,
+        );
+        spec.hostfs.resolve_relative_sources(&spec_dir);
+        assert!(spec.validate_sources(&spec_dir).is_err());
 
         std::fs::remove_dir_all(&parent).ok();
     }

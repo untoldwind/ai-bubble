@@ -107,6 +107,16 @@ Notes:
   └── cache/         # backing store of `project-cache` mappings
   ```
 
+  You may keep a configuration directory inside the spec directory (e.g.
+  `.ai-bubble/conf/`) and expose it to the sandbox with a `bind` or
+  `redirect-rw` mapping — **do this with care**: such a source bypasses the
+  glob-based write policy and the spec directory's auto-hide, so everything
+  under it is readable and (with `rw`) writable by the sandboxed command,
+  and whatever it writes there persists into every later run that reads it.
+  Only sources **inside a subdirectory** of the spec directory are accepted;
+  the spec directory itself, its ancestors, and files directly inside it
+  (`spec.json`, the env file) are rejected as sources at spec load time.
+
 ### Editor support
 
 The spec file's JSON Schema is generated at build time and printed by
@@ -308,6 +318,12 @@ command line.
   (which is then shown with its whole subtree); its `dest` must be
   absolute, free of wildcards and of `..` components. A relative
   `source` is resolved relative to the directory the spec file lives in.
+  A `source` that covers the spec directory (the directory itself or an
+  ancestor) is a hard error; a source *inside* the spec directory must be
+  within a subdirectory — the directory itself and top-level files are
+  rejected — so a kept-in-`.ai-bubble` conf directory can be shared, while
+  `spec.json` and the env file can never be reached (see "A typical spec
+  directory" above; do this with care).
 - `session-cache` and `project-cache` are writable redirects with a
   managed backing directory. The sandbox path maps onto the backing
   directory plus its relative sub-path (e.g. `/home/a/.cache` →
