@@ -388,13 +388,21 @@ fn schema_key_is_accepted_but_ignored() {
 fn redirect_sources_are_resolved_relative_to_the_spec_dir() {
     let dir = std::env::temp_dir().join(format!("ai-bubble-spec-redirect-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // The relative source must resolve *outside* the spec directory (a
+    // source inside it would be rejected by `validate_sources` — it
+    // bypasses the pattern list and the auto-hide).
+    let sibling_name = format!("ai-bubble-spec-redirect-sib-{}", std::process::id());
+    let sibling = dir.join("..").join(&sibling_name);
+    std::fs::create_dir_all(&sibling).unwrap();
     let path = dir.join(crate::spec::file::SPEC_FILE);
     std::fs::write(
         &path,
-        r#"{ "hostfs": { "mappings": [
-            { "type": "redirect-ro", "dest": "/bla", "source": "otherdir" },
-            { "type": "redirect-rw", "dest": "/abs", "source": "/elsewhere" }
-        ] } }"#,
+        format!(
+            r#"{{ "hostfs": {{ "mappings": [
+            {{ "type": "redirect-ro", "dest": "/bla", "source": "../{sibling_name}" }},
+            {{ "type": "redirect-rw", "dest": "/abs", "source": "/elsewhere" }}
+        ] }} }}"#
+        ),
     )
     .unwrap();
     let spec = Spec::load(Some(&dir));
@@ -406,7 +414,7 @@ fn redirect_sources_are_resolved_relative_to_the_spec_dir() {
             // directory (canonicalized, like the dir itself).
             assert_eq!(
                 Path::new(source),
-                std::fs::canonicalize(&dir).unwrap().join("otherdir")
+                std::fs::canonicalize(&sibling).unwrap()
             );
         }
         other => panic!("expected a redirect-ro mapping, got {other:?}"),
@@ -417,6 +425,7 @@ fn redirect_sources_are_resolved_relative_to_the_spec_dir() {
         other => panic!("expected a redirect-rw mapping, got {other:?}"),
     }
     std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&sibling).ok();
 }
 
 #[test]

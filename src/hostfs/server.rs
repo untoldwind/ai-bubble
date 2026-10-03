@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use fuse3::raw::Session;
 use fuse3::MountOptions;
 
-use super::{fuselog, HostFs, HOST_MOUNT_POINT, HOST_PID, patterns::Patterns};
+use super::{fuselog, HostFs, HOST_MOUNT_POINT, HOST_PID, fuse_ops::cstring_of, patterns::Patterns};
 use crate::sandbox::{die, die_with_error};
 
 /// The signals that must never kill the FUSE server child: the ones that
@@ -111,7 +111,7 @@ pub fn start_host_fs(patterns: &Patterns) {
             disarm_signals();
         }
         // The FUSE server never signs certificates; drop the waf CA private
-        // key fork-copied into this address space (AUDIT.md L8).
+        // key fork-copied into this address space (AUDIT.md, TLS MITM key hygiene).
         crate::waf::host::wipe_after_fork();
         serve(patterns.clone(), mountpoint, write_fd);
         // serve never returns
@@ -236,14 +236,49 @@ async fn mount_with_fallback(
         .await
     {
         Ok(handle) => Ok(handle),
-        Err(unprivileged_err) => Session::new(options())
-            .mount(HostFs::collect(patterns), mountpoint)
-            .await
-            .map_err(|privileged_err| {
-                std::io::Error::other(format!(
-                    "unprivileged: {unprivileged_err}; privileged: {privileged_err}"
-                ))
-            }),
+        Err(unprivileged_err) => {
+            let handle = Session::new(options())
+                .mount(HostFs::collect(patterns), mountpoint)
+                .await
+                .map_err(|privileged_err| {
+                    std::io::Error::other(format!(
+                        "unprivileged: {unprivileged_err}; privileged: {privileged_err}"
+                    ))
+                })?;
+            // AUDIT.md L7: the unprivileged fusermount3 route forces
+            // `nosuid,nodev` itself; the direct root-only mount above
+            // does not — the mount flags must be brought to parity, or a
+            // mirrored device node would be opened by the kernel's device
+            // layer (I/O bypassing the mirror) and setuid execution from
+            // the mirror would be defused only by the user namespace. A
+            // plain remount of the same mountpoint flips the per-mount
+            // flags (root-only, which is exactly the fallback's case).
+            // `default_permissions` deliberately stays off (it would break
+            // the uid-translation model).
+            let flags = libc::MS_REMOUNT
+                | libc::MS_NODEV
+                | libc::MS_NOSUID
+                | if read_only { libc::MS_RDONLY } else { 0 };
+            let path = cstring_of(mountpoint)?;
+            if unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    flags,
+                    std::ptr::null(),
+                )
+            } != 0
+            {
+                let err = std::io::Error::last_os_error();
+                drop(handle);
+                return Err(std::io::Error::other(format!(
+                    "Can't apply nosuid/nodev to the privileged FUSE mount at {}: {err}",
+                    mountpoint.display()
+                )));
+            }
+            Ok(handle)
+        },
     }
 }
 

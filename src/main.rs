@@ -74,8 +74,15 @@ fn main() {
         Some(Command::Run {
             die_with_parent,
             new_session,
+            require_spec,
             command,
-        }) => cli::run(cli.spec.as_deref(), die_with_parent, new_session, command),
+        }) => cli::run(
+            cli.spec.as_deref(),
+            die_with_parent,
+            new_session,
+            require_spec,
+            command,
+        ),
 
         Some(Command::Ls { path }) => cli::ls(cli.spec.as_deref(), &path),
 

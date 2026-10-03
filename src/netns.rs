@@ -24,9 +24,12 @@
 //! namespaces via the filesystem — but the socket directory is *not*
 //! mounted into the sandbox (an earlier `/net` bind mount was never
 //! implemented; see the note on `create_socket_dir`). By default the
-//! command cannot reach the connector socket at all; should a `/net`
-//! mount ever be added, it must come with a `SO_PEERCRED` check that the
-//! peer is P (AUDIT.md L11).
+//! command cannot reach the connector socket at all — but only because
+//! the mount table never exposes it: a spec bind-mounting the host `/tmp`
+//! would give the command direct socket access (AUDIT.md L6). Every
+//! protocol command is re-authorized host-side, so nothing new becomes
+//! reachable; if the mount is ever added, it must come with a
+//! `SO_PEERCRED` check that the peer is P.
 //!
 //! Tokio runtimes are created strictly *after* every fork, in the process
 //! that actually runs async code — a forked child must never share a
@@ -49,7 +52,10 @@ use crate::waf;
 /// Temporary host directory holding the proxy socket. It is *not* mounted
 /// into the sandbox: a `/net` bind mount was considered but never
 /// implemented (stale comments used to claim otherwise), so the command
-/// cannot reach the connector at all — the safer state (AUDIT.md L11).
+/// cannot reach the connector at all — a guarantee that rests on the
+/// mount table, not on enforcement (AUDIT.md L6: a host `/tmp` bind
+/// mount would expose the socket directory to the command; every protocol
+/// command is re-authorized host-side, so nothing new becomes reachable).
 /// If the mount is ever added, verify with `SO_PEERCRED` that the peer is
 /// P before serving it.
 ///
@@ -90,7 +96,7 @@ pub fn run(
             drop(listener);
             // P only relays `tls-cert` requests to the connector; the CA
             // private key fork-copied into its address space is dropped
-            // here (AUDIT.md L8).
+            // here (AUDIT.md, TLS MITM key hygiene).
             waf::host::wipe_after_fork();
             isolated_parent(
                 &netdir,

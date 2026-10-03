@@ -13,6 +13,10 @@ Key differences:
   `spec.json`, the env file, the project cache) is **always hidden** from the
   sandboxed command: ai-bubble appends an internal `hide` mapping for it, so
   even a mapping that mirrors the directory containing it cannot expose it.
+  This is path-based policy: a host **bind mount** aliasing the project tree
+  at a second path, or a **case-folding** filesystem (ext4 `casefold`) under
+  a broad rw mapping, can bypass it (AUDIT.md L12) — keep the spec directory
+  on a single, case-sensitive mount.
 * Network access can be restricted through an embedded HTTP proxy, or —
   as an alternative — through a DNS/HTTP/HTTPS "waf" server triple
   inside the sandbox (not exposing the host network).
@@ -63,7 +67,9 @@ Notes:
   (created if missing, extended otherwise).
 * A missing `.ai-bubble/spec.json` is fine: an **empty spec** is used (empty
   tmpfs root, no mounts, host network). An *explicit* `--spec-dir` that
-  cannot be read is a hard error.
+  cannot be read is a hard error. When a policy is mandatory, pass
+  `run --require-spec`: a missing default spec file then aborts the run
+  instead of degrading to an empty spec with host networking.
 * `run` sets `PR_SET_PDEATHSIG` so the sandboxed command is killed with
   SIGKILL when ai-bubble — or ai-bubble's parent — dies (like bwrap's
   `--die-with-parent`, which is the default here); `run
@@ -81,6 +87,13 @@ Notes:
   device. With pipes on stdin or stdout the plain new-session behaviour
   is kept (the command simply has no controlling tty; `/dev/tty` fails
   with `ENXIO`, as it does in bwrap's `--new-session`).
+  Note (AUDIT.md L3): like `ssh` to an untrusted host or `script(1)`, the
+  relay copies the command's output **unfiltered** to the user's terminal,
+  so terminal escape sequences pass through — OSC 52 clipboard writes,
+  title/palette changes, and any terminal-emulator escape-parsing issues.
+  This applies to pty mode *and* to plain new-session runs with a tty on
+  stdout; treat untrusted output the way you would treat untrusted `ssh`
+  output.
   Only if you explicitly need the *shared*-terminal behaviour — the
   command seeing the very same pts device — use `run --no-new-session`,
   which bind-mounts the host terminal into the sandbox; only use it for
@@ -231,6 +244,18 @@ All fields are optional. A complete example:
   spawns, and that it sees syscall numbers only — not arguments, paths
   or network addresses (those are the domain of the `hostfs` mappings
   and the `net` section).
+
+- `rlimits` — optional **resource limits** applied to the sandboxed
+  process (and inherited by everything it forks) right before exec:
+  `"rlimits": { "nproc": 1024, "nofile": 4096, "as": 536870912 }`. Each
+  field is optional; an absent field (or section) means the limit is not
+  set at all. `nproc` is the fork-bomb brake (there is no cgroup
+  limiting; without it a fork bomb consumes the invoking user's global
+  per-uid process budget), `nofile` bounds fd-table kernel memory, and
+  `as` caps the per-process address space. Every limit is applied with
+  soft == hard, so the command cannot raise it back up (AUDIT.md M4).
+  The starter spec written by `ai-bubble init` sets `nproc`/`nofile` and
+  a `size` cap on its `/tmp` tmpfs by way of example.
 
 ### The mapping types
 
@@ -485,7 +510,14 @@ TCP connection to `127.0.0.2` inside the sandbox lands on the proxy —
 no veth pairs, no root, no host `CAP_NET_ADMIN` needed. The connector
 dials real targets from the host side over Unix-domain sockets (which
 cross network namespaces via the filesystem); the socket directory is
-bind-mounted at `/net` inside the sandbox.
+a `mkdtemp`-created 0700 directory on the host and is deliberately
+**not** mounted into the sandbox — by default the command cannot reach
+the connector at all (AUDIT.md L6). That guarantee is conditional on
+the mount table: a spec bind-mounting the host `/tmp` (or wherever the
+directory lives) would expose the raw connector protocol to the
+command. Every protocol command is re-authorized host-side against the
+allow-list, so nothing new becomes reachable — but avoid mapping host
+`/tmp` into the sandbox.
 
 The sandbox is still network-isolated: the namespace has no interfaces
 besides loopback and no routes to the host, so direct connections

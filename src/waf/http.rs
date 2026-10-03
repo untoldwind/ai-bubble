@@ -40,7 +40,7 @@ type BodyT = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 /// The whole-connection timeout of the plain HTTP proxy. This proxy
 /// serves exactly one request per connection (responses carry
 /// `Connection: close`, see `Proxy::handle`), so a hard cap on the
-/// connection's total lifetime is a safe slowloris guard (AUDIT.md M10):
+/// connection's total lifetime is a safe slowloris guard (AUDIT.md, resource limits on the frontends):
 /// a client that connects but never sends a request — or dribbles one —
 /// is cut off here instead of holding a task forever. It also bounds
 /// long-running downloads through this test-only frontend; the real

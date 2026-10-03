@@ -2,6 +2,7 @@
 //! default) with a starter `spec.json` and the matching JSON Schema, so
 //! `ai-bubble run -- /bin/sh` works out of the box.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::{sandbox, spec};
@@ -15,7 +16,11 @@ use crate::{sandbox, spec};
 /// It exposes just enough of the host (the usual `/bin`, `/etc`, `/lib`,
 /// `/lib64`, `/usr` trees, plus a fresh `/dev`, `/tmp` and `/proc`) to let
 /// a shell and common tools run, and passes the host's `PATH`/`HOME`
-/// through — a safe starting point to tighten from. The `$schema`
+/// through — a safe starting point to tighten from. It also leads by
+/// example on resource limits (AUDIT.md M4): `nproc`/`nofile` rlimits and
+/// a `size` cap on the `/tmp` tmpfs, so a fork bomb or a tmpfs-filling
+/// command hits a per-command brake instead of the invoking user's global
+/// budgets (there is no cgroup limiting; see `spec::rlimits`). The `$schema`
 /// reference points at the schema file `init` writes next to it.
 const STARTER_SPEC_TEMPLATE: &str = r#"{
   "$schema": "./ai-bubble.spec.schema.json",
@@ -26,12 +31,13 @@ const STARTER_SPEC_TEMPLATE: &str = r#"{
       { "type": "project-cache", "path": ["${HOME}/.cargo", "${HOME}/.local", "${HOME}/.config/opencode"] },
       { "type": "session-cache", "path": "${HOME}/.cache" },
       { "type": "dev" },
-      { "type": "tmpfs", "path": "/tmp", "perms": "1777" },
+      { "type": "tmpfs", "path": "/tmp", "perms": "1777", "size": 1073741824 },
       { "type": "proc" }
     ]
   },
   "cwd": {{PROJECT_DIR}},
   "net": { "mode": "host" },
+  "rlimits": { "nproc": 1024, "nofile": 4096 },
   "env": {
     "values": { "PATH": "${PATH}", "HOME": "${HOME}", "TERM": "${TERM}" }
   }
@@ -78,6 +84,12 @@ pub fn init(spec_dir: Option<&Path>) {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         sandbox::die(&format!("Can't create {}: {e}", dir.display()));
     }
+    // AUDIT.md L10: the spec directory holds the env file with its
+    // secrets. `create_dir_all` honors the umask (typically 0755), so the
+    // mode is enforced explicitly after creation.
+    if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+        sandbox::die(&format!("Can't set the mode of {}: {e}", dir.display()));
+    }
 
     // The project directory is the current directory: that is what the
     // starter spec maps and uses as `cwd`. Resolve it to an absolute path
@@ -88,6 +100,9 @@ pub fn init(spec_dir: Option<&Path>) {
     let spec_path = dir.join(spec::file::SPEC_FILE);
     if let Err(e) = std::fs::write(&spec_path, starter_spec(&project_dir)) {
         sandbox::die(&format!("Can't write {}: {e}", spec_path.display()));
+    }
+    if let Err(e) = std::fs::set_permissions(&spec_path, std::fs::Permissions::from_mode(0o600)) {
+        sandbox::die(&format!("Can't set the mode of {}: {e}", spec_path.display()));
     }
 
     let schema_path = dir.join(SCHEMA_FILE);
@@ -369,5 +384,33 @@ mod tests {
         ensure_ignored(&dir.0, &dir.0.join(".ai-bubble"));
 
         assert!(!dir.0.join(".gitignore").exists());
+    }
+
+    /// AUDIT.md M4: the starter spec must lead by example on resource
+    /// limits — `rlimits` set (nproc/nofile) and a `size` cap on the
+    /// `/tmp` tmpfs — and of course stay a valid spec.
+    #[test]
+    fn starter_spec_is_valid_and_sets_resource_limits() {
+        let rendered = starter_spec(std::path::Path::new("/home/me/project"));
+        let spec: crate::spec::Spec = serde_json::from_str(&rendered)
+            .expect("the starter spec must parse as a Spec");
+
+        assert_eq!(spec.rlimits.nproc, Some(1024));
+        assert_eq!(spec.rlimits.nofile, Some(4096));
+
+        let tmpfs = spec
+            .hostfs
+            .mappings
+            .iter()
+            .find_map(|m| match m {
+                crate::spec::hostfs::Mapping::Tmpfs { path, size, .. }
+                    if path.0 == ["/tmp".to_string()] =>
+                {
+                    Some(*size)
+                }
+                _ => None,
+            })
+            .expect("the starter spec has a /tmp tmpfs mapping");
+        assert_eq!(tmpfs, Some(1073741824), "the /tmp tmpfs must be size-capped");
     }
 }

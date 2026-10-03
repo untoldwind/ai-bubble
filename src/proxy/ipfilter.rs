@@ -64,6 +64,10 @@ fn blocked_reason_v4(ip: Ipv4Addr) -> Option<&'static str> {
         [169, 254, ..] => "link-local (incl. cloud metadata)",
         [172, b, ..] if b & 0xf0 == 16 => "private",
         [192, 168, ..] => "private",
+        [192, 0, 0, ..] => "IETF protocol assignments",
+        [192, 31, 196, ..] | [192, 52, 193, ..] => "IANA special-purpose",
+        [192, 88, 99, ..] => "6to4 relay anycast (deprecated)",
+        [192, 175, 48, ..] => "AS112 (RFC 7534)",
         [192, 0, 2, ..] | [198, 51, 100, ..] | [203, 0, 113, ..] => "documentation",
         [198, 18, ..] | [198, 19, ..] => "benchmarking",
         [224..=239, ..] => "multicast",
@@ -98,6 +102,11 @@ fn blocked_reason_v6(ip: Ipv6Addr) -> Option<&'static str> {
         [s0, ..] if s0 & 0xfe00 == 0xfc00 => "unique-local",
         [s0, ..] if s0 & 0xffc0 == 0xfe80 => "link-local",
         [s0, ..] if s0 & 0xff00 == 0xff00 => "multicast",
+        // Teredo tunneling (deprecated, AUDIT.md L5).
+        [0x2001, 0x0000, ..] => "teredo",
+        // NAT64 local-use prefix (RFC 8215) — not the well-known prefix
+        // handled by the embedded-v4 check above.
+        [0x0064, 0xff9b, 1, ..] => "nat64 local-use",
         [0x2001, 0x0db8, ..] => "documentation",
         _ => return None,
     };
@@ -143,6 +152,14 @@ pub fn filter_addrs(
     Ok(kept)
 }
 
+/// How long a single dial attempt (and, in the waf host, the upstream TLS
+/// handshake) may take before it is abandoned (AUDIT.md L8): without a
+/// timeout, a firewalled-but-allowed IP holds a connector slot for the
+/// kernel's full SYN-retry duration (~2 min), so a churning command keeps
+/// the connector's limited slots (and host fds) saturated — a self-DoS of
+/// the sandbox's own networking.
+pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Resolve `host:port`, drop every address in a blocked range (unless
 /// `allow_private`), and connect to the first remaining address — the IP,
 /// not the name, so nothing can re-resolve between the check and the
@@ -163,9 +180,16 @@ pub async fn connect_checked(target: &str, allow_private: bool) -> io::Result<Tc
     let allowed = filter_addrs(&host, &addrs, allow_private)?;
     let mut last = None;
     for addr in allowed {
-        match TcpStream::connect(addr).await {
-            Ok(tcp) => return Ok(tcp),
-            Err(e) => last = Some(e),
+        // AUDIT.md L8: bound each attempt; see `DIAL_TIMEOUT`.
+        match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(tcp)) => return Ok(tcp),
+            Ok(Err(e)) => last = Some(e),
+            Err(_) => {
+                last = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {addr} timed out"),
+                ));
+            }
         }
     }
     Err(last.unwrap_or_else(|| io::Error::other("no address to connect to")))
@@ -202,6 +226,12 @@ mod tests {
         assert_eq!(blocked("224.0.0.1"), "multicast");
         assert_eq!(blocked("255.255.255.255"), "reserved");
         assert_eq!(blocked("192.0.2.1"), "documentation");
+        // AUDIT.md L5: the remaining IANA special-purpose ranges.
+        assert_eq!(blocked("192.0.0.1"), "IETF protocol assignments");
+        assert_eq!(blocked("192.31.196.1"), "IANA special-purpose");
+        assert_eq!(blocked("192.52.193.1"), "IANA special-purpose");
+        assert_eq!(blocked("192.88.99.1"), "6to4 relay anycast (deprecated)");
+        assert_eq!(blocked("192.175.48.1"), "AS112 (RFC 7534)");
         // Boundary cases that must NOT be blocked.
         not_blocked("8.8.8.8");
         not_blocked("172.32.0.1"); // just outside 172.16/12
@@ -223,6 +253,9 @@ mod tests {
         assert_eq!(blocked("::ffff:169.254.169.254"), "link-local (incl. cloud metadata)");
         assert_eq!(blocked("64:ff9b::a00:1"), "private");
         assert_eq!(blocked("2002:a00:1::"), "private");
+        // AUDIT.md L5: Teredo and the NAT64 local-use prefix.
+        assert_eq!(blocked("2001:0::1"), "teredo");
+        assert_eq!(blocked("64:ff9b:1::1"), "nat64 local-use");
         // Public addresses pass.
         not_blocked("2606:4700::1111");
         not_blocked("::ffff:8.8.8.8");

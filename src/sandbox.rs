@@ -89,7 +89,7 @@ fn current_rlimits() -> Rlimits {
 /// error: a limit the operator asked for but that cannot be applied
 /// must not silently go missing.
 ///
-/// These limits protect the *host* (AUDIT.md M10, resource isolation):
+/// These limits protect the *host* (AUDIT.md M4, resource isolation):
 /// they bound the command's process count (`RLIMIT_NPROC`, the fork-bomb
 /// brake), its file-descriptor table (`RLIMIT_NOFILE`) and its address
 /// space (`RLIMIT_AS`, the memory brake). They are applied only to the
@@ -294,6 +294,59 @@ pub(crate) fn handle_die_with_parent(enabled: bool) {
         if enabled && libc::getppid() == 1 {
             die("Parent died before PR_SET_PDEATHSIG was armed");
         }
+        // AUDIT.md L1: in `pidns_and_exec`'s forked child the check above
+        // is ineffective — the child is the first process of its new PID
+        // namespace, so getppid() returns 0 (its parent lives outside the
+        // namespace), never 1. Detect the same fork→prctl race there by
+        // reading the *host-namespace* parent from /proc: the child runs
+        // this before `mount_and_exec` unshares the mount namespace and
+        // mounts a sandbox /proc, so /proc/self/stat still shows the host
+        // view and field 4 (PPid) is the real parent's host pid. A PPid of
+        // 1 means the launcher was re-parented to init, i.e. it died in
+        // the race window. If /proc is not readable (or the field cannot
+        // be parsed) the check is skipped — the PDEATHSIG arming above
+        // still covers the non-race case, and the residual (SIGKILL to the
+        // launcher inside the window leaves the fully confined command
+        // unsupervised) is accepted and documented in AUDIT.md L1.
+        if enabled && libc::getppid() == 0 && host_ppid_is_init() {
+            die("Parent died before PR_SET_PDEATHSIG was armed");
+        }
+    }
+}
+
+/// Whether the host-namespace PPid of this process is 1 (`/proc/self/stat`,
+/// field 4). `false` when the field cannot be determined.
+fn host_ppid_is_init() -> bool {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return false;
+    };
+    ppid_from_stat(&stat) == Some("1")
+}
+
+/// The PPid (field 4) of a `/proc/<pid>/stat` line. `None` when the line
+/// cannot be parsed.
+fn ppid_from_stat(stat: &str) -> Option<&str> {
+    // Field 2 (comm) may contain spaces and parentheses; everything after
+    // the last ')' is field 3 (state) onward.
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next();
+    fields.next()
+}
+
+#[cfg(test)]
+mod ppid_tests {
+    use super::ppid_from_stat;
+
+    #[test]
+    fn ppid_is_parsed_after_the_parenthesized_comm() {
+        // A comm containing spaces and closing parens must not break the
+        // field offset.
+        let stat = "1234 (weird (comm)) S 1 1234 0 0 -1 4194560 ...";
+        assert_eq!(ppid_from_stat(stat), Some("1"));
+        assert_eq!(ppid_from_stat("99 (bash) R 4711 99 0"), Some("4711"));
+        assert_eq!(ppid_from_stat("garbage"), None);
+        assert_eq!(ppid_from_stat("99 (bash) R"), None);
     }
 }
 
@@ -1149,7 +1202,7 @@ pub(crate) unsafe fn mount_and_exec(
         // Resource limits (the spec's `rlimits` section): applied only
         // to this sandboxed process, after all forks, so the supervisor
         // is never restricted by them (see `apply_rlimits` and
-        // AUDIT.md M10). Absent fields are left untouched.
+        // AUDIT.md M4). Absent fields are left untouched.
         apply_rlimits(&current_rlimits());
 
         // All privileged work is done; run the command with as little

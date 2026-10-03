@@ -154,9 +154,13 @@ Details that are easy to get wrong:
   for the sandbox propagates back to the host. In the net path `S` inherits
   `P`'s network namespace by construction (same user namespace, forked
   child), so the COMMAND shares the netns with the frontends on 127.0.0.2.
-* **cgroup controllers.** None are created and no limits are applied; the
-  cgroup *namespace* is unshared only so the command cannot see the host's
-  cgroup hierarchy. There is no cgroup-based resource limiting.
+* **cgroup controllers.** None are created; the cgroup *namespace* is
+  unshared only so the command cannot see the host's cgroup hierarchy.
+  There is no cgroup-based resource limiting — the resource brakes are
+  the spec's `rlimits` (`nproc`, `nofile`, `as`, applied right before
+  exec; AUDIT.md M4) and, for the network frontends, per-listener
+  connection caps and timeouts. The starter spec written by `init` leads
+  by example (`nproc` 1024, `nofile` 4096, a size-capped `/tmp` tmpfs).
 * **userns verification.** After every `unshare(CLONE_NEWUSER)` the code
   compares `/proc/self/ns/user` before and after; a silently stripped
   `CLONE_NEWUSER` (some seccomp filters/LSMs do this) is reported as a
@@ -201,7 +205,13 @@ Key points:
   process in the chain sets it for itself: A (bound to ai-bubble's caller),
   P (bound to A), S (bound to P), COMMAND (set in the PID-1 child of S
   before exec). With `--die-with-parent`, the death of ai-bubble's caller
-  ripples down and kills the entire tree.
+  ripples down and kills the entire tree. Inside the PID-1 child the
+  classic fork→prctl race cannot be caught with `getppid() == 1` (the
+  parent lives outside the PID namespace, so it reads 0); the child
+  instead reads the host-namespace PPid from the still-host-mounted
+  `/proc/self/stat` (AUDIT.md L1). If `/proc` is unreadable the check is
+  skipped — the residual (a SIGKILL landing exactly in the fork→prctl
+  window leaves the fully confined command unsupervised) is accepted.
 
 ---
 

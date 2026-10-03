@@ -54,8 +54,56 @@ pub fn ls(spec_dir: Option<&Path>, path: &Path) {
         let full = target.join(entry.file_name());
         println!(
             "  {} ({})",
-            entry.file_name().to_string_lossy(),
+            quote_name(&entry.file_name()),
             label(patterns.permission_of(&full))
         );
+    }
+}
+
+/// Render a host filename for the operator's terminal (AUDIT.md L11):
+/// hostile filenames can otherwise emit terminal escape sequences (OSC 52
+/// clipboard writes, title changes, terminal-emulator CVEs) into the tty.
+/// Names are printed verbatim while they are plain; anything containing
+/// quotes, backslashes or control characters is single-quoted with
+/// `\xNN` escapes for control bytes — the same idea as modern coreutils
+/// `ls` quoting.
+fn quote_name(name: &std::ffi::OsStr) -> String {
+    let lossy = name.to_string_lossy();
+    let needs_quoting = lossy
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\'' | '"' | '\\'));
+    if !needs_quoting {
+        return lossy.into_owned();
+    }
+    let mut out = String::with_capacity(lossy.len() + 2);
+    out.push('\'');
+    for c in lossy.chars() {
+        match c {
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_name;
+
+    #[test]
+    fn filenames_with_control_characters_are_escaped() {
+        // Plain names pass through verbatim.
+        assert_eq!(quote_name(std::ffi::OsStr::new("plain.txt")), "plain.txt");
+        // Control bytes (terminal escape injection, AUDIT.md L11) are
+        // quoted and hex-escaped.
+        assert_eq!(quote_name(std::ffi::OsStr::new("\x1b]0;pwned\x07")), "'\\x1b]0;pwned\\x07'");
+        assert_eq!(quote_name(std::ffi::OsStr::new("a\nb")), "'a\\x0ab'");
+        assert_eq!(quote_name(std::ffi::OsStr::new("del\x7fx")), "'del\\x7fx'");
+        // Quotes and backslashes are quoted/escaped.
+        assert_eq!(quote_name(std::ffi::OsStr::new("it's")), "'it\\'s'");
+        assert_eq!(quote_name(std::ffi::OsStr::new("back\\slash")), "'back\\\\slash'");
     }
 }

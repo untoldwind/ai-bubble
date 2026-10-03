@@ -345,6 +345,11 @@ pub(crate) fn stat_entry(parent: &AnchoredParent) -> io::Result<libc::stat> {
 
 /// `readlinkat` on an already-pinned parent — the target of the symlink
 /// standing at `parent`'s final component.
+///
+/// Currently unused: `link` of a symlink is denied outright (AUDIT.md
+/// M5), so no operation needs to read a pinned symlink's target any more.
+/// Kept as the pinned-parent counterpart of [`read_link`] for future ops.
+#[allow(dead_code)]
 pub(crate) fn read_link_at(parent: &AnchoredParent) -> io::Result<std::ffi::OsString> {
     let mut size = 4096usize;
     loop {

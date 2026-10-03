@@ -618,11 +618,14 @@ fn intermediate_symlinks_are_never_followed_by_host_access() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
-/// A symlink standing at a *final* component is linked as a link (never
-/// followed to its target), and the new name cannot be used to reach the
-/// target either.
+/// Linking a host symlink is denied outright (AUDIT.md M5): the `symlink`
+/// op is unconditionally EACCES, and `link` used to re-create the symlink
+/// on the host with the server's credentials (`symlinkat`) — a real
+/// symlink creation at an arbitrary writable mapped location, defeating
+/// the "the sandbox can never create symlinks" invariant. Hard links to
+/// regular files are unaffected (covered by the other link tests).
 #[test]
-fn hard_linking_a_symlink_links_the_link_not_the_target() {
+fn link_of_a_symlink_is_denied() {
     let (base, outside_file) = escape_fixture("link");
     let f = fs(&[(base.to_str().unwrap(), Permission::Rw)]);
     let base_ino = f
@@ -639,27 +642,22 @@ fn hard_linking_a_symlink_links_the_link_not_the_target() {
             .attr
             .ino
     });
-    block(async {
+    let res = block(async {
         f.link(Request::default(), evil_ino, base_ino, OsStr::new("copy"))
             .await
-            .expect("link of the symlink succeeds");
     });
+    let err = res.expect_err("link of a symlink must be denied");
+    assert_eq!(
+        err,
+        <fuse3::Errno>::from(libc::EACCES),
+        "link of a symlink must fail closed with EACCES"
+    );
 
-    // The new name is a symlink (its target was not hard-linked through).
-    let attr = block(async {
-        f.lookup(Request::default(), base_ino, OsStr::new("copy"))
-            .await
-            .expect("lookup copy")
-            .attr
-    });
-    assert_eq!(attr.kind, FileType::Symlink);
-    // Opening it fails like any mirror symlink: the target stays unreachable.
-    let copy_ino = attr.ino;
-    let res = block(async {
-        f.open(Request::default(), copy_ino, libc::O_RDONLY as u32)
-            .await
-    });
-    assert!(res.is_err());
+    // Nothing was created, and the symlink's target is untouched.
+    assert!(
+        std::fs::symlink_metadata(base.join("copy")).is_err(),
+        "no `copy` entry may be created"
+    );
     assert_eq!(std::fs::read(&outside_file).unwrap(), b"HOST-SECRET");
 
     std::fs::remove_dir_all(&base).unwrap();

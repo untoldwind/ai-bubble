@@ -452,7 +452,16 @@ impl Filesystem for HostFs {
         let writable = self.patterns.writable(&mirrored);
         let fh = match self.insert_handle(file, mirrored, append, writable) {
             Ok(fh) => fh,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // AUDIT.md L13: the speculative `open_handle` count above
+                // must be released when the handle could not be inserted,
+                // or the nodeid leaks a permanent zombie entry after
+                // `forget`.
+                self.inodes
+                    .write().unwrap_or_else(|e| e.into_inner())
+                    .close_handle(inode);
+                return Err(e.into());
+            }
         };
         Ok(ReplyOpen { fh, flags: 0 })
     }
@@ -1442,11 +1451,14 @@ impl Filesystem for HostFs {
     /// (the source nodeid keeps its mapping; renaming one name must not
     /// affect the other's).
     ///
-    /// The source is **never followed**: a host symlink at the source name is
-    /// linked as the link itself (re-created with the same target — Linux
-    /// `linkat` cannot no-follow the source), because its target may live
-    /// outside every mapping and following it would be a variant of the C1
-    /// escape the anchored resolution closes.
+    /// The source is **never followed**, and a host symlink at the source
+    /// name is not linked at all: Linux `linkat` cannot no-follow the
+    /// source, and re-creating the symlink (as this used to do) would be
+    /// a real symlink creation on the host — the `symlink` op is
+    /// unconditionally denied, so `link` of a symlink is denied too
+    /// (AUDIT.md M5). A symlink's target may also live outside every
+    /// mapping; following it would be a variant of the C1 escape the
+    /// anchored resolution closes.
     ///
     /// **Both** names must be writable. Checking only the new name would
     /// let the sandbox link a *read-only* mapped file (say, from
@@ -1515,28 +1527,34 @@ impl Filesystem for HostFs {
         let old_anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&old))?;
         let new_anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&new))?;
         let source_stat = anchored::stat_entry(&old_anchored)?;
-        let link_result = if Self::stat_is_symlink(&source_stat) {
-            let target = anchored::read_link_at(&old_anchored)?;
-            let ctarget = cstring_of(Path::new(&target))?;
-            // SAFETY: valid descriptors and NUL-terminated names.
-            unsafe {
-                libc::symlinkat(
-                    ctarget.as_ptr(),
-                    new_anchored.dir().as_raw_fd(),
-                    new_anchored.name().as_ptr(),
-                )
-            }
-        } else {
-            // SAFETY: valid descriptors and NUL-terminated names.
-            unsafe {
-                libc::linkat(
-                    old_anchored.dir().as_raw_fd(),
-                    old_anchored.name().as_ptr(),
-                    new_anchored.dir().as_raw_fd(),
-                    new_anchored.name().as_ptr(),
-                    0,
-                )
-            }
+        if Self::stat_is_symlink(&source_stat) {
+            // AUDIT.md M5: linking a host symlink used to re-create it on
+            // the host (`symlinkat` with the server's credentials) — a
+            // real symlink creation at an arbitrary writable mapped
+            // location, defeating the absolute "the sandbox can never
+            // create symlinks" invariant (the `symlink` op is
+            // unconditionally EACCES). The target string is copied
+            // verbatim and symlinks are inert inside the mirror, so this
+            // was low-impact — but the invariant is worth more than the
+            // compatibility. Hard links to regular files are unaffected.
+            log_op_err(
+                "link",
+                &old,
+                Some(&self.patterns.redirect(&old)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            )
+            .await;
+            return Err(libc::EACCES.into());
+        }
+        // SAFETY: valid descriptors and NUL-terminated names.
+        let link_result = unsafe {
+            libc::linkat(
+                old_anchored.dir().as_raw_fd(),
+                old_anchored.name().as_ptr(),
+                new_anchored.dir().as_raw_fd(),
+                new_anchored.name().as_ptr(),
+                0,
+            )
         };
         if link_result != 0 {
             let e = std::io::Error::last_os_error();
@@ -1648,7 +1666,14 @@ impl Filesystem for HostFs {
                 .open_handle(inode);
             let fh = match self.insert_handle(file, mirrored, append, writable) {
             Ok(fh) => fh,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // AUDIT.md L13: release the speculative `open_handle`
+                // count (see the `open` op for the rationale).
+                self.inodes
+                    .write().unwrap_or_else(|e| e.into_inner())
+                    .close_handle(inode);
+                return Err(e.into());
+            }
         };
             let mut attr = attr_from_metadata(&md);
             attr.ino = inode;
@@ -1690,7 +1715,14 @@ impl Filesystem for HostFs {
             .open_handle(inode);
         let fh = match self.insert_handle(file, mirrored, append, writable) {
             Ok(fh) => fh,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // AUDIT.md L13: release the speculative `open_handle`
+                // count (see the `open` op for the rationale).
+                self.inodes
+                    .write().unwrap_or_else(|e| e.into_inner())
+                    .close_handle(inode);
+                return Err(e.into());
+            }
         };
         attr.ino = inode;
         Ok(ReplyCreated {

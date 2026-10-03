@@ -92,6 +92,17 @@ pub enum Command {
         )]
         new_session: bool,
 
+        /// Refuse to run when the default spec directory (`.ai-bubble`,
+        /// unless `--spec-dir` is given) does not contain a spec file.
+        /// Without this, a missing spec silently degrades to an empty
+        /// tmpfs root **with host networking** — restricted only by the
+        /// AF_UNIX gate — which is the right default for a bare
+        /// `ai-bubble run` but dangerous when the operator believed a
+        /// policy was in place (wrong CWD, or an attacker renamed the
+        /// spec directory; AUDIT.md L9).
+        #[arg(long = "require-spec")]
+        require_spec: bool,
+
         /// The command to run inside the sandbox (everything after the
         /// first bare argument or after `--`). Its own flags (e.g.
         /// `ls -l`) pass through verbatim.
@@ -143,6 +154,7 @@ mod tests {
             Some(Command::Run {
                 die_with_parent: true,
                 new_session: true,
+                require_spec: false,
                 command: ["sh", "-c", "echo hi"]
                     .iter()
                     .map(|s| s.to_string())
@@ -208,6 +220,19 @@ mod tests {
         };
         assert!(run(&["ai-bubble", "run", "sh"]));
         assert!(!run(&["ai-bubble", "run", "--no-new-session", "sh"]));
+    }
+
+    #[test]
+    fn require_spec_flag() {
+        let run = |args: &[&str]| match parse(args).command {
+            Some(Command::Run { require_spec, .. }) => require_spec,
+            other => panic!("expected run, got {other:?}"),
+        };
+        // Default: off.
+        assert!(!run(&["ai-bubble", "run", "sh"]));
+        // On when given (AUDIT.md L9): a missing default spec must not
+        // silently degrade to an empty policy with host networking.
+        assert!(run(&["ai-bubble", "run", "--require-spec", "sh"]));
     }
 
     #[test]

@@ -325,16 +325,25 @@ impl Patterns {
         // One walk over the strict ancestors replaces the three separate
         // passes the naive composition needs (`under_empty`, the
         // empty/inject shadowing inside every `permission_of` call, and
-        // the mirrored-ancestor fallback): the *shallowest* ancestor
-        // directly named by an `empty`/`inject` pattern decides both —
-        // deeper such ancestors are shadowed by it (their permission is
-        // `None`), so only its kind matters.
-        let mut shallowest_shadow: Option<&Permission> = None;
+        // the mirrored-ancestor fallback): the *deepest* ancestor
+        // directly named by an `empty`/`inject` pattern decides — the
+        // same break-on-first rule [`Self::permission_of`] applies (the
+        // walk goes outward, deepest ancestor first; AUDIT.md L14).
+        let mut deepest_shadow: Option<&Permission> = None;
         let mut nearest_mirrored: Option<&Permission> = None;
         for ancestor in mirrored.ancestors().skip(1) {
             match self.direct(ancestor) {
                 Some(p @ (Permission::Empty | Permission::Inject { .. })) => {
-                    shallowest_shadow = Some(p);
+                    // AUDIT.md L14: record only the *first* (deepest,
+                    // nearest-to-the-path) shadow — the same rule
+                    // [`Self::permission_of`] applies with its
+                    // break-on-first walk. Overwriting it with the
+                    // outermost ancestors' shadows made this walk
+                    // disagree with `permission_of` on nested shadow
+                    // patterns.
+                    if deepest_shadow.is_none() {
+                        deepest_shadow = Some(p);
+                    }
                 }
                 Some(p) if p.is_mirrored() && nearest_mirrored.is_none() => {
                     nearest_mirrored = Some(p);
@@ -344,13 +353,13 @@ impl Patterns {
         }
         // Everything strictly below an empty path is invisible: the empty
         // path is meant to be covered by a mount inside the sandbox. (The
-        // shallowest shadow being `inject` does *not* hide: an injected
+        // deepest shadow being `inject` does *not* hide: an injected
         // path is a virtual file whose parent directories stay navigable
         // — that is decided by `dir_prefix`/`is_empty_prefix` below.)
-        if matches!(shallowest_shadow, Some(Permission::Empty)) {
+        if matches!(deepest_shadow, Some(Permission::Empty)) {
             return false;
         }
-        let shadowed = shallowest_shadow.is_some();
+        let shadowed = deepest_shadow.is_some();
         if self.hidden(mirrored) {
             return false;
         }
@@ -586,6 +595,47 @@ impl Patterns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AUDIT.md L14: with nested shadow patterns, `exists` used to keep
+    /// overwriting its shadow record while walking the ancestors outward,
+    /// so it ended up with the *shallowest* (outermost) empty/inject
+    /// ancestor — while `permission_of` breaks at the first (deepest,
+    /// nearest-to-the-path) one. The two walks disagreed on which shadow
+    /// governs: with an `empty` deeper than an `inject`, interior
+    /// directory paths reported `exists() == true` (via the dir-prefix
+    /// rule, because the outermost `inject` "won") while
+    /// `permission_of() == None` (the deeper `empty` governs). `exists`
+    /// now applies the same deepest-shadow rule as `permission_of`.
+    #[test]
+    fn exists_and_permission_of_agree_on_nested_shadows() {
+        // An `empty` deeper than an `inject`: the deeper shadow governs,
+        // so `/a/b/c` (a directory prefix of the mirrored `/a/b/c/file`)
+        // is invisible for both walks. The old `exists` let the outermost
+        // `inject` win and answered via the dir-prefix rule.
+        let patterns = Patterns::new(vec![
+            ("/a".to_string(), Permission::Inject {
+                content: "shallow".to_string(),
+            }),
+            ("/a/b".to_string(), Permission::Empty),
+            ("/a/b/c/file".to_string(), Permission::Ro),
+        ]);
+        assert!(!patterns.exists(Path::new("/a/b/c")));
+        assert_eq!(patterns.permission_of(Path::new("/a/b/c")), None);
+
+        // The reverse nesting (an `inject` deeper than an `empty`) keeps
+        // the documented inject-parent navigability: the path itself has
+        // no permission (`None`), but as a directory prefix of mirrored
+        // content below the injected path it still "exists" for traversal.
+        let patterns = Patterns::new(vec![
+            ("/a".to_string(), Permission::Empty),
+            ("/a/b".to_string(), Permission::Inject {
+                content: "deep".to_string(),
+            }),
+            ("/a/b/c/file".to_string(), Permission::Ro),
+        ]);
+        assert_eq!(patterns.permission_of(Path::new("/a/b/c")), None);
+        assert!(patterns.exists(Path::new("/a/b/c")));
+    }
 
     #[test]
     fn permission_of_follows_hostfs_semantics() {

@@ -45,7 +45,7 @@ pub const REDIRECT_ADDR: &str = "127.0.0.2";
 /// How long a sandbox-side client may take to send its one command line.
 /// A command that opens command connections but never sends must not
 /// hold a task (and a supervisor file descriptor) forever — part of
-/// AUDIT.md M10. The timeout guards only the command line; a piped
+/// AUDIT.md, resource limits on the frontends). The timeout guards only the command line; a piped
 /// connection after a successful `connect`/`tls-connect` is never
 /// timed out.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -146,7 +146,7 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String], allow_privat
         // Keygen costs real host CPU (a fresh RSA-grade key pair plus a
         // signature per request). Rate-limit it so the sandbox cannot
         // burn the supervisor's CPU by requesting certificates in a
-        // loop (AUDIT.md M10); excess requests get an ERR, which the
+        // loop (AUDIT.md, resource limits on the frontends); excess requests get an ERR, which the
         // in-sandbox HTTPS server already handles as a failed MITM.
         if !take_keygen_token().await {
             eprintln!("ai-bubble waf: tls-cert for {name} rate-limited");
@@ -218,9 +218,33 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String], allow_privat
             let _ = stream.write_all(b"ERR invalid server name\n").await;
             return;
         };
-        let mut tls = match tls_client_stream(name, tcp).await {
-            Ok(t) => t,
-            Err(e) => {
+        // AUDIT.md L8: bound the upstream handshake, so a black-holed
+        // target cannot hold a connector slot for the kernel's full SYN/
+        // TLS-retry duration (see `ipfilter::DIAL_TIMEOUT`).
+        let mut tls = match tokio::time::timeout(
+            crate::proxy::ipfilter::DIAL_TIMEOUT,
+            tls_client_stream(name, tcp),
+        )
+        .await
+        {
+            Ok(Ok(t)) => t,
+            Err(_) => {
+                let e = io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out");
+                eprintln!("ai-bubble waf: TLS handshake with {target} failed: {e}");
+                crate::audit::record(
+                    "waf",
+                    "tls-connect",
+                    Some(target),
+                    Some("err"),
+                    Some(format!("{e}")),
+                )
+                .await;
+                let _ = stream
+                    .write_all(format!("ERR TLS handshake failed: {e}\n").as_bytes())
+                    .await;
+                return;
+            }
+            Ok(Err(e)) => {
                 eprintln!("ai-bubble waf: TLS handshake with {target} failed: {e}");
                 crate::audit::record(
                     "waf",
@@ -257,7 +281,7 @@ async fn read_line(stream: &mut UnixStream) -> Option<String> {
 /// [`KEYGEN_INTERVAL`] up to [`KEYGEN_BURST`], so a burst of
 /// [`KEYGEN_BURST`] immediate requests is served and the sustained rate
 /// is one keygen every [`KEYGEN_INTERVAL`]. This bounds the host CPU a
-/// malicious sandbox can burn with certificate requests (AUDIT.md M10):
+/// malicious sandbox can burn with certificate requests (AUDIT.md, resource limits on the frontends):
 /// leaf keygen is expensive (fresh key pair + signature per request).
 struct KeygenThrottle {
     tokens: u32,
@@ -310,6 +334,10 @@ async fn take_keygen_token() -> bool {
 }
 
 /// Sanity-check a DNS name before it reaches the allow-list matcher.
+/// Only printable ASCII (`0x21..=0x7e`) is accepted: the name is
+/// interpolated verbatim into a command line on the host socket, and a
+/// control byte would inject a second line into that protocol once more
+/// than one command per connection is ever processed (AUDIT.md L4).
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains([' ', '*', '\0'])
@@ -317,6 +345,7 @@ fn valid_name(name: &str) -> bool {
         && name
             .split('.')
             .all(|label| !label.is_empty() && label.len() <= 63 && name.is_ascii())
+        && name.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// Sanity-check a `host:port` connect target.
@@ -339,7 +368,7 @@ struct Pki {
 
 /// The PKI is kept in an `Option` behind a mutex so that a forked child
 /// that must never sign (P, FS — they only relay or serve the FUSE tree)
-/// can *take* and drop it (AUDIT.md L8): `fork` copies the parent's whole
+/// can *take* and drop it (AUDIT.md, TLS MITM key hygiene): `fork` copies the parent's whole
 /// address space, so a plain `OnceLock` would leave the CA private key in
 /// every child's memory. `wipe_after_fork` runs immediately after the fork
 /// in such children; dropping the key pair releases its key material
@@ -399,7 +428,7 @@ fn pki() -> Arc<Pki> {
     pki
 }
 
-/// Drop the CA private key from this process's memory (AUDIT.md L8). Must
+/// Drop the CA private key from this process's memory (AUDIT.md, TLS MITM key hygiene). Must
 /// be called by every forked child that never signs anything (the network
 /// parent P, the FUSE server FS) directly after the fork: `fork` copied
 /// the parent's address space, key material and all. The original process
@@ -645,7 +674,7 @@ mod tests {
     }
 
     /// The keygen throttle serves its burst allowance, then refuses,
-    /// and refills one token per interval (AUDIT.md M10).
+    /// and refills one token per interval (AUDIT.md, resource limits on the frontends).
     #[test]
     fn keygen_throttle_bounds_burst_and_refills() {
         let mut t = KeygenThrottle::new();
@@ -667,6 +696,14 @@ mod tests {
         assert!(!valid_name("evil .com"));
         assert!(!valid_name("*.example.com"));
         assert!(!valid_name("exa\0mple.com"));
+        // AUDIT.md L4: control characters (and other non-printables) must
+        // be refused — the name is interpolated into a command line on the
+        // host socket, so `0x0a` would inject a second line into the
+        // protocol.
+        assert!(!valid_name("exa\nmple.com"));
+        assert!(!valid_name("exa\rmple.com"));
+        assert!(!valid_name("exa\u{1}mple.com"));
+        assert!(!valid_name("exa\u{7f}mple.com"));
         assert!(valid_target("example.com:443"));
         assert!(valid_target("127.0.0.1:8080"));
         assert!(!valid_target("example.com"));
@@ -677,7 +714,7 @@ mod tests {
 }
 
 /// The CA private key is dropped in forked children that never sign
-/// (AUDIT.md L8): after `wipe_after_fork`, the PKI slot must be empty —
+/// (AUDIT.md, TLS MITM key hygiene): after `wipe_after_fork`, the PKI slot must be empty —
 /// the forked child no longer holds key material — and the *parent's* PKI
 /// must be unaffected. Runs in a forked child so the wipe cannot race the
 /// other tests' use of the process-global PKI.

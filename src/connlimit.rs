@@ -1,4 +1,4 @@
-//! A simple per-listener connection cap (AUDIT.md M10: resource
+//! A simple per-listener connection cap (AUDIT.md (Verified prevented: resource limits on the frontends; the command side is M4): resource
 //! isolation).
 //!
 //! Every network frontend of the sandbox (the in-sandbox proxy and waf

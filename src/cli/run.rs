@@ -7,18 +7,34 @@ use crate::{audit, hostfs, netns, sandbox, spec, waf};
 
 /// Runs the `run` sub-command. `spec_dir` is the `--spec-dir` value (if
 /// given), `die_with_parent` the (negatable) PDEATHSIG flag, `new_session`
-/// the (negatable) new-terminal-session flag, `command` the command to
+/// the (negatable) new-terminal-session flag, `require_spec` the
+/// `--require-spec` strictness flag (see above), `command` the command to
 /// execute inside the sandbox.
 pub fn run(
     spec_dir: Option<&Path>,
     die_with_parent: bool,
     new_session: bool,
+    require_spec: bool,
     mut command: Vec<String>,
 ) {
     if command.is_empty() {
         sandbox::die(
             "No command given; usage: ai-bubble run [--spec-dir DIR] -- COMMAND [args...]",
         );
+    }
+    // AUDIT.md L9: an explicit `--spec-dir` that cannot be read is a hard
+    // error inside `Spec::load` already; `--require-spec` extends the same
+    // strictness to the default spec directory, so a missing `.ai-bubble/
+    // spec.json` (wrong CWD, renamed spec dir) cannot silently degrade the
+    // run to an empty policy with host networking.
+    if require_spec {
+        let dir = spec_dir.unwrap_or_else(|| Path::new(spec::file::DEFAULT_SPEC_DIR));
+        if !dir.join(spec::file::SPEC_FILE).exists() {
+            sandbox::die(&format!(
+                "--require-spec: no spec file at {}",
+                dir.join(spec::file::SPEC_FILE).display()
+            ));
+        }
     }
     let mut spec = spec::Spec::load(spec_dir);
 

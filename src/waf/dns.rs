@@ -27,7 +27,7 @@ use crate::connlimit::ConnLimit;
 /// How long a DNS-over-TCP client may take to send the length prefix and
 /// the query of one message. A client that opens a TCP connection but
 /// never sends must not hold a task forever (the slowloris half of
-/// AUDIT.md M10); UDP is connectionless and needs no such guard.
+/// AUDIT.md, resource limits on the frontends); UDP is connectionless and needs no such guard.
 const TCP_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The redirect address as an [`std::net::Ipv4Addr`] (parsed from

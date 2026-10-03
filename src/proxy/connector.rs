@@ -16,7 +16,7 @@ use crate::connlimit::ConnLimit;
 /// target line. A command that opens many connections to the proxy
 /// socket but never sends must not hold a task (and, worse, a file
 /// descriptor of *this host-side process*) forever — the idle-connection
-/// half of AUDIT.md M10's resource-isolation finding.
+/// half of AUDIT.md M4's resource-isolation concern.
 const TARGET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Accept loop on the host side: every connection becomes a raw pipe to the

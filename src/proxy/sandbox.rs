@@ -17,7 +17,7 @@ use crate::connlimit::ConnLimit;
 /// How long a client may take to deliver a complete HTTP CONNECT request
 /// head. A client that opens a connection but never sends (or trickles
 /// bytes) must not hold a task and its connection forever — that is the
-/// slowloris half of AUDIT.md M10. The timeout guards *only* this
+/// slowloris half of the resource-DoS concern (AUDIT.md L8 and Verified prevented). The timeout guards *only* this
 /// request-head read: bytes after `connect` (part of the piped payload,
 /// see `super::connector` and AUDIT.md Verified-safe #7) are read later,
 /// without a timeout.

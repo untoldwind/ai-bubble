@@ -174,7 +174,7 @@ pub struct Spec {
     /// Resource limits (setrlimit) for the sandboxed command, applied
     /// right before exec (see [`super::rlimits`]). They protect the host
     /// supervisor from a resource-hungry or malicious command (fork
-    /// bombs, fd exhaustion, memory hoarding — AUDIT.md M10); every
+    /// bombs, fd exhaustion, memory hoarding — AUDIT.md M4); every
     /// field is optional and absent fields mean the limit is not set.
     #[serde(default)]
     pub rlimits: super::rlimits::Rlimits,
@@ -246,6 +246,10 @@ impl Spec {
                     // `spec.json`, the env file, and the project cache
                     // must never be visible inside the sandbox, even when
                     // a mapping mirrors the directory containing them.
+                    // (Path-based limitation, AUDIT.md L12: a host
+                    // bind-mount alias of the project tree or a
+                    // case-folding filesystem can bypass this —
+                    // documented in the README.)
                     spec.hide_spec_dir(dir);
                 }
                 // The audit log path is host path-like, too: expand its
@@ -326,8 +330,12 @@ impl Spec {
         for mapping in &self.hostfs.mappings {
             let (kind, source) = match mapping {
                 super::hostfs::Mapping::Bind { src, .. } => ("bind", src.as_str()),
-                super::hostfs::Mapping::RedirectRo { source, .. } => ("redirect-ro", source.as_str()),
-                super::hostfs::Mapping::RedirectRw { source, .. } => ("redirect-rw", source.as_str()),
+                super::hostfs::Mapping::RedirectRo { source, .. } => {
+                    ("redirect-ro", source.as_str())
+                }
+                super::hostfs::Mapping::RedirectRw { source, .. } => {
+                    ("redirect-rw", source.as_str())
+                }
                 _ => continue,
             };
             // Resolve like `absolute_dir` does, so the comparison is
@@ -451,7 +459,10 @@ mod tests {
                 let [pattern] = &glob.0[..] else {
                     panic!("expected a single glob")
                 };
-                assert_eq!(pattern.as_str(), format!("{}/proj\\[2\\]\\*", parent.display()));
+                assert_eq!(
+                    pattern.as_str(),
+                    format!("{}/proj\\[2\\]\\*", parent.display())
+                );
             }
             other => panic!("expected a trailing hide mapping, got {other:?}"),
         }
@@ -462,16 +473,10 @@ mod tests {
         let compiled = crate::spec::internal::SandboxConfig::compile(&spec);
         let spec_path = std::fs::canonicalize(&dir).unwrap();
         let sibling_path = std::fs::canonicalize(&sibling).unwrap();
-        assert_eq!(
-            compiled.patterns.permission_of(&spec_path),
-            Some(&P::Hide)
-        );
+        assert_eq!(compiled.patterns.permission_of(&spec_path), Some(&P::Hide));
         assert!(compiled.patterns.hidden(&spec_path));
         assert!(!compiled.patterns.hidden(&sibling_path));
-        assert_eq!(
-            compiled.patterns.permission_of(&sibling_path),
-            Some(&P::Rw)
-        );
+        assert_eq!(compiled.patterns.permission_of(&sibling_path), Some(&P::Rw));
         std::fs::remove_dir_all(&parent).ok();
     }
 
@@ -490,9 +495,10 @@ mod tests {
         let spec = parse(
             r#"{ "hostfs": { "mappings": [ { "type": "bind", "src": "/repo/.ai-bubble" } ] } }"#,
         );
-        assert!(spec
-            .validate_sources(Path::new("/repo/.ai-bubble"))
-            .is_err());
+        assert!(
+            spec.validate_sources(Path::new("/repo/.ai-bubble"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -515,6 +521,54 @@ mod tests {
             .validate_sources(&spec_dir)
             .expect_err("a redirect onto the spec dir must be rejected");
         assert!(err.contains("redirect-ro"), "{err}");
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// AUDIT.md M6: a bind/redirect source *strictly inside* the spec
+    /// directory (e.g. the spec file itself, or the env file) bypasses the
+    /// pattern list and the auto-hide just like a source covering the spec
+    /// directory — and with `rw: true`/`redirect-rw` it lets the sandboxed
+    /// command rewrite the policy persistently. Such sources are rejected,
+    /// except the project-cache backing store `<spec-dir>/cache/`.
+    #[test]
+    fn a_source_inside_the_spec_dir_is_rejected() {
+        let parent =
+            std::env::temp_dir().join(format!("ai-bubble-spec-src-{}", std::process::id()));
+        let spec_dir = parent.join(".ai-bubble");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+
+        // A redirect onto spec.json — the documented escalation scenario.
+        let mut spec = parse(
+            r#"{ "hostfs": { "mappings": [
+                { "type": "redirect-rw", "dest": "/loot", "source": "spec.json" }
+            ] } }"#,
+        );
+        spec.hostfs.resolve_relative_sources(&spec_dir);
+        let err = spec
+            .validate_sources(&spec_dir)
+            .expect_err("a redirect-rw onto spec.json must be rejected");
+        assert!(err.contains("inside the spec directory"), "{err}");
+
+        // A bind of the spec file is rejected, too.
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+            { "type": "bind", "src": "/repo/.ai-bubble/spec.json" }
+        ] } }"#,
+        );
+        assert!(
+            spec.validate_sources(Path::new("/repo/.ai-bubble"))
+                .is_err()
+        );
+
+        // The project-cache backing store remains deliberately allowed.
+        let spec = parse(
+            r#"{ "hostfs": { "mappings": [
+            { "type": "bind", "src": "/repo/.ai-bubble/cache/data" }
+        ] } }"#,
+        );
+        spec.validate_sources(Path::new("/repo/.ai-bubble"))
+            .expect("the cache backing store may be targeted");
+
         std::fs::remove_dir_all(&parent).ok();
     }
 

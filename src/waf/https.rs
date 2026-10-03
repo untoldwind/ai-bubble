@@ -53,7 +53,7 @@ type BodyT = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 /// How long a client may take to deliver a complete TLS ClientHello (and
 /// then finish the TLS handshake). A client that opens a connection but
 /// never sends — or trickles hello bytes — must not hold a task forever
-/// (the slowloris half of AUDIT.md M10). The timeout guards only these
+/// (the slowloris half of the resource-DoS concern (AUDIT.md, resource limits on the frontends)). The timeout guards only these
 /// initial reads; the tunneled traffic afterwards is never timed out.
 const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -86,7 +86,7 @@ pub async fn serve_https(listener: TcpListener, sock: PathBuf) {
 /// Anything that is not a ClientHello with a SNI (or whose SNI is denied)
 /// is dropped.
 async fn handle_tls(mut tcp: TcpStream, sock: &Path) {
-    // Slowloris guard (AUDIT.md M10): the ClientHello — and the rest of
+    // Slowloris guard (AUDIT.md, resource limits on the frontends): the ClientHello — and the rest of
     // the TLS handshake, which the client could equally stall — must
     // complete within HELLO_TIMEOUT. On timeout the connection is simply
     // dropped.
@@ -415,7 +415,14 @@ fn sni_from_client_hello(hello: &[u8]) -> Option<String> {
                 }
                 if name_type == 0 {
                     let name = &data[p..p + name_len];
-                    return if name.iter().all(|&b| b.is_ascii() && b != 0 && b != b'\\') {
+                    // AUDIT.md L4: only printable ASCII, no backslash.
+                    // Control bytes here would be re-emitted verbatim on
+                    // the host connector's command line (`tls-cert <sni>`)
+                    // — currently neutralized because exactly one line per
+                    // connection is read, but that robustness is
+                    // accidental; refusing non-printable bytes closes the
+                    // latent injection for good.
+                    return if name.iter().all(|&b| b.is_ascii_graphic() && b != b'\\') {
                         Some(String::from_utf8_lossy(name).to_ascii_lowercase())
                     } else {
                         None
@@ -480,6 +487,18 @@ mod tests {
             sni_from_client_hello(&record[9..]).as_deref(),
             Some("example.com")
         );
+
+        // AUDIT.md L4: the SNI must consist of printable ASCII only —
+        // control bytes would be re-emitted verbatim on the host
+        // connector's command line (`tls-cert <sni>`).
+        for evil in ["evil\nexample.com", "evil\r.com", "e\x01vil.com", "evil\x7f.com"] {
+            let record = make_client_hello(Some(evil));
+            assert_eq!(
+                sni_from_client_hello(&record[9..]),
+                None,
+                "SNI {evil:?} must be refused"
+            );
+        }
 
         let record = make_client_hello(None);
         assert_eq!(sni_from_client_hello(&record[9..]), None);

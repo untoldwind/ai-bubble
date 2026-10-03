@@ -2,7 +2,7 @@
 //! the sandboxed command (see [`crate::sandbox`]).
 //!
 //! These limits protect the **host supervisor** from a malicious
-//! command — the resource-isolation finding AUDIT.md M10. The
+//! command — the resource-isolation concern AUDIT.md M4. The
 //! namespace/capability isolation keeps the command from *reaching*
 //! host resources, but it does not bound how much of them the command
 //! may consume: an unbounded fork loop, an unbounded number of open
@@ -25,8 +25,12 @@
 //! * `nproc` — [`RLIMIT_NPROC`]: the maximum number of processes (and
 //!   threads) the command's real uid may run under. This is the fork-
 //!   bomb brake; it bounds the process count below what a fork bomb
-//!   could otherwise reach, complementing the RLIMIT_NPROC the kernel
-//!   already enforces *inside* the user namespace.
+//!   could otherwise reach. (The user namespace does *not* provide this
+//!   brake on its own: since kernel 5.11 the userns has its own ucount,
+//!   but the limit actually enforced is the one inherited from the
+//!   caller — typically the host's large per-uid default — so without
+//!   an explicit `nproc` here a fork bomb consumes the invoking user's
+//!   global process budget. AUDIT.md M4.)
 //! * `nofile` — [`RLIMIT_NOFILE`]: the maximum number of open file
 //!   descriptors. Bounds fd-table (kernel) memory and keeps a leaking
 //!   command from hitting the system-wide fd ceiling that the host's

@@ -46,6 +46,15 @@
 //! `ttyname(0)`-style paths resolve; `/dev/tty` is provided too, because
 //! the command's controlling terminal is now the private pty. The fresh
 //! `devpts` instance on `/dev/pts` (see `mount_and_exec`) is unchanged.
+//!
+//! Accepted residual (AUDIT.md L3): the relay copies the command's output
+//! to the user's terminal **verbatim** — terminal escape sequences pass
+//! through unfiltered, exactly like `ssh` to an untrusted host or
+//! `script(1)`. OSC 52 clipboard writes, title/palette changes and any
+//! terminal-emulator escape-parsing weaknesses are therefore reachable
+//! from untrusted command output (in pty mode and in plain new-session
+//! runs with a tty on stdout alike). The TIOCSTI analysis above is
+//! unaffected; this is output-side only, documented rather than filtered.
 
 use std::process::exit;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -241,6 +250,24 @@ pub(crate) unsafe fn parent_relay(pty: &Pty, child_pid: libc::pid_t) {
         PIPE_W.store(-1, Ordering::Relaxed);
         if have_termios {
             libc::tcsetattr(0, libc::TCSANOW, &saved);
+        }
+        // AUDIT.md L2: the relay's custom handlers are never restored
+        // today, which breaks the epilogue below twice over. On the
+        // `RelayEnd::Signal` path the forwarded signal is dropped by the
+        // kernel when the command is PID 1 of its PID namespace and has no
+        // handler for it (the kernel silently discards non-
+        // SIGKILL/SIGSTOP signals for a pidns init) — so the bare waitpid
+        // loop can wait indefinitely; and because the leftover relay
+        // handler swallows ^C (writing into a closed pipe), the operator
+        // cannot even interrupt the wait. Restore SIG_DFL for all five
+        // signals before the waitpid loop: ^C/^\/termination kill this
+        // process (the script(1) behaviour), SIGWINCH returns to its
+        // default-ignore, and the waitpid is interruptible again.
+        let default_action: libc::sigaction = std::mem::zeroed();
+        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP, libc::SIGWINCH] {
+            if libc::sigaction(sig, &default_action, std::ptr::null_mut()) != 0 {
+                die_with_error("Can't restore the default signal handlers");
+            }
         }
         let _ = libc::close(pipe_r);
         let _ = libc::close(pipe_w);
