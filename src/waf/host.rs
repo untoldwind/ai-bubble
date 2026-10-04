@@ -24,6 +24,7 @@
 //! allowed hosts' resolved IPs. Both are inherent to relaying host-side
 //! network decisions to an untrusted client that needs the answers.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -151,34 +152,46 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String], allow_privat
             let _ = stream.write_all(b"ERR name not on the allow list\n").await;
             return;
         }
-        // Keygen costs real host CPU (a fresh RSA-grade key pair plus a
-        // signature per request). Rate-limit it so the sandbox cannot
-        // burn the supervisor's CPU by requesting certificates in a
-        // loop (AUDIT.md, resource limits on the frontends); excess requests get an ERR, which the
-        // in-sandbox HTTPS server already handles as a failed MITM.
-        if !take_keygen_token().await {
-            eprintln!("ai-bubble waf: tls-cert for {name} rate-limited");
-            crate::audit::record("waf", "tls-cert", Some(name), Some("rate-limited"), None).await;
-            let _ = stream
-                .write_all(b"ERR too many certificate requests\n")
-                .await;
-            return;
-        }
-        let (cert, key) = match sign_leaf(name) {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("ai-bubble waf: can't sign a certificate for {name}: {e}");
-                crate::audit::record(
-                    "waf",
-                    "tls-cert",
-                    Some(name),
-                    Some("err"),
-                    Some(format!("{e}")),
-                )
-                .await;
-                let _ = stream.write_all(b"ERR can't sign certificate\n").await;
+        // A certificate is generated once per domain and then cached (see
+        // [`CERT_CACHE`]), so the normal flow — a browser hitting the same
+        // handful of hosts repeatedly — never touches the keygen throttle.
+        // Only *fresh* keygens (new domains, cache misses) are rate-limited:
+        // keygen costs real host CPU (a fresh key pair plus a signature),
+        // and the rate limit stops the sandbox from burning the
+        // supervisor's CPU by requesting certificates for endlessly
+        // different names in a loop (AUDIT.md, resource limits on the
+        // frontends). Excess requests get an ERR, which the in-sandbox
+        // HTTPS server already handles as a failed MITM.
+        let (cert, key) = if let Some(pair) = cached_cert(name) {
+            pair
+        } else {
+            if !take_keygen_token().await {
+                eprintln!("ai-bubble waf: tls-cert for {name} rate-limited");
+                crate::audit::record("waf", "tls-cert", Some(name), Some("rate-limited"), None)
+                    .await;
+                let _ = stream
+                    .write_all(b"ERR too many certificate requests\n")
+                    .await;
                 return;
             }
+            let pair = match sign_leaf(name) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("ai-bubble waf: can't sign a certificate for {name}: {e}");
+                    crate::audit::record(
+                        "waf",
+                        "tls-cert",
+                        Some(name),
+                        Some("err"),
+                        Some(format!("{e}")),
+                    )
+                    .await;
+                    let _ = stream.write_all(b"ERR can't sign certificate\n").await;
+                    return;
+                }
+            };
+            cached_cert_insert(name, &pair);
+            pair
         };
         crate::audit::record("waf", "tls-cert", Some(name), Some("ok"), None).await;
         // One line: base64(DER cert) SP base64(DER PKCS#8 key).
@@ -336,11 +349,81 @@ impl KeygenThrottle {
 static KEYGEN_THROTTLE: OnceLock<tokio::sync::Mutex<KeygenThrottle>> = OnceLock::new();
 
 /// Take one keygen token (see [`KeygenThrottle`]). `false` when the
-/// request is throttled and should be answered with an ERR.
+/// request is throttled and should be answered with an ERR. Only cache
+/// misses (`tls-cert` for a name not currently cached) reach this.
 async fn take_keygen_token() -> bool {
     let throttle = KEYGEN_THROTTLE.get_or_init(|| tokio::sync::Mutex::new(KeygenThrottle::new()));
     let mut throttle = throttle.lock().await;
     throttle.take()
+}
+
+/// How long a cached leaf certificate (and its key) stays valid. Short
+/// enough that a domain's identity rotates regularly — the real blast
+/// radius is bounded by the per-run CA anyway — but long enough that a
+/// browser session's repeated SNI requests never regenerate a key.
+const CERT_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+/// Cache size bound: at most this many domains, so the memory held for
+/// leaf key material stays bounded even if the sandbox tours the whole
+/// allow list. Eviction drops the entry expiring soonest.
+const CERT_CACHE_MAX: usize = 256;
+
+/// Per-domain cache of signed leaf certificates. Each `tls-cert` request
+/// for an already-cached domain is answered from here without a fresh
+/// keygen, so the [`KeygenThrottle`] only throttles genuinely new
+/// domains — the "rate limit triggers too often" symptom. The leaf key
+/// is reused across handshakes for that one domain instead of being
+/// generated per request.
+struct CertCache {
+    /// name -> (DER cert, DER PKCS#8 key, cache expiry).
+    entries: HashMap<String, (Vec<u8>, Vec<u8>, Instant)>,
+}
+
+impl CertCache {
+    fn get(&self, name: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        let (cert, key, expiry) = self.entries.get(name)?;
+        (Instant::now() < *expiry).then(|| (cert.clone(), key.clone()))
+    }
+
+    fn insert(&mut self, name: String, cert: Vec<u8>, key: Vec<u8>) {
+        let now = Instant::now();
+        self.entries.retain(|_, (_, _, expiry)| *expiry > now);
+        if self.entries.len() >= CERT_CACHE_MAX {
+            // Evict whichever entry expires soonest (LRU-ish: it was the
+            // longest-ago insert that survived every TTL sweep).
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, _, expiry))| *expiry)
+                .map(|(name, _)| name.clone());
+            if let Some(victim) = victim {
+                self.entries.remove(&victim);
+            }
+        }
+        self.entries.insert(name, (cert, key, now + CERT_CACHE_TTL));
+    }
+}
+
+/// The per-domain certificate cache. An `Option` behind a std (non-async)
+/// mutex so [`wipe_after_fork`] can take and drop it synchronously — the
+/// cached leaf keys are private key material, and a forked child that
+/// never signs must not hold them (same reasoning as [`PKI`]). The lock
+/// is held only for map lookups/inserts, never across an `.await`.
+static CERT_CACHE: std::sync::Mutex<Option<CertCache>> = std::sync::Mutex::new(None);
+
+/// Cached leaf pair for `name`, if present and unexpired.
+fn cached_cert(name: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let cache = CERT_CACHE.lock().expect("certificate cache poisoned");
+    cache.as_ref()?.get(name)
+}
+
+/// Store a freshly signed leaf pair for `name` in the cache.
+fn cached_cert_insert(name: &str, (cert, key): &(Vec<u8>, Vec<u8>)) {
+    let mut cache = CERT_CACHE.lock().expect("certificate cache poisoned");
+    cache
+        .get_or_insert_with(|| CertCache {
+            entries: HashMap::new(),
+        })
+        .insert(name.to_string(), cert.clone(), key.clone());
 }
 
 /// Sanity-check a DNS name before it reaches the allow-list matcher.
@@ -449,10 +532,16 @@ fn pki() -> Arc<Pki> {
 /// Drop the CA private key from this process's memory (AUDIT.md, TLS MITM key hygiene). Must
 /// be called by every forked child that never signs anything (the network
 /// parent P, the FUSE server FS) directly after the fork: `fork` copied
-/// the parent's address space, key material and all. The original process
-/// — the only signer — keeps its `Arc` and is unaffected.
+/// the parent's address space, key material and all. Also drops the
+/// cached leaf certificates — their keys are private key material, too.
+/// The original process — the only signer — keeps its `Arc` and is
+/// unaffected.
 pub fn wipe_after_fork() {
     let _ = PKI.lock().expect("PKI poisoned").take();
+    let _ = CERT_CACHE
+        .lock()
+        .expect("certificate cache poisoned")
+        .take();
 }
 
 /// The CA certificate in PEM form, for injection into the sandbox as its
@@ -470,8 +559,10 @@ pub fn ca_certificate_der() -> Vec<u8> {
 
 /// Sign a leaf certificate for `name` (a SAN, and the SNI the
 /// sandbox client used). Returns the DER-encoded certificate and the
-/// DER-encoded PKCS#8 key. The key exists only for this handshake —
-/// freshly generated per request. (Note: the *validity window* is
+/// DER-encoded PKCS#8 key. Only called on cache misses — the result is
+/// cached per domain (see [`CERT_CACHE`]), so repeated SNI requests for
+/// one domain reuse the key instead of generating a fresh one per
+/// request. (Note: the *validity window* is
 /// rcgen's default — not deliberately short; per-run CA generation,
 /// not leaf expiry, is what limits the blast radius.)
 pub fn sign_leaf(name: &str) -> io::Result<(Vec<u8>, Vec<u8>)> {
@@ -704,6 +795,54 @@ mod tests {
         std::thread::sleep(KEYGEN_INTERVAL + Duration::from_millis(30));
         assert!(t.take());
         assert!(!t.take());
+    }
+
+    /// The per-domain certificate cache serves a repeat request without
+    /// a fresh keygen (same DER pair both times), inserts only on
+    /// misses, and evicts the soonest-expiring entry at capacity.
+    #[test]
+    fn cert_cache_serves_repeat_requests() {
+        // Clean slate for this test's entries.
+        let _ = CERT_CACHE.lock().unwrap().take();
+
+        let first = sign_leaf("cached.example.com").unwrap();
+        cached_cert_insert("cached.example.com", &first);
+        // A cache hit returns the identical pair — no second keygen.
+        assert_eq!(cached_cert("cached.example.com").as_ref(), Some(&first));
+
+        // A different name is a miss even though another name is cached.
+        assert_eq!(cached_cert("other.example.com"), None);
+
+        // Expiry: entries past their TTL are not served.
+        let past = CERT_CACHE_TTL + Duration::from_secs(1);
+        {
+            let mut cache = CERT_CACHE.lock().unwrap();
+            let cache = cache.get_or_insert_with(|| CertCache {
+                entries: HashMap::new(),
+            });
+            let (_, _, expiry) = cache.entries.get_mut("cached.example.com").unwrap();
+            *expiry -= past;
+        }
+        assert_eq!(cached_cert("cached.example.com"), None);
+
+        // Size bound: filling the cache evicts the soonest-expiring entry.
+        let _ = CERT_CACHE.lock().unwrap().take();
+        let dummy = first.clone();
+        for i in 0..CERT_CACHE_MAX + 1 {
+            cached_cert_insert(
+                &format!("fill-{i}.example.com"),
+                &(dummy.0.clone(), dummy.1.clone()),
+            );
+        }
+        let cache = CERT_CACHE.lock().unwrap();
+        let cache = cache.as_ref().unwrap();
+        assert_eq!(cache.entries.len(), CERT_CACHE_MAX);
+        assert!(!cache.entries.contains_key("fill-0.example.com"));
+        assert!(
+            cache
+                .entries
+                .contains_key(&format!("fill-{CERT_CACHE_MAX}.example.com"))
+        );
     }
 
     #[test]

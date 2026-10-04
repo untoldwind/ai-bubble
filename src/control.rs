@@ -1739,17 +1739,15 @@ mod tests {
         });
         // A shared allow-list, like netns::run sets up. `NET_ALLOW` is a
         // OnceLock: if another test in this process already set it, the
-        // authoritative list is whatever it holds — reset the contents.
-        let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
-        if crate::control::NET_ALLOW
-            .set(std::sync::Arc::clone(&shared))
-            .is_err()
-        {
-            // Another test in this process already set it; reset the
-            // contents instead.
-            let allow = crate::control::NET_ALLOW.get().unwrap();
-            *allow.write().unwrap() = vec!["example.com:443".to_string()];
-        }
+        // authoritative list is whatever it holds — reuse *that* Arc
+        // (the server swaps what `NET_ALLOW` holds, so asserting on a
+        // fresh Arc here would race the setter) and reset the contents.
+        let shared = crate::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
+            let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
+            let _ = crate::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
+            shared
+        });
+        *shared.write().unwrap() = vec!["example.com:443".to_string()];
         crate::control::start(&dir.join("spec"));
         assert!(crate::control::running());
 
@@ -1880,14 +1878,14 @@ mod tests {
             session_cache: None,
         });
         FS_AVAILABLE.store(true, Ordering::Relaxed);
-        let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
-        if crate::control::NET_ALLOW
-            .set(std::sync::Arc::clone(&shared))
-            .is_err()
-        {
-            *crate::control::NET_ALLOW.get().unwrap().write().unwrap() =
-                vec!["example.com:443".to_string()];
-        }
+        // `NET_ALLOW` is a OnceLock: reuse the authoritative Arc (the
+        // server swaps what `NET_ALLOW` holds) and reset the contents.
+        let shared = crate::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
+            let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
+            let _ = crate::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
+            shared
+        });
+        *shared.write().unwrap() = vec!["example.com:443".to_string()];
 
         // 1. Unchanged spec: reloads cleanly (no push happens — there
         // is no live FS/P peer, and that must not matter).

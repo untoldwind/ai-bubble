@@ -17,7 +17,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 futures-util = "0.3.34"
-libc = "0.2.189"
+libc = "0.2.190"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Dependency note (AUDIT.md): simple-dns parses fully attacker-controlled
