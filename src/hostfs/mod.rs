@@ -111,7 +111,6 @@ pub(crate) mod fuselog;
 mod inodes;
 pub(crate) mod pattern;
 pub(crate) mod patterns;
-mod perf;
 mod server;
 mod session;
 

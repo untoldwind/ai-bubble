@@ -136,7 +136,6 @@ fn minimal_statfs() -> ReplyStatFs {
 
 impl Filesystem for HostFs {
     async fn init(&self, _req: Request) -> Result<ReplyInit> {
-        perf::fuse_op!("init");
         // Advertise a large max write (the kernel clamps it to its own
         // limit): with a tiny value the kernel splits every write into
         // small FUSE requests, multiplying the per-request overhead.
@@ -145,14 +144,11 @@ impl Filesystem for HostFs {
         })
     }
 
-    async fn destroy(&self, _req: Request) {
-        perf::fuse_op!("destroy");
-    }
+    async fn destroy(&self, _req: Request) {}
 
     /// A forgotten nodeid loses its mapping (the kernel is done with the
     /// dentry); a nodeid with open handles keeps its last path as a zombie.
     async fn forget(&self, _req: Request, inode: Inode, nlookup: u64) {
-        perf::fuse_op!("forget");
         let path = self
             .inodes
             .write()
@@ -166,7 +162,6 @@ impl Filesystem for HostFs {
     }
 
     async fn batch_forget(&self, _req: Request, inodes: &[Inode]) {
-        perf::fuse_op!("batch_forget");
         let mut map = self.inodes.write().unwrap_or_else(|e| e.into_inner());
         for &inode in inodes {
             let path = map.forget(inode);
@@ -179,7 +174,6 @@ impl Filesystem for HostFs {
     }
 
     async fn lookup(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<ReplyEntry> {
-        perf::fuse_op!("lookup");
         // The nodeid resolves to the parent's mirrored path; "/" means the
         // root directory itself.
         let parent_path = match self.resolve(parent) {
@@ -250,7 +244,6 @@ impl Filesystem for HostFs {
         _fh: Option<u64>,
         _flags: u32,
     ) -> Result<ReplyAttr> {
-        perf::fuse_op!("getattr");
         let mirrored = match self.resolve(inode) {
             Ok(p) => p,
             Err(e) => {
@@ -292,7 +285,6 @@ impl Filesystem for HostFs {
     }
 
     async fn readlink(&self, _req: Request, inode: Inode) -> Result<ReplyData> {
-        perf::fuse_op!("readlink");
         let mirrored = self.resolve(inode)?;
         if !self.patterns.load().exists(&mirrored) {
             return Err(libc::ENOENT.into());
@@ -310,7 +302,6 @@ impl Filesystem for HostFs {
     }
 
     async fn open(&self, _req: Request, inode: Inode, flags: u32) -> Result<ReplyOpen> {
-        perf::fuse_op!("open");
         let mirrored = self.resolve(inode)?;
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
@@ -524,7 +515,6 @@ impl Filesystem for HostFs {
         offset: u64,
         size: u32,
     ) -> Result<ReplyData> {
-        perf::fuse_op!("read");
         // Stateful IO first: a real handle can only come from `open`/`create`,
         // which already established that the path is mirrored (exists), not
         // injected and not empty — the per-request spec checks below are
@@ -664,7 +654,6 @@ impl Filesystem for HostFs {
         _write_flags: u32,
         flags: u32,
     ) -> Result<ReplyWrite> {
-        perf::fuse_op!("write");
         // The handle is looked up before the path: a real handle caches the
         // mirrored path from open time, so the stateful fast path never
         // consults the inode map.
@@ -842,7 +831,6 @@ impl Filesystem for HostFs {
         Ok(ReplyWrite { written: n as u32 })
     }
     async fn statfs(&self, _req: Request, inode: Inode) -> Result<ReplyStatFs> {
-        perf::fuse_op!("statfs");
         // Report the real filesystem holding the mirrored path (or "/" for
         // the root), so tools like `df` behave sensibly. The path is opened
         // with `O_NOFOLLOW` and `fstatvfs` runs on the descriptor: symlinks
@@ -908,7 +896,6 @@ impl Filesystem for HostFs {
     }
 
     async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
-        perf::fuse_op!("opendir");
         let mirrored = self.resolve(inode)?;
         if !self.patterns.load().exists(&mirrored)
             || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored)
@@ -930,7 +917,6 @@ impl Filesystem for HostFs {
         offset: i64,
     ) -> Result<ReplyDirectory<impl futures_util::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
-        perf::fuse_op!("readdir");
         let mirrored = self.resolve(parent)?;
         if !self.patterns.load().exists(&mirrored)
             || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored)
@@ -991,7 +977,6 @@ impl Filesystem for HostFs {
             impl futures_util::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a,
         >,
     > {
-        perf::fuse_op!("readdirplus");
         let mirrored = self.resolve(parent)?;
         if !self.patterns.load().exists(&mirrored)
             || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored)
@@ -1043,7 +1028,6 @@ impl Filesystem for HostFs {
     }
 
     async fn access(&self, _req: Request, inode: Inode, mask: u32) -> Result<()> {
-        perf::fuse_op!("access");
         let mirrored = self.resolve(inode)?;
         if !self.patterns.load().exists(&mirrored) {
             return Err(libc::ENOENT.into());
@@ -1138,7 +1122,6 @@ impl Filesystem for HostFs {
         _fh: Option<u64>,
         set_attr: SetAttr,
     ) -> Result<ReplyAttr> {
-        perf::fuse_op!("setattr");
         let mirrored = self.resolve(inode)?;
         // The mirror root is a synthetic inode (see `getattr`): it has no
         // host counterpart of its own, and its parent anchor would be the
@@ -1295,7 +1278,6 @@ impl Filesystem for HostFs {
         mode: u32,
         _umask: u32,
     ) -> Result<ReplyEntry> {
-        perf::fuse_op!("mkdir");
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         if !self.patterns.load().writable(&mirrored) {
@@ -1371,7 +1353,6 @@ impl Filesystem for HostFs {
     }
 
     async fn unlink(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<()> {
-        perf::fuse_op!("unlink");
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         if self.patterns.load().is_empty(&mirrored) {
@@ -1438,7 +1419,6 @@ impl Filesystem for HostFs {
         Ok(())
     }
     async fn rmdir(&self, _req: Request, parent: Inode, name: &OsStr) -> Result<()> {
-        perf::fuse_op!("rmdir");
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         if self.patterns.load().is_empty(&mirrored) {
@@ -1519,7 +1499,6 @@ impl Filesystem for HostFs {
         parent: Inode,
         name: &OsStr,
     ) -> Result<()> {
-        perf::fuse_op!("rename");
         let origin_parent_path = self.resolve(origin_parent)?;
         let new_parent_path = self.resolve(parent)?;
         let old = origin_parent_path.join(origin_name);
@@ -1656,7 +1635,6 @@ impl Filesystem for HostFs {
         name: &OsStr,
         _link: &std::ffi::OsStr,
     ) -> Result<ReplyEntry> {
-        perf::fuse_op!("symlink");
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         log_op_err(
@@ -1702,7 +1680,6 @@ impl Filesystem for HostFs {
         new_parent: Inode,
         new_name: &OsStr,
     ) -> Result<ReplyEntry> {
-        perf::fuse_op!("link");
         let source_path = self.resolve(inode)?;
         let new_parent_path = self.resolve(new_parent)?;
         let old = source_path;
@@ -1815,7 +1792,6 @@ impl Filesystem for HostFs {
         mode: u32,
         flags: u32,
     ) -> Result<ReplyCreated> {
-        perf::fuse_op!("create");
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         let writable = self.patterns.load().writable(&mirrored);
@@ -2016,7 +1992,6 @@ impl Filesystem for HostFs {
         _lock_owner: u64,
         _flush: bool,
     ) -> Result<()> {
-        perf::fuse_op!("release");
         // Drop the cached host file (closing it); the handle bookkeeping
         // is all that remains — IO is stateful but needs no flush.
         self.remove_handle(fh);
@@ -2028,7 +2003,6 @@ impl Filesystem for HostFs {
     }
 
     async fn releasedir(&self, _req: Request, inode: Inode, _fh: u64, _flags: u32) -> Result<()> {
-        perf::fuse_op!("releasedir");
         self.inodes
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -2045,7 +2019,6 @@ impl Filesystem for HostFs {
     /// is nothing on disk to sync, so the op reports `ENOSYS` like the
     /// other unsupported operations instead of pretending success.
     async fn fsync(&self, _req: Request, inode: Inode, fh: u64, datasync: bool) -> Result<()> {
-        perf::fuse_op!("fsync");
         let _ = inode;
         let Some(handle) = (if fh != 0 { self.handle_of(fh) } else { None }) else {
             return Err(libc::ENOSYS.into());
