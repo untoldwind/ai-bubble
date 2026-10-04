@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 /// Read one rlimit as (soft, hard).
 fn get_rlimit(resource: libc::__rlimit_resource_t) -> (u64, u64) {
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
@@ -126,7 +125,10 @@ fn seccomp_blocklist_denies_listed_syscalls() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![syscalls::Sysno::getpid as i64],
                 on_violation: SeccompViolation::Errno,
-                sockets: SocketGate { unix_sockets: true, ..SocketGate::default() },
+                sockets: SocketGate {
+                    unix_sockets: true,
+                    ..SocketGate::default()
+                },
             };
             apply_seccomp(&policy);
             // Raw syscalls: the seccomp ERRNO action makes the raw
@@ -152,7 +154,10 @@ fn seccomp_allowlist_permits_only_listed_syscalls() {
                     syscalls::Sysno::exit_group as i64,
                 ],
                 on_violation: SeccompViolation::Errno,
-                sockets: SocketGate { unix_sockets: true, ..SocketGate::default() },
+                sockets: SocketGate {
+                    unix_sockets: true,
+                    ..SocketGate::default()
+                },
             };
             apply_seccomp(&policy);
             if libc::syscall(libc::SYS_getpid) >= 0 && libc::syscall(libc::SYS_getuid) == -1 {
@@ -174,28 +179,33 @@ fn unix_sockets_are_denied_unless_opted_in() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![],
                 on_violation: SeccompViolation::Errno,
-                sockets: SocketGate { unix_sockets: false, ..SocketGate::default() },
+                sockets: SocketGate {
+                    unix_sockets: false,
+                    ..SocketGate::default()
+                },
             };
             apply_seccomp(&policy);
-            let unix_fd =
-                libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let unix_fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
             let inet_fd = libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
             let mut sv = [0 as libc::c_int; 2];
-            let paired =
-                libc::syscall(libc::SYS_socketpair, libc::AF_UNIX, libc::SOCK_STREAM, 0,
-                              sv.as_mut_ptr());
+            let paired = libc::syscall(
+                libc::SYS_socketpair,
+                libc::AF_UNIX,
+                libc::SOCK_STREAM,
+                0,
+                sv.as_mut_ptr(),
+            );
             let uring = libc::syscall(libc::SYS_io_uring_setup, 4, std::ptr::null::<()>());
-            if unix_fd == -1
-                && inet_fd >= 0
-                && paired == -1
-                && uring == -1
-            {
+            if unix_fd == -1 && inet_fd >= 0 && paired == -1 && uring == -1 {
                 libc::close(inet_fd as libc::c_int);
                 libc::_exit(0);
             }
         })
     };
-    assert_eq!(code, 0, "AF_UNIX must be denied while AF_INET keeps working");
+    assert_eq!(
+        code, 0,
+        "AF_UNIX must be denied while AF_INET keeps working"
+    );
 
     // With the opt-in, AF_UNIX works again.
     let code = unsafe {
@@ -203,7 +213,10 @@ fn unix_sockets_are_denied_unless_opted_in() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![],
                 on_violation: SeccompViolation::Errno,
-                sockets: SocketGate { unix_sockets: true, ..SocketGate::default() },
+                sockets: SocketGate {
+                    unix_sockets: true,
+                    ..SocketGate::default()
+                },
             };
             apply_seccomp(&policy);
             let fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -229,11 +242,13 @@ fn unix_socket_denial_narrows_an_allowlist() {
                     syscalls::Sysno::exit_group as i64,
                 ],
                 on_violation: SeccompViolation::Errno,
-                sockets: SocketGate { unix_sockets: false, ..SocketGate::default() },
+                sockets: SocketGate {
+                    unix_sockets: false,
+                    ..SocketGate::default()
+                },
             };
             apply_seccomp(&policy);
-            let unix_fd =
-                libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let unix_fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
             let inet_fd = libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
             let getuid = libc::syscall(libc::SYS_getuid);
             if unix_fd == -1 && inet_fd >= 0 && getuid == -1 {
@@ -256,27 +271,43 @@ fn unix_socket_denial_survives_garbage_upper_argument_bits() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![],
                 on_violation: SeccompViolation::Errno,
-                sockets: SocketGate { unix_sockets: false, ..SocketGate::default() },
+                sockets: SocketGate {
+                    unix_sockets: false,
+                    ..SocketGate::default()
+                },
             };
             apply_seccomp(&policy);
-            let mangled_unix =
-                libc::syscall(libc::SYS_socket, libc::AF_UNIX as u64 | (1u64 << 32),
-                              libc::SOCK_STREAM, 0);
-            let mangled_pair =
-                libc::syscall(libc::SYS_socketpair, libc::AF_UNIX as u64 | (1u64 << 32),
-                              libc::SOCK_STREAM, 0, std::ptr::null_mut::<libc::c_int>());
+            let mangled_unix = libc::syscall(
+                libc::SYS_socket,
+                libc::AF_UNIX as u64 | (1u64 << 32),
+                libc::SOCK_STREAM,
+                0,
+            );
+            let mangled_pair = libc::syscall(
+                libc::SYS_socketpair,
+                libc::AF_UNIX as u64 | (1u64 << 32),
+                libc::SOCK_STREAM,
+                0,
+                std::ptr::null_mut::<libc::c_int>(),
+            );
             // AF_INET with garbage in the upper bits must still work:
             // the kernel sees plain AF_INET.
-            let mangled_inet =
-                libc::syscall(libc::SYS_socket, libc::AF_INET as u64 | (1u64 << 32),
-                              libc::SOCK_STREAM, 0);
+            let mangled_inet = libc::syscall(
+                libc::SYS_socket,
+                libc::AF_INET as u64 | (1u64 << 32),
+                libc::SOCK_STREAM,
+                0,
+            );
             if mangled_unix == -1 && mangled_pair == -1 && mangled_inet >= 0 {
                 libc::close(mangled_inet as libc::c_int);
                 libc::_exit(0);
             }
         })
     };
-    assert_eq!(code, 0, "AF_UNIX must be denied even with garbage upper arg bits");
+    assert_eq!(
+        code, 0,
+        "AF_UNIX must be denied even with garbage upper arg bits"
+    );
 
     // Same in allowlist mode, where socket(2) is listed and narrowed
     // with a Ne(AF_UNIX) rule: the mangled AF_UNIX call must fall to
@@ -289,18 +320,27 @@ fn unix_socket_denial_survives_garbage_upper_argument_bits() {
                     syscalls::Sysno::exit_group as i64,
                 ],
                 on_violation: SeccompViolation::Errno,
-                sockets: SocketGate { unix_sockets: false, ..SocketGate::default() },
+                sockets: SocketGate {
+                    unix_sockets: false,
+                    ..SocketGate::default()
+                },
             };
             apply_seccomp(&policy);
-            let mangled_unix =
-                libc::syscall(libc::SYS_socket, libc::AF_UNIX as u64 | (1u64 << 32),
-                              libc::SOCK_STREAM, 0);
+            let mangled_unix = libc::syscall(
+                libc::SYS_socket,
+                libc::AF_UNIX as u64 | (1u64 << 32),
+                libc::SOCK_STREAM,
+                0,
+            );
             if mangled_unix == -1 {
                 libc::_exit(0);
             }
         })
     };
-    assert_eq!(code, 0, "allowlist Ne rule must not be fooled by garbage upper arg bits");
+    assert_eq!(
+        code, 0,
+        "allowlist Ne rule must not be fooled by garbage upper arg bits"
+    );
 }
 
 #[test]
@@ -351,7 +391,10 @@ fn dangerous_families_are_denied_unless_opted_in() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![],
                 on_violation: SeccompViolation::Errno,
-                sockets: SocketGate { netlink: true, ..SocketGate::default() },
+                sockets: SocketGate {
+                    netlink: true,
+                    ..SocketGate::default()
+                },
             };
             apply_seccomp(&policy);
             let netlink = libc::syscall(
@@ -393,7 +436,8 @@ fn socket_gate_narrows_an_allowlist_for_every_dangerous_family() {
             let unix_fd = libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_STREAM, 0);
             let netlink = libc::syscall(libc::SYS_socket, libc::AF_NETLINK, libc::SOCK_RAW, 0);
             let vsock = libc::syscall(libc::SYS_socket, libc::AF_VSOCK, libc::SOCK_STREAM, 0);
-            let bluetooth = libc::syscall(libc::SYS_socket, libc::AF_BLUETOOTH, libc::SOCK_STREAM, 0);
+            let bluetooth =
+                libc::syscall(libc::SYS_socket, libc::AF_BLUETOOTH, libc::SOCK_STREAM, 0);
             if inet_fd >= 0 && unix_fd == -1 && netlink == -1 && vsock == -1 && bluetooth == -1 {
                 libc::close(inet_fd as libc::c_int);
                 libc::_exit(0);
@@ -418,7 +462,10 @@ fn seccomp_kill_on_violation_kills_the_process() {
             let policy = SeccompPolicy::Block {
                 syscalls: vec![syscalls::Sysno::getpid as i64],
                 on_violation: SeccompViolation::Kill,
-                sockets: SocketGate { unix_sockets: true, ..SocketGate::default() },
+                sockets: SocketGate {
+                    unix_sockets: true,
+                    ..SocketGate::default()
+                },
             };
             apply_seccomp(&policy);
             let _ = libc::getpid();
@@ -432,4 +479,3 @@ fn seccomp_kill_on_violation_kills_the_process() {
         );
     }
 }
-

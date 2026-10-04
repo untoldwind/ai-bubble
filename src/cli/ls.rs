@@ -99,11 +99,17 @@ mod tests {
         assert_eq!(quote_name(std::ffi::OsStr::new("plain.txt")), "plain.txt");
         // Control bytes (terminal escape injection, AUDIT.md L11) are
         // quoted and hex-escaped.
-        assert_eq!(quote_name(std::ffi::OsStr::new("\x1b]0;pwned\x07")), "'\\x1b]0;pwned\\x07'");
+        assert_eq!(
+            quote_name(std::ffi::OsStr::new("\x1b]0;pwned\x07")),
+            "'\\x1b]0;pwned\\x07'"
+        );
         assert_eq!(quote_name(std::ffi::OsStr::new("a\nb")), "'a\\x0ab'");
         assert_eq!(quote_name(std::ffi::OsStr::new("del\x7fx")), "'del\\x7fx'");
         // Quotes and backslashes are quoted/escaped.
         assert_eq!(quote_name(std::ffi::OsStr::new("it's")), "'it\\'s'");
-        assert_eq!(quote_name(std::ffi::OsStr::new("back\\slash")), "'back\\\\slash'");
+        assert_eq!(
+            quote_name(std::ffi::OsStr::new("back\\slash")),
+            "'back\\\\slash'"
+        );
     }
 }

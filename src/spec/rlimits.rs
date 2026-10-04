@@ -87,7 +87,7 @@ mod tests {
                 as_: Some(536870912),
             }
         );
-        }
+    }
 
     #[test]
     fn rlimits_default_to_nothing() {
@@ -97,7 +97,10 @@ mod tests {
         // Individual fields are optional.
         assert_eq!(
             parse(r#"{ "rlimits": { "nproc": 64 } }"#).rlimits,
-            Rlimits { nproc: Some(64), ..Rlimits::default() }
+            Rlimits {
+                nproc: Some(64),
+                ..Rlimits::default()
+            }
         );
     }
 
@@ -113,6 +116,9 @@ mod tests {
         assert_eq!(compiled.rlimits.nofile, Some(512));
         assert_eq!(compiled.rlimits.nproc, None);
         // An absent section compiles to the (inert) default.
-        assert_eq!(SandboxConfig::compile(&parse("{}")).rlimits, Rlimits::default());
+        assert_eq!(
+            SandboxConfig::compile(&parse("{}")).rlimits,
+            Rlimits::default()
+        );
     }
 }

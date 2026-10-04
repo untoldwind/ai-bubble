@@ -180,7 +180,10 @@ mod tests {
         let spec = parse(r#"{ "net": { "mode": "proxy", "allow": ["example.com"] } }"#);
         assert!(matches!(
             spec.net,
-            NetConfig::Proxy { allow_private: false, .. }
+            NetConfig::Proxy {
+                allow_private: false,
+                ..
+            }
         ));
     }
 
@@ -190,7 +193,10 @@ mod tests {
         // M3); the user must actively opt in.
         for json in ["{}", r#"{ "net": { "mode": "host" } }"#] {
             let spec = parse(json);
-            assert!(!spec.net.unix_sockets(), "spec {json} must default to no AF_UNIX");
+            assert!(
+                !spec.net.unix_sockets(),
+                "spec {json} must default to no AF_UNIX"
+            );
         }
         let spec = parse(r#"{ "net": { "mode": "host", "unix_sockets": true } }"#);
         assert!(spec.net.unix_sockets(), "opt-in must allow AF_UNIX");
@@ -254,7 +260,10 @@ mod tests {
         let spec = parse(r#"{ "net": { "mode": "host", "vsock": true } }"#);
         assert!(spec.net.vsock(), "vsock opt-in must allow AF_VSOCK");
         let spec = parse(r#"{ "net": { "mode": "host", "bluetooth": true } }"#);
-        assert!(spec.net.bluetooth(), "bluetooth opt-in must allow AF_BLUETOOTH");
+        assert!(
+            spec.net.bluetooth(),
+            "bluetooth opt-in must allow AF_BLUETOOTH"
+        );
         // The isolated modes always allow all four (their network
         // namespace already isolates the namespace-scoped families).
         for json in [
@@ -369,7 +378,9 @@ mod tests {
         let compiled = SandboxConfig::compile(&parse(
             r#"{ "net": { "mode": "host", "unix_sockets": true, "netlink": true } }"#,
         ));
-        let policy = compiled.seccomp.expect("partial opt-in must keep the filter");
+        let policy = compiled
+            .seccomp
+            .expect("partial opt-in must keep the filter");
         assert!(policy.sockets().unix_sockets && policy.sockets().netlink);
         assert!(!policy.sockets().vsock && !policy.sockets().bluetooth);
 

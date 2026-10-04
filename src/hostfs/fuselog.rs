@@ -103,7 +103,10 @@ mod tests {
     /// and a terminal cannot be attacked with raw escape bytes.
     #[test]
     fn paths_are_logged_escaped() {
-        assert_eq!(path_string(std::ffi::OsStr::new("plain/file")), "\"plain/file\"");
+        assert_eq!(
+            path_string(std::ffi::OsStr::new("plain/file")),
+            "\"plain/file\""
+        );
         assert_eq!(
             path_string(std::ffi::OsStr::new("a\nFS open ok mirrored=/etc/shadow")),
             "\"a\\nFS open ok mirrored=/etc/shadow\""
@@ -112,7 +115,10 @@ mod tests {
             path_string(std::ffi::OsStr::new("\x1b[31mred\x1b[0m")),
             "\"\\u{1b}[31mred\\u{1b}[0m\""
         );
-        assert_eq!(path_string(std::ffi::OsStr::new("q\"uote\\")), "\"q\\\"uote\\\\\"");
+        assert_eq!(
+            path_string(std::ffi::OsStr::new("q\"uote\\")),
+            "\"q\\\"uote\\\\\""
+        );
         // Non-UTF-8 bytes become replacement characters (lossy), still
         // inside the quotes.
         assert_eq!(
@@ -132,9 +138,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("fuse.log");
-        let c_path =
-            std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes().to_vec()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo failed");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes().to_vec()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) },
+            0,
+            "mkfifo failed"
+        );
         unsafe { std::env::set_var("RS_BUBBLE_FUSE_LOG", &fifo) };
         super::init();
         unsafe { std::env::remove_var("RS_BUBBLE_FUSE_LOG") };

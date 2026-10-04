@@ -5,6 +5,37 @@
 //! request; the sandbox-side HTTP CONNECT proxy answers CONNECT requests
 //! early with 403.
 
+//! The list is runtime-swappable: the launcher and each frontend hold a
+//! cheap-clone [`SharedAllow`] handle to the same instance, and a swap
+//! replaces the whole list (`net-set` semantics — see `PLAN.md`). The
+//! convention mirrors `crate::hostfs::SharedPatterns`: locks are recovered
+//! when poisoned (`unwrap_or_else(|e| e.into_inner())`), never panicked
+//! on, and swaps are full replacements — a reader sees either the old or
+//! the new list, never a mix.
+
+/// The allow-list, shared between the launcher (which keeps the
+/// authoritative copy) and the frontends (connector, sandbox CONNECT
+/// proxy, waf host), so it can be **swapped at runtime**.
+///
+/// Every accepted connection takes a snapshot ([`load`]) and keeps it for
+/// its whole lifetime: a swap affects *new* connections only, never
+/// already-established ones or the raw pipes behind them. This is the
+/// shape `PLAN.md` records ("clone the allow-list per accepted
+/// connection") and the one `crate::control` already codes against.
+pub type SharedAllow = std::sync::Arc<std::sync::RwLock<Vec<String>>>;
+
+/// Wrap the compiled allow-list in a shared handle (see [`SharedAllow`]).
+pub fn shared(allow: Vec<String>) -> SharedAllow {
+    std::sync::Arc::new(std::sync::RwLock::new(allow))
+}
+
+/// A snapshot of the currently active list, taken when a connection is
+/// accepted: the connection then checks against this copy for its whole
+/// lifetime, whatever swaps happen meanwhile.
+pub fn load(allow: &SharedAllow) -> Vec<String> {
+    allow.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Check a `host:port` target against the allow-list. An empty list allows
 /// nothing: every target must be listed explicitly. List entries are `host`
 /// (any port) or `host:port`. An entry host may start with `*.` for a simple
@@ -122,5 +153,25 @@ mod tests {
         assert!(!target_allowed("evil.com:443", &allow));
         // Case-insensitive.
         assert!(target_allowed("API.GitHub.com:443", &allow));
+    }
+
+    /// Swapping the shared list affects new connections only: a snapshot
+    /// taken before the swap keeps checking against the old list.
+    #[test]
+    fn swap_affects_new_connections_only() {
+        let shared = shared(vec!["old.example:443".to_string()]);
+        let established = load(&shared);
+        assert!(target_allowed("old.example:443", &established));
+
+        // The runtime swap (what `control::net_apply` does).
+        *shared.write().unwrap_or_else(|e| e.into_inner()) = vec!["new.example:443".to_string()];
+
+        // The established connection keeps its snapshot.
+        assert!(target_allowed("old.example:443", &established));
+        assert!(!target_allowed("new.example:443", &established));
+        // A new connection sees the new rules.
+        let fresh = load(&shared);
+        assert!(target_allowed("new.example:443", &fresh));
+        assert!(!target_allowed("old.example:443", &fresh));
     }
 }

@@ -193,12 +193,22 @@ impl Spec {
     /// case, while an explicit `--spec-dir` that cannot be read is a hard
     /// error.
     pub fn load(explicit: Option<&Path>) -> Spec {
+        Self::try_load(explicit).unwrap_or_else(|e| crate::sandbox::die(&e))
+    }
+
+    /// The fallible [`Spec::load`]: every hard error (unreadable file,
+    /// invalid JSON, failed source validation) is reported to the caller
+    /// instead of killing the process. Used by `spec-reload` (see
+    /// [`crate::control`]): a broken spec file mid-run must be an error
+    /// reply to the control client, not the end of the launcher — which
+    /// is supervising a live sandbox at that point.
+    pub fn try_load(explicit: Option<&Path>) -> Result<Spec, String> {
         match explicit {
-            Some(dir) => Self::read(&dir.join(SPEC_FILE)),
+            Some(dir) => Self::try_read(&dir.join(SPEC_FILE)),
             None => {
                 let path = Path::new(DEFAULT_SPEC_DIR).join(SPEC_FILE);
                 if path.exists() {
-                    Self::read(&path)
+                    Self::try_read(&path)
                 } else {
                     // Falling back to an empty policy is silent otherwise —
                     // running from the wrong CWD (or after an attacker
@@ -210,17 +220,15 @@ impl Spec {
                          policy (empty tmpfs root, host network, no mappings)",
                         path.display()
                     );
-                    Spec::default()
+                    Ok(Spec::default())
                 }
             }
         }
     }
 
-    fn read(path: &Path) -> Spec {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) => crate::sandbox::die(&format!("Can't read spec file {}: {e}", path.display())),
-        };
+    fn try_read(path: &Path) -> Result<Spec, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("Can't read spec file {}: {e}", path.display()))?;
         match serde_json::from_str::<Spec>(&text) {
             Ok(mut spec) => {
                 // Redirect sources may be relative: they are resolved
@@ -231,16 +239,12 @@ impl Spec {
                     // (see `validate_sources`): reject any that cover the
                     // spec directory — now, after the relative sources
                     // have been resolved to absolute host paths.
-                    if let Err(e) = spec.validate_sources(dir) {
-                        crate::sandbox::die(&e);
-                    }
+                    spec.validate_sources(dir)?;
                     // Same for the env file: it is resolved against the
                     // spec directory and its entries merged into
                     // `env.values` (the values are still unexpanded; see
                     // `SandboxConfig::compile`).
-                    if let Err(e) = spec.env.load_env_file(dir) {
-                        crate::sandbox::die(&e);
-                    }
+                    spec.env.load_env_file(dir)?;
                     // The spec directory itself is always hidden from the
                     // sandboxed command — no matter what the spec maps:
                     // `spec.json`, the env file, and the project cache
@@ -258,12 +262,12 @@ impl Spec {
                 if let Some(log) = &spec.audit.log {
                     match expand_str(log) {
                         Ok(expanded) => spec.audit.log = Some(expanded),
-                        Err(e) => crate::sandbox::die(&format!("Invalid audit log path: {e}")),
+                        Err(e) => return Err(format!("Invalid audit log path: {e}")),
                     }
                 }
-                spec
+                Ok(spec)
             }
-            Err(e) => crate::sandbox::die(&format!("Invalid spec file {}: {e}", path.display())),
+            Err(e) => Err(format!("Invalid spec file {}: {e}", path.display())),
         }
     }
 
@@ -510,10 +514,7 @@ fn validate_expansion(s: &str) -> Result<(), String> {
                          an unset variable must be an error, not silently expand to a default"
                     ));
                 }
-                if name.is_empty()
-                    || !name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 {
                     return Err(format!(
                         "invalid variable name {name:?} in {s:?}: only ASCII letters, digits \
@@ -548,6 +549,39 @@ mod tests {
     /// `${VAR}` expansion happens later, at compile time).
     fn parse(text: &str) -> Spec {
         serde_json::from_str(text).expect("valid spec JSON")
+    }
+    /// `try_load` reports instead of dying: an explicit spec directory
+    /// that cannot be read is an error the caller controls (the run
+    /// path dies on it; `spec-reload` returns it to the client).
+    #[test]
+    fn try_load_reports_an_unreadable_spec() {
+        let dir =
+            std::env::temp_dir().join(format!("ai-bubble-spec-tryload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing file, explicit dir: error.
+        assert!(Spec::try_load(Some(&dir)).is_err());
+        // Invalid JSON, explicit dir: error.
+        std::fs::write(dir.join(SPEC_FILE), "{ not json").unwrap();
+        assert!(Spec::try_load(Some(&dir)).is_err());
+        // A source covering the spec directory: error (validation runs
+        // in the fallible path too).
+        std::fs::write(
+            dir.join(SPEC_FILE),
+            r#"{ "hostfs": { "mappings": [ { "type": "bind", "src": "/" } ] } }"#,
+        )
+        .unwrap();
+        assert!(Spec::try_load(Some(&dir)).is_err());
+        // A valid spec: Ok.
+        std::fs::write(
+            dir.join(SPEC_FILE),
+            r#"{ "hostfs": { "mappings": [ { "type": "ro", "glob": "/etc" } ] } }"#,
+        )
+        .unwrap();
+        assert!(Spec::try_load(Some(&dir)).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -668,8 +702,8 @@ mod tests {
     /// `<spec-dir>/cache/`.
     #[test]
     fn a_source_inside_the_spec_dir_is_restricted() {
-        let parent = std::env::temp_dir()
-            .join(format!("ai-bubble-spec-src-inside-{}", std::process::id()));
+        let parent =
+            std::env::temp_dir().join(format!("ai-bubble-spec-src-inside-{}", std::process::id()));
         let spec_dir = parent.join(".ai-bubble");
         std::fs::create_dir_all(&spec_dir).unwrap();
 
@@ -809,8 +843,11 @@ mod tests {
         // (Live-verified against shellexpand 3.1.2: this used to expand to
         // `x/etcy` with `UNSET` unset.)
         assert!(expand_str("x${UNSET:-/etc}y").is_err());
-        assert!(expand_str("${HOME:-/root}").is_err(), "even a set variable \
-            must not silently switch to the operator's default");
+        assert!(
+            expand_str("${HOME:-/root}").is_err(),
+            "even a set variable \
+            must not silently switch to the operator's default"
+        );
         // Unterminated braces used to pass through verbatim.
         assert!(expand_str("x${BOGUS").is_err());
         // The remaining ambiguous shell forms: PID-style `$$` and non-name

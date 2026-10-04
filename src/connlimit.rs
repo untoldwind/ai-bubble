@@ -64,7 +64,11 @@ impl ConnLimit {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(Guard { limit: self.clone() }),
+                Ok(_) => {
+                    return Some(Guard {
+                        limit: self.clone(),
+                    });
+                }
                 Err(now) => current = now,
             }
         }

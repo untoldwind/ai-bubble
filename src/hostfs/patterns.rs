@@ -118,15 +118,23 @@ impl Patterns {
     /// Compile the pattern → permission list. Invalid patterns are a hard
     /// error: a spec that cannot be compiled must not run at all.
     pub fn new(patterns: Vec<(String, Permission)>) -> Patterns {
+        Patterns::try_new(patterns)
+            .unwrap_or_else(|e| crate::sandbox::die(&format!("Invalid hostfs pattern: {e}")))
+    }
+
+    /// Fallible compile (see [`Patterns::new`]): a runtime policy update
+    /// (`fs-set`) must report a bad glob to its caller instead of killing
+    /// the FUSE server. The spec loader keeps using [`Patterns::new`],
+    /// whose hard error is right for a config file.
+    pub fn try_new(patterns: Vec<(String, Permission)>) -> Result<Patterns, String> {
         let patterns: Vec<(Pattern, Permission)> = patterns
             .into_iter()
             .map(|(pattern, permission)| {
-                let compiled = Pattern::new(&pattern).unwrap_or_else(|e| {
-                    crate::sandbox::die(&format!("Invalid hostfs pattern: {e}"))
-                });
-                (compiled, permission)
+                let compiled =
+                    Pattern::new(&pattern).map_err(|e| format!("invalid hostfs pattern: {e}"))?;
+                Ok((compiled, permission))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         // Partition the list once, at construction, so the per-operation
         // checks (`hidden`, `is_empty_prefix`, `is_inject_prefix`, the
         // hide precedence in `permission_of`) only scan their own kind
@@ -142,12 +150,12 @@ impl Patterns {
                 _ => {}
             }
         }
-        Patterns {
+        Ok(Patterns {
             patterns,
             hides,
             empties,
             injects,
-        }
+        })
     }
 
     /// Whether the pattern list is non-empty (at least one hostfs mapping).
@@ -394,9 +402,9 @@ impl Patterns {
     /// virtual) directory leading to empty paths, and must stay navigable
     /// even when the mirror knows nothing about it.
     pub fn is_empty_prefix(&self, mirrored: &Path) -> bool {
-        self.empties.iter().any(|&i| {
-            self.pattern_reaches(&self.patterns[i].0, mirrored)
-        })
+        self.empties
+            .iter()
+            .any(|&i| self.pattern_reaches(&self.patterns[i].0, mirrored))
     }
 
     /// Whether some `inject` pattern could still match something *strictly
@@ -634,9 +642,12 @@ mod tests {
         // is invisible for both walks. The old `exists` let the outermost
         // `inject` win and answered via the dir-prefix rule.
         let patterns = Patterns::new(vec![
-            ("/a".to_string(), Permission::Inject {
-                content: "shallow".to_string(),
-            }),
+            (
+                "/a".to_string(),
+                Permission::Inject {
+                    content: "shallow".to_string(),
+                },
+            ),
             ("/a/b".to_string(), Permission::Empty),
             ("/a/b/c/file".to_string(), Permission::Ro),
         ]);
@@ -649,9 +660,12 @@ mod tests {
         // content below the injected path it still "exists" for traversal.
         let patterns = Patterns::new(vec![
             ("/a".to_string(), Permission::Empty),
-            ("/a/b".to_string(), Permission::Inject {
-                content: "deep".to_string(),
-            }),
+            (
+                "/a/b".to_string(),
+                Permission::Inject {
+                    content: "deep".to_string(),
+                },
+            ),
             ("/a/b/c/file".to_string(), Permission::Ro),
         ]);
         assert_eq!(patterns.permission_of(Path::new("/a/b/c")), None);
@@ -924,7 +938,12 @@ mod tests {
         // Injected files are virtual: no rename may carry their context either.
         let patterns = ps(&[
             ("/work/**", Permission::Rw),
-            ("/work/vault", Permission::Inject { content: "x".into() }),
+            (
+                "/work/vault",
+                Permission::Inject {
+                    content: "x".into(),
+                },
+            ),
         ]);
         assert!(patterns.subtree_restricted(Path::new("/work")));
 

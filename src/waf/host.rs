@@ -55,7 +55,11 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// accepted connection holds a file descriptor of the supervisor, so an
 /// unbounded number of idle connections would exhaust them. At capacity
 /// the new connection is dropped immediately.
-pub async fn serve_host(listener: UnixListener, allow: Vec<String>, allow_private: bool) {
+pub async fn serve_host(
+    listener: UnixListener,
+    allow: crate::proxy::allowlist::SharedAllow,
+    allow_private: bool,
+) {
     let limit = ConnLimit::new();
     loop {
         match listener.accept().await {
@@ -63,7 +67,11 @@ pub async fn serve_host(listener: UnixListener, allow: Vec<String>, allow_privat
                 let Some(guard) = limit.try_acquire() else {
                     continue; // at capacity: drop the connection
                 };
-                let allow = allow.clone();
+                // Snapshot at accept time: this command connection checks
+                // against these rules for its whole lifetime, so a runtime
+                // swap (crate::control's `net-set`) affects new
+                // connections only.
+                let allow = crate::proxy::allowlist::load(&allow);
                 tokio::spawn(async move {
                     let _guard = guard;
                     handle_host_conn(stream, &allow, allow_private).await;
@@ -151,7 +159,9 @@ async fn handle_host_conn(mut stream: UnixStream, allow: &[String], allow_privat
         if !take_keygen_token().await {
             eprintln!("ai-bubble waf: tls-cert for {name} rate-limited");
             crate::audit::record("waf", "tls-cert", Some(name), Some("rate-limited"), None).await;
-            let _ = stream.write_all(b"ERR too many certificate requests\n").await;
+            let _ = stream
+                .write_all(b"ERR too many certificate requests\n")
+                .await;
             return;
         }
         let (cert, key) = match sign_leaf(name) {
@@ -386,9 +396,8 @@ fn pki() -> Arc<Pki> {
         return pki.clone();
     }
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let ca_key = rcgen::KeyPair::generate().unwrap_or_else(|e| {
-        crate::sandbox::die(&format!("Can't generate the waf CA key: {e}"))
-    });
+    let ca_key = rcgen::KeyPair::generate()
+        .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't generate the waf CA key: {e}")));
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
         .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't set up the waf CA: {e}")));
     params.distinguished_name.push(
@@ -497,8 +506,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    fn allow(entries: &[&str]) -> Vec<String> {
-        entries.iter().map(|s| s.to_string()).collect()
+    fn allow(entries: &[&str]) -> crate::proxy::allowlist::SharedAllow {
+        crate::proxy::allowlist::shared(entries.iter().map(|s| s.to_string()).collect())
     }
 
     #[tokio::test]

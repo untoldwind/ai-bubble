@@ -412,10 +412,7 @@ fn redirect_sources_are_resolved_relative_to_the_spec_dir() {
         Mapping::RedirectRo { source, .. } => {
             // The relative source is resolved against the spec file's
             // directory (canonicalized, like the dir itself).
-            assert_eq!(
-                Path::new(source),
-                std::fs::canonicalize(&sibling).unwrap()
-            );
+            assert_eq!(Path::new(source), std::fs::canonicalize(&sibling).unwrap());
         }
         other => panic!("expected a redirect-ro mapping, got {other:?}"),
     }
@@ -500,7 +497,10 @@ fn explicit_spec_dir_is_required() {
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         spec.net,
-        crate::spec::net::NetConfig::Proxy { allow: vec![], allow_private: false }
+        crate::spec::net::NetConfig::Proxy {
+            allow: vec![],
+            allow_private: false
+        }
     );
 }
 
@@ -657,7 +657,10 @@ fn env_file_outside_the_spec_dir_is_refused() {
 
     for file in [
         format!("../{outside}"),
-        std::env::temp_dir().join(&outside).to_string_lossy().into_owned(),
+        std::env::temp_dir()
+            .join(&outside)
+            .to_string_lossy()
+            .into_owned(),
     ] {
         let mut env = EnvConfig {
             env_file: Some(file),
@@ -674,7 +677,67 @@ fn env_file_outside_the_spec_dir_is_refused() {
         env_file: Some("inner.env".to_string()),
         values: Default::default(),
     };
-    env.load_env_file(&dir).expect("an env file inside the spec dir is fine");
+    env.load_env_file(&dir)
+        .expect("an env file inside the spec dir is fine");
     std::fs::remove_dir_all(&dir).unwrap();
     let _ = std::fs::remove_file(std::env::temp_dir().join(&outside));
+}
+
+/// Every mapping kind round-trips through the control-plane's
+/// serialization (`policy-get`'s `fs` domain, `fs-set`'s update frames)
+/// losslessly: serialize → deserialize → equal, and the compiled
+/// pattern list is identical on both sides. The deprecated aliases
+/// (`globs`/`paths`, bind's `path`) are never *produced*, but the
+/// deserializer accepts them — the round trip here pins the canonical
+/// spelling.
+#[test]
+fn mappings_round_trip_through_the_control_serialization() {
+    use super::hostfs::patterns_from_mappings;
+    let spec = parse(
+        r#"{ "hostfs": { "mappings": [
+            { "type": "ro", "glob": "/etc/**" },
+            { "type": "rw", "glob": ["/work", "/tmp/scratch"] },
+            { "type": "hide", "glob": "/etc/shadow" },
+            { "type": "empty", "path": "/mnt" },
+            { "type": "dev" },
+            { "type": "tmpfs", "path": "/tmp", "perms": "1777", "size": 1048576 },
+            { "type": "proc" },
+            { "type": "bind", "src": "/usr", "dest": "/usr", "rw": true },
+            { "type": "redirect-ro", "dest": "/hosts-file", "source": "/etc/hosts" },
+            { "type": "redirect-rw", "dest": "/dotfiles", "source": "/home/me/dots" },
+            { "type": "symlink", "src": "usr/lib", "dest": "/lib" },
+            { "type": "inject", "path": "/etc/resolv.conf", "content": "nameserver 127.0.0.2\n" }
+        ] } }"#,
+    );
+    let mappings = &spec.hostfs.mappings;
+    for mapping in mappings {
+        let json = serde_json::to_value(mapping).unwrap();
+        let back: super::hostfs::Mapping = serde_json::from_value(json).unwrap();
+        assert_eq!(&back, mapping, "{mapping:?} must round-trip losslessly");
+    }
+    // The list as a whole round-trips (this is exactly what `policy-get`
+    // and an `fs-set` update frame carry), and the compiled pattern set
+    // is unchanged through the round trip.
+    let json = serde_json::to_value(mappings).unwrap();
+    let back: Vec<super::hostfs::Mapping> = serde_json::from_value(json).unwrap();
+    assert_eq!(back, *mappings);
+    let patterns_before = spec.hostfs.patterns();
+    let patterns_after = patterns_from_mappings(&back).unwrap();
+    assert_eq!(patterns_before, patterns_after);
+
+    // The cache mappings and relative redirect sources are rejected: a
+    // control client must send the loader-resolved shapes.
+    assert!(
+        patterns_from_mappings(&[super::hostfs::Mapping::SessionCache {
+            path: super::hostfs::Paths(vec!["/home/me/.cache".into()]),
+        }])
+        .is_err()
+    );
+    assert!(
+        patterns_from_mappings(&[super::hostfs::Mapping::RedirectRw {
+            dest: "/dots".into(),
+            source: "relative/dots".into(),
+        }])
+        .is_err()
+    );
 }

@@ -3,15 +3,16 @@
 //! session, and the last-resort unmounts.
 
 use std::ffi::CString;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use fuse3::raw::Session;
 use fuse3::MountOptions;
+use fuse3::raw::Session;
 
-use super::{fuselog, HostFs, HOST_MOUNT_POINT, HOST_PID, fuse_ops::cstring_of, patterns::Patterns};
+use super::{HOST_MOUNT_POINT, HOST_PID, HostFs, SharedPatterns, fuse_ops::cstring_of, fuselog};
 use crate::sandbox::{die, die_with_error};
 
 /// The signals that must never kill the FUSE server child: the ones that
@@ -59,13 +60,14 @@ unsafe fn disarm_signals() {
 /// Fork the FUSE server process, wait for it to mount, and record the
 /// mountpoint for the sandbox child. Must run before any namespace setup.
 ///
-/// `patterns` is the internal pattern → permission list built from the
-/// spec's `hostfs` section; the patterns are compiled inside the server
-/// process (after the fork).
+/// `policy` is the shared, runtime-swappable pattern set (see
+/// [`crate::hostfs::SharedPatterns`]) — the launcher holds the
+/// authoritative handle and may push a full replacement at runtime; the
+/// server reads the currently active set on every operation.
 ///
 /// On success the mountpoint path is stored in `HOST_MOUNT_POINT` (inherited
 /// by every later fork). On any failure the process dies.
-pub fn start_host_fs(patterns: &Patterns) {
+pub fn start_host_fs(patterns: &SharedPatterns) {
     // Open the request log (if requested) eagerly, before the fork: the
     // server child inherits the fd and never opens the path itself — a
     // lazy open inside the single-threaded FUSE server could hang on a
@@ -88,6 +90,28 @@ pub fn start_host_fs(patterns: &Patterns) {
         die_with_error("Can't create readiness pipe");
     }
     let (read_fd, write_fd) = (fds[0], fds[1]);
+
+    // Audit channel (single-writer refactor): on the isolated path the
+    // server's events go to the launcher over this pre-fork socketpair.
+    // `SOCK_CLOEXEC` on both ends — neither side may survive an `exec`.
+    // `sv[0]` stays with the launcher (its hub reads it), `sv[1]` goes
+    // to the server child.
+    let mut audit_pair: Option<[libc::c_int; 2]> = None;
+    if crate::audit::ipc_channel_wanted() {
+        let mut sv: [libc::c_int; 2] = [0; 2];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                sv.as_mut_ptr(),
+            )
+        } != 0
+        {
+            die_with_error("Can't create audit channel");
+        }
+        audit_pair = Some(sv);
+    }
 
     // Block the signals that terminate ai-bubble (plus SIGPIPE) *around the
     // fork*: the server child inherits the blocked mask, so a SIGINT/SIGTERM
@@ -119,12 +143,32 @@ pub fn start_host_fs(patterns: &Patterns) {
         // The FUSE server never signs certificates; drop the waf CA private
         // key fork-copied into this address space (AUDIT.md, TLS MITM key hygiene).
         crate::waf::host::wipe_after_fork();
+        // Audit first, before any other work: register the upstream
+        // channel (from here on this process's events go to the launcher
+        // over the socketpair) and close the inherited audit-log fd —
+        // the launcher is the only process holding the log. Also close
+        // the inherited control listener: this child never serves
+        // control, and a lingering copy would keep the abstract socket
+        // name bound after the launcher exits.
+        crate::control::close_inherited_listener();
+        if let Some(sv) = audit_pair {
+            unsafe { libc::close(sv[0]) };
+            crate::audit::set_channel(unsafe { OwnedFd::from_raw_fd(sv[1]) });
+            crate::audit::drop_log_fd();
+        }
         serve(patterns.clone(), mountpoint, write_fd);
         // serve never returns
     }
     unsafe { libc::sigprocmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut()) };
 
-    // Parent: wait for readiness.
+    // Parent: register our end of the audit channel for the hub, then
+    // wait for readiness.
+    if let Some(sv) = audit_pair {
+        unsafe { libc::close(sv[1]) };
+        crate::audit::add_peer(crate::audit::PeerRole::HostFs, unsafe {
+            OwnedFd::from_raw_fd(sv[0])
+        });
+    }
     unsafe { libc::close(write_fd) };
     let mut byte: u8 = 0;
     let n = unsafe { libc::read(read_fd, (&mut byte) as *mut u8 as *mut libc::c_void, 1) };
@@ -142,7 +186,7 @@ pub fn start_host_fs(patterns: &Patterns) {
 /// loop is a spawned task, and a current-thread runtime only polls its tasks
 /// while `block_on` is running — returning early would silently stall the
 /// event loop and every filesystem access would hang.
-fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
+fn serve(policy: SharedPatterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
@@ -154,14 +198,33 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
     let outcome = {
         let mp = mountpoint.clone();
         let server_mountpoint = mountpoint.clone();
-        fuselog::event!("SERVER start mountpoint={}", fuselog::path_string(mountpoint.as_os_str()));
+        fuselog::event!(
+            "SERVER start mountpoint={}",
+            fuselog::path_string(mountpoint.as_os_str())
+        );
         runtime.block_on(async move {
-            let handle =
-                match mount_with_fallback(&mp, uid, gid, &patterns, !patterns.any_writable()).await
-                {
-                    Ok(handle) => handle,
-                    Err(e) => return Err(e),
-                };
+            // The audit channel's halves (if this child has one): the
+            // read half feeds the control loop below (its EOF *is* the
+            // run-end signal, subsuming the old channel-EOF watch), the
+            // shared write half carries both the audit batches and the
+            // control replies.
+            crate::audit::init_channel_sink();
+            let control_read = crate::audit::channel_reader();
+            let control_reply = crate::audit::reply_writer();
+            // The mount's read-only decision is taken once, from the *initial*
+            // set: fuse3's mount handle has no remount. A runtime swap can
+            // only ever widen/narrow within what the mount allows — except
+            // when the run was started with control enabled (the default): then the mount is
+            // writable regardless (an all-`ro` initial set must still be
+            // able to grant writes later), giving up the kernel read-only
+            // backstop in favor of the per-operation pattern checks (the
+            // accepted, opt-in trade-off of the runtime-control plan).
+            let initial = policy.load();
+            let read_only = !crate::control::running() && !initial.any_writable();
+            let handle = match mount_with_fallback(&mp, uid, gid, &policy, read_only).await {
+                Ok(handle) => handle,
+                Err(e) => return Err(e),
+            };
 
             fuselog::event!("SERVER mounted");
 
@@ -171,17 +234,49 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
                 unsafe { libc::write(ready_fd, (&byte) as *const u8 as *const libc::c_void, 1) };
             unsafe { libc::close(ready_fd) };
 
-            // Serve until the sandbox process dies, then unmount cleanly. The
+            // Serve until the launcher says the run is ending, or until
+            // the launcher process dies, then unmount cleanly. The
             // session task runs concurrently on this runtime.
+            //
+            // Shutdown triggers, in order of precedence:
+            // 1. the control loop ending — the launcher half-closed the
+            //    channel's write side (`SHUT_WR`) to say "the run is
+            //    ending; finish and exit". This is the primary, prompt
+            //    trigger; the final audit events still flow, because the
+            //    opposite direction of the pair stays open until the
+            //    drain below.
+            // 2. the 200 ms `getppid()` poll — the backstop for abnormal
+            //    launcher death (a SIGKILLed launcher EOFs the channel
+            //    anyway; the poll is redundant but harmless) and for
+            //    channel-less runs.
+            let mut child_loop = match (control_read, control_reply) {
+                (Some(read), Some(reply)) => Some(tokio::spawn(crate::control::fs_child_loop(
+                    read,
+                    reply,
+                    policy.clone(),
+                ))),
+                _ => None,
+            };
             let mut heartbeat = 0u64;
             loop {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                if unsafe { libc::getppid() } != HOST_PID.load(Ordering::SeqCst) {
-                    break;
-                }
-                heartbeat += 1;
-                if heartbeat.is_multiple_of(10) {
-                    fuselog::event!("SERVER alive");
+                tokio::select! {
+                    _ = async {
+                        match &mut child_loop {
+                            Some(task) => {
+                                let _ = (&mut *task).await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => break,
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                        if unsafe { libc::getppid() } != HOST_PID.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        heartbeat += 1;
+                        if heartbeat.is_multiple_of(10) {
+                            fuselog::event!("SERVER alive");
+                        }
+                    }
                 }
             }
 
@@ -198,7 +293,10 @@ fn serve(patterns: Patterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
             }
             fuselog::event!("SERVER unmount outcome={outcome:?}");
             // Give the audit writer a chance to flush the last batch
-            // before this process exits.
+            // into the launcher's still-open channel read end (that is
+            // why the launcher half-closes instead of closing). When
+            // the writer task ends it closes the channel, which the
+            // launcher's hub reader sees as EOF.
             crate::audit::drain().await;
             outcome
         })
@@ -221,12 +319,14 @@ async fn mount_with_fallback(
     mountpoint: &Path,
     uid: u32,
     gid: u32,
-    patterns: &Patterns,
+    policy: &SharedPatterns,
     read_only: bool,
 ) -> std::io::Result<fuse3::raw::MountHandle> {
     // The mount consumes the filesystem, so each attempt builds its own
-    // `HostFs` — cheap (pattern compilation only), and correct: a failed
-    // attempt never reached the kernel, so its inode map was never touched.
+    // `HostFs` — cheap, and correct: a failed attempt never reached the
+    // kernel, so its inode map was never touched. Both attempts share the
+    // same `SharedPatterns` instance, so a runtime swap reaches whichever
+    // one actually serves.
     let options = || {
         let mut o = MountOptions::default();
         o.uid(uid)
@@ -238,13 +338,13 @@ async fn mount_with_fallback(
         o
     };
     match Session::new(options())
-        .mount_with_unprivileged(HostFs::collect(patterns), mountpoint)
+        .mount_with_unprivileged(HostFs::collect(policy), mountpoint)
         .await
     {
         Ok(handle) => Ok(handle),
         Err(unprivileged_err) => {
             let handle = Session::new(options())
-                .mount(HostFs::collect(patterns), mountpoint)
+                .mount(HostFs::collect(policy), mountpoint)
                 .await
                 .map_err(|privileged_err| {
                     std::io::Error::other(format!(
@@ -284,7 +384,7 @@ async fn mount_with_fallback(
                 )));
             }
             Ok(handle)
-        },
+        }
     }
 }
 

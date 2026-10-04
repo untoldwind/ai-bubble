@@ -37,7 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 
@@ -87,6 +87,27 @@ pub fn run(
         // The command must not inherit the listening socket.
         let _ = libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
 
+        // Audit channel (single-writer refactor): P's events go to the
+        // connector over this pre-fork socketpair. `SOCK_CLOEXEC` on
+        // both ends — the exec'd sandboxed command never sees either
+        // side. `sv[0]` stays with the connector (its hub reads it),
+        // `sv[1]` goes to P. The same pair carries the control plane's
+        // downstream `net-set` updates and P's acks (see `crate::control`).
+        let mut audit_pair: Option<[libc::c_int; 2]> = None;
+        if crate::audit::ipc_channel_wanted() {
+            let mut sv: [libc::c_int; 2] = [0; 2];
+            if libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+                sv.as_mut_ptr(),
+            ) != 0
+            {
+                die_with_error("Can't create audit channel");
+            }
+            audit_pair = Some(sv);
+        }
+
         // Fork P. This must happen before any runtime or proxy task exists.
         let pid = libc::fork();
         if pid < 0 {
@@ -94,6 +115,21 @@ pub fn run(
         }
         if pid == 0 {
             drop(listener);
+            // Audit first, before any other work: P inherited the
+            // connector's A↔FS hub peer across this fork and must not
+            // hold it (a lingering copy would keep the FS hub reader
+            // from ever seeing EOF), registers its own channel end, and
+            // drops the inherited audit-log fd — the connector is the
+            // only audit writer. P also closes the inherited control
+            // listener: it must never serve control (its network
+            // namespace would not even see the abstract name).
+            crate::audit::close_inherited();
+            crate::control::close_inherited_listener();
+            if let Some(sv) = audit_pair {
+                libc::close(sv[0]);
+                crate::audit::set_channel(OwnedFd::from_raw_fd(sv[1]));
+                crate::audit::drop_log_fd();
+            }
             // P only relays `tls-cert` requests to the connector; the CA
             // private key fork-copied into its address space is dropped
             // here (AUDIT.md, TLS MITM key hygiene).
@@ -111,14 +147,32 @@ pub fn run(
             );
         }
 
-        // Connector: serve proxy/waf requests from the host side and
-        // watch for P's exit.
-        let allow = net.allow.clone();
+        // Connector: register our end of the audit channel for the hub, then
+        // serve proxy/waf requests from the host side and watch for P's
+        // exit.
+        if let Some(sv) = audit_pair {
+            libc::close(sv[1]);
+            crate::audit::add_peer(crate::audit::PeerRole::Network, OwnedFd::from_raw_fd(sv[0]));
+        }
+        // The shared allow-list: the launcher keeps this authoritative
+        // handle (the control plane's `net-set` swaps it at runtime), the
+        // connector/waf host serves from clones of the same instance. A
+        // swap affects new connections only — every accepted connection
+        // snapshots the list (see `proxy::allowlist::SharedAllow`).
+        let allow = crate::proxy::allowlist::shared(net.allow.clone());
+        // Hand the authoritative copy to the control plane.
+        crate::control::set_allow(std::sync::Arc::clone(&allow));
         let allow_private = net.allow_private;
         let status = block_on(async move {
             let _ = listener.set_nonblocking(true);
             let l = tokio::net::UnixListener::from_std(listener)
                 .unwrap_or_else(|e| die(&format!("Can't register proxy socket: {e}")));
+            // The audit hub: one reader per child channel (FS and P),
+            // each forwarding into this process's own event queue — the
+            // file writer below is the run's only audit writer. The hub
+            // also demultiplexes the children's control replies.
+            let hub = crate::audit::spawn_hub();
+            let replies = crate::control::Replies::from_peers(hub.replies);
             let status = tokio::select! {
                 _ = async {
                     match net.mode {
@@ -130,10 +184,31 @@ pub fn run(
                 } => {
                     unreachable!("connector accept loop never ends")
                 }
+                // The control server: pending forever when control is
+                // off (a `--no-control` run never wakes this
+                // arm), the accept loop otherwise.
+                _ = crate::control::serve_task(replies) => {
+                    unreachable!("control accept loop never ends")
+                }
+                // The SIGHUP reload shim (sugar over `spec-reload`):
+                // pending forever when control is off.
+                _ = crate::control::reload_task() => {
+                    unreachable!("SIGHUP reload loop never ends")
+                }
                 st = wait_status(pid) => st,
             };
-            // Give the audit writer a chance to flush the last batch
-            // before this process exits.
+            // P is gone (its status was just reaped; its channel end
+            // closed with it). Tell FS the run is ending: half-close
+            // the hub peers' write side, so FS's read side EOFs and it
+            // shuts down — its final events still flow, because this
+            // side's read half stays open until each reader saw EOF.
+            crate::audit::shutdown_peers();
+            // Wait for every child's final batch: a reader ends at EOF,
+            // the child's "queue flushed" signal.
+            for reader in hub.readers {
+                let _ = reader.await;
+            }
+            // Final file flush: every child event is in the queue now.
             crate::audit::drain().await;
             status
         });
@@ -282,23 +357,67 @@ fn isolated_parent(
             // dead P leaves the sandbox re-parented to init.
             handle_die_with_parent(die_with_parent);
             // PID 1 of its own PID namespace (see pidns_and_exec).
-            pidns_and_exec(ops, command, &child_env, cwd, die_with_parent, new_session, seccomp);
+            pidns_and_exec(
+                ops,
+                command,
+                &child_env,
+                cwd,
+                die_with_parent,
+                new_session,
+                seccomp,
+            );
         }
 
         // Serve the mode's network frontends while the command runs.
-        let allow = net.allow.clone();
+        // The shared allow-list: P serves the CONNECT proxy from it, and
+        // P's control loop (once wired) applies launcher-pushed `net-set`
+        // updates by swapping this handle. Swaps affect new connections
+        // only — every accepted connection snapshots the list.
+        let allow = crate::proxy::allowlist::shared(net.allow.clone());
         let sock = netdir.join("sock");
         let status = block_on(async move {
+            // Proxy mode: register P's control loop on the inherited
+            // channel — the launcher's `net-set` arrives here as an
+            // `upd` frame and swaps the allow-list (affecting new
+            // connections only). Waf mode keeps no allow-list of its
+            // own (every decision is forwarded to the connector), so
+            // the launcher never pushes net updates to it.
+            crate::audit::init_channel_sink();
+            let control_loop = match (
+                net.mode,
+                crate::audit::channel_reader(),
+                crate::audit::reply_writer(),
+            ) {
+                (NetMode::Proxy, Some(read), Some(reply)) => Some(tokio::spawn(
+                    crate::control::net_child_loop(read, reply, std::sync::Arc::clone(&allow)),
+                )),
+                _ => None,
+            };
             let status = match (net.mode, proxy_listener, waf_listeners) {
                 (NetMode::Proxy, Some(listener), _) => {
                     let _ = listener.set_nonblocking(true);
                     let l = tokio::net::TcpListener::from_std(listener)
                         .unwrap_or_else(|e| die(&format!("Can't register proxy listener: {e}")));
                     tokio::select! {
-                        _ = crate::proxy::serve_sandbox_proxy(l, sock, allow) => {
-                            unreachable!("proxy accept loop never ends")
-                        }
                         st = wait_status(child_pid) => st,
+                        // The proxy accept loop never ends; the control loop
+                        // below merely ends at the launcher's EOF (P's
+                        // shutdown stays driven by the child's exit), after
+                        // which this block waits for the child like the
+                        // proxy arm does.
+                        _ = async {
+                            tokio::select! {
+                                _ = crate::proxy::serve_sandbox_proxy(l, sock, allow) => {
+                                    unreachable!("proxy accept loop never ends")
+                                }
+                                _ = async {
+                                    match control_loop {
+                                        Some(task) => { let _ = task.await; }
+                                        None => std::future::pending::<()>().await,
+                                    }
+                                } => std::future::pending::<()>().await,
+                            }
+                        } => unreachable!("proxy accept loop never ends"),
                     }
                 }
                 (NetMode::Waf, _, Some((tcp53, tcp80, tcp443, udp53))) => {
@@ -328,8 +447,10 @@ fn isolated_parent(
                 }
                 _ => unreachable!("mode and listeners agree"),
             };
-            // Give the audit writer a chance to flush the last batch
-            // before this process exits.
+            // Flush the last batch into the connector's still-open channel
+            // read end. When the writer task ends it closes the channel,
+            // which the connector's hub reader sees as EOF ("queue
+            // flushed") — before P exits.
             crate::audit::drain().await;
             status
         });
@@ -347,8 +468,10 @@ fn create_socket_dir() -> PathBuf {
 }
 
 /// Wait for `pid` on a blocking thread and return its raw waitpid status,
-/// so the async accept loops above are never stalled by waitpid.
-async fn wait_status(pid: libc::pid_t) -> libc::c_int {
+/// so the async accept loops above are never stalled by waitpid. Also
+/// used by the non-isolated supervisor's control-serving branch (see
+/// `sandbox::pidns_and_exec`).
+pub(crate) async fn wait_status(pid: libc::pid_t) -> libc::c_int {
     tokio::task::spawn_blocking(move || {
         let mut status: libc::c_int = 0;
         loop {

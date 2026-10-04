@@ -93,16 +93,15 @@ use fuse3::raw::{Filesystem, Request};
 use fuse3::{FileType, Inode, Result, SetAttr, Timestamp};
 use futures_util::stream;
 
-
+mod anchored;
+mod fuse_ops;
 pub(crate) mod fuselog;
 mod inodes;
-mod session;
 pub(crate) mod pattern;
 pub(crate) mod patterns;
 mod perf;
-mod anchored;
-mod fuse_ops;
 mod server;
+mod session;
 
 pub use server::start_host_fs;
 
@@ -184,6 +183,100 @@ static HOST_PID: AtomicI32 = AtomicI32::new(0);
 
 const TTL: Duration = Duration::from_secs(1);
 
+/// The compiled pattern set, shared between the launcher and the FUSE
+/// server so it can be **swapped at runtime**.
+///
+/// Every FUSE operation reads the currently active set through
+/// [`SharedPatterns::load`] (or [`SharedPatterns::snapshot`], where the
+/// decision and a validity stamp must come from the same generation) and
+/// matches against it on the fly. Swapping is a **full replacement**
+/// (`set`), never a delta: the whole compiled list is replaced atomically
+/// — a reader sees either the old or the new set, never a mix.
+///
+/// The set is cheap to clone (an `Arc` bump), so the launcher (`A`) can
+/// keep its own authoritative handle while the FUSE server (`FS`) holds
+/// another to the same instance; `FS`'s control loop applies a
+/// launcher-pushed update with [`SharedPatterns::set`], and every
+/// follow-up FUSE request — including reads and writes through
+/// *already-open* file handles — applies the new rules. In-flight
+/// operations are not interrupted.
+///
+/// Locks follow the module-wide poisoning convention: a poisoned lock is
+/// recovered (`into_inner`), never panicked on.
+#[derive(Clone)]
+pub struct SharedPatterns {
+    inner: std::sync::Arc<SharedPatternsInner>,
+}
+
+struct SharedPatternsInner {
+    /// The currently active compiled set. Readers clone the `Arc` (a
+    /// cheap reference-count bump); a swap replaces the `Arc` under the
+    /// write lock.
+    current: std::sync::RwLock<std::sync::Arc<Patterns>>,
+    /// Bumped on every [`SharedPatterns::set`]. Consumers with derived
+    /// state (the readdir [`DirNames`] cache) stamp their entries with it
+    /// and treat any other generation as stale — the swap invalidates the
+    /// derived state automatically, without walking it.
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl SharedPatterns {
+    /// Wrap the compiled pattern set (see [`Patterns::new`]).
+    pub fn new(patterns: Patterns) -> SharedPatterns {
+        SharedPatterns {
+            inner: std::sync::Arc::new(SharedPatternsInner {
+                current: std::sync::RwLock::new(std::sync::Arc::new(patterns)),
+                generation: std::sync::atomic::AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// A handle to the currently active set. The `Arc` keeps it alive even
+    /// if a swap happens mid-operation: the operation keeps matching
+    /// against the set it loaded.
+    pub fn load(&self) -> std::sync::Arc<Patterns> {
+        self.inner
+            .current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The current set *and* its generation, read atomically: for callers
+    /// that stamp derived state with the generation.
+    pub fn snapshot(&self) -> (std::sync::Arc<Patterns>, u64) {
+        let guard = self.inner.current.read().unwrap_or_else(|e| e.into_inner());
+        (guard.clone(), self.inner.generation.load(Ordering::SeqCst))
+    }
+
+    /// The current generation (bumped on every [`SharedPatterns::set`]).
+    // `generation`/`set` have no in-crate caller yet: their consumer is the
+    // runtime-control wiring (`control::fs_apply` swaps the set, and the
+    // readdir cache reads the generation), which lands with the control
+    // channel in the FUSE server's serve loop.
+    #[allow(dead_code)]
+    pub fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::SeqCst)
+    }
+
+    /// Replace the whole pattern set with a newly compiled one. Returns
+    /// the new generation. In-flight operations that already loaded the
+    /// old set finish against it; every later request applies the new
+    /// rules. (See `generation` for why this is currently unused.)
+    #[allow(dead_code)]
+    pub fn set(&self, patterns: Patterns) -> u64 {
+        let mut guard = self
+            .inner
+            .current
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = std::sync::Arc::new(patterns);
+        // Bumped while the write lock is held, so [`SharedPatterns::snapshot`]
+        // never pairs a set with the wrong generation.
+        self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
 /// The mirror filesystem: a view of the paths selected by the spec's
 /// ordered `hostfs.mappings` pattern → permission list, reproduced at
 /// the same absolute host paths (the filesystem is the sandbox root).
@@ -226,11 +319,15 @@ const TTL: Duration = Duration::from_secs(1);
 struct HostFs {
     uid: u32,
     gid: u32,
-    /// The spec's pattern list, in order and **pre-compiled** (by
+    /// The compiled pattern list, in order and **pre-compiled** (by
     /// [`Patterns::new`] at spec-compile time) — the single source of every
     /// permission and structural decision (see
-    /// [`Patterns::permission_of`]).
-    patterns: Patterns,
+    /// [`Patterns::permission_of`]). Shared with the launcher and
+    /// **swappable at runtime** (see [`SharedPatterns`]): every operation
+    /// loads the currently active set on the fly, so a swap applies to
+    /// every follow-up request without touching open handles or the
+    /// session.
+    patterns: SharedPatterns,
     /// The pinned host root directory descriptor every host-path walk
     /// anchors on (see [`anchored`]). Host paths are *never* resolved as
     /// strings through the kernel's path walking: each operation walks the
@@ -257,20 +354,27 @@ struct HostFs {
     handles: std::sync::Mutex<HashMap<u64, std::sync::Arc<OpenHandle>>>,
     /// Cached real-entry names per directory inode, validated by the
     /// directory's mtime/ctime (AUDIT.md L14: readdir must not re-list
-    /// and re-filter the whole directory on every follow-up call). The
-    /// pattern list never changes during a session, so the filtered
-    /// names stay valid as long as the host directory's timestamps do.
+    /// and re-filter the whole directory on every follow-up call). A
+    /// stamped entry stays valid as long as the host directory's
+    /// timestamps do *and* the policy generation is unchanged — swapping
+    /// the pattern set (see [`SharedPatterns::set`]) invalidates every
+    /// cached listing without walking the cache, because the filtered
+    /// names depend on the pattern list, not on the host timestamps.
     dir_cache: std::sync::Mutex<HashMap<u64, DirNames>>,
     /// The next `fh` to hand out; 0 is reserved for stateless IO.
     next_fh: AtomicU64,
 }
 
 /// A cached directory listing: the host directory's (mtime, mtime-nsec,
-/// ctime, ctime-nsec) stamp at listing time and the filtered, sorted
-/// names. Inode numbers are never reused, so a stale entry can only be
-/// memory, never a wrong listing (the stamp check re-lists on change).
+/// ctime, ctime-nsec) stamp at listing time, the policy generation the
+/// listing was filtered under (a pattern-set swap bumps it and stales
+/// every entry — the host directory's timestamps do not change when the
+/// patterns do), and the filtered, sorted names. Inode numbers are never
+/// reused, so a stale entry can only be memory, never a wrong listing
+/// (the stamp and generation checks re-list on change).
 struct DirNames {
     stamp: (libc::time_t, libc::c_long, libc::time_t, libc::c_long),
+    policy_gen: u64,
     names: Vec<std::ffi::OsString>,
 }
 
@@ -290,20 +394,20 @@ struct OpenHandle {
     path: PathBuf,
     /// Opened with `O_APPEND`: every write goes to the end, offsets ignored.
     append: bool,
-    /// Spec verdict cached at open time: whether the spec says the mirrored
-    /// path is writable (`rw`). The pattern list never changes during a
-    /// session, so the verdict stays valid for the handle's lifetime —
-    /// `write` uses it instead of re-matching every pattern per request.
-    /// (A real handle can only come from `open`/`create`, which already
-    /// established that the path exists, is not injected and not empty:
-    /// those checks are skipped on the handle's read/write fast path too.)
-    writable: bool,
+    // No cached `writable` verdict here: the pattern set can be swapped at
+    // runtime, so the write path re-checks
+    // `patterns.writable(&self.path)` on every write — tightening a
+    // mapping `rw` → `ro` must also stop writes through an already-open
+    // handle. (The open-time exists/inject/empty checks stay skipped on
+    // the handle's fast path: a real handle only comes from
+    // `open`/`create`, which established them.)
 }
 
 impl HostFs {
     /// Build the filesystem. The patterns arrive already compiled (see
-    /// [`Patterns::new`]) — the same compiled list backs every decision.
-    fn collect(patterns: &Patterns) -> HostFs {
+    /// [`Patterns::new`]) and wrapped in a [`SharedPatterns`] — the same
+    /// shared instance backs every decision and any later runtime swap.
+    fn collect(patterns: &SharedPatterns) -> HostFs {
         HostFs {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -330,13 +434,14 @@ impl HostFs {
     const MAX_HANDLES: usize = 8192;
 
     /// Register an opened host file under a fresh `fh`. Fails with ENFILE
-    /// when the handle table is full.
+    /// when the handle table is full. No permission verdict is stored
+    /// here: the write path re-checks the (runtime-swappable) pattern set
+    /// per request.
     fn insert_handle(
         &self,
         file: std::fs::File,
         path: PathBuf,
         append: bool,
-        writable: bool,
     ) -> std::io::Result<u64> {
         let mut table = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         if table.len() >= Self::MAX_HANDLES {
@@ -349,7 +454,6 @@ impl HostFs {
                 file: std::sync::Mutex::new(file),
                 path,
                 append,
-                writable,
             }),
         );
         Ok(fh)
@@ -359,7 +463,8 @@ impl HostFs {
     /// `OpenHandle` closes the host file.
     fn remove_handle(&self, fh: u64) {
         self.handles
-            .lock().unwrap_or_else(|e| e.into_inner())
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&fh);
     }
 
@@ -368,7 +473,8 @@ impl HostFs {
     /// stateless reopen in that case.
     fn handle_of(&self, fh: u64) -> Option<std::sync::Arc<OpenHandle>> {
         self.handles
-            .lock().unwrap_or_else(|e| e.into_inner())
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&fh)
             .cloned()
     }
@@ -382,7 +488,8 @@ impl HostFs {
     /// is dropped before returning, hence the single owned clone.
     fn resolve(&self, inode: Inode) -> std::io::Result<PathBuf> {
         self.inodes
-            .read().unwrap_or_else(|e| e.into_inner())
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .path_of(inode)
             .map(Path::to_path_buf)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))
@@ -395,10 +502,11 @@ impl HostFs {
     /// directories (mode 0555) — or injected files — that are never
     /// writable. It stats the real host filesystem (anchored, no-follow).
     fn virtual_only(&self, mirrored: &Path) -> bool {
-        self.patterns.is_empty(mirrored)
-            || self.patterns.is_inject(mirrored).is_some()
-            || (self.patterns.is_empty_prefix(mirrored) || self.patterns.is_inject_prefix(mirrored))
-                && !self.real_exists(&self.patterns.redirect(mirrored))
+        self.patterns.load().is_empty(mirrored)
+            || self.patterns.load().is_inject(mirrored).is_some()
+            || (self.patterns.load().is_empty_prefix(mirrored)
+                || self.patterns.load().is_inject_prefix(mirrored))
+                && !self.real_exists(&self.patterns.load().redirect(mirrored))
     }
 
     /// The attributes of an empty path (or a purely virtual ancestor of
@@ -490,20 +598,20 @@ impl HostFs {
     fn attr(&self, mirrored: &Path) -> std::io::Result<FileAttr> {
         // Injected paths take precedence over everything: they are purely
         // virtual files served from memory.
-        if let Some(content) = self.patterns.is_inject(mirrored) {
+        if let Some(content) = self.patterns.load().is_inject(mirrored) {
             return Ok(self.inject_file_attr(content.as_bytes()));
         }
         // Empty paths take precedence: they appear even when the real host
         // path exists (with different attributes) — as an empty directory
         // when the path is (or would be) a directory, as an empty file
         // when it matches a real file.
-        if self.patterns.is_empty(mirrored) {
+        if self.patterns.load().is_empty(mirrored) {
             return match self.real_lstat(mirrored) {
                 Ok(st) if !Self::stat_is_dir(&st) => Ok(Self::empty_file_attr(&st)),
                 _ => Ok(self.empty_dir_attr()),
             };
         }
-        let real = self.patterns.redirect(mirrored);
+        let real = self.patterns.load().redirect(mirrored);
         match self.real_lstat(&real) {
             Ok(md) => Ok(attr_from_stat(&md)),
             // A purely virtual ancestor of an empty path has no real
@@ -516,8 +624,8 @@ impl HostFs {
             // listing despite the entries being lookable).
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
-                    && (self.patterns.is_empty_prefix(mirrored)
-                        || self.patterns.is_inject_prefix(mirrored)) =>
+                    && (self.patterns.load().is_empty_prefix(mirrored)
+                        || self.patterns.load().is_inject_prefix(mirrored)) =>
             {
                 Ok(self.empty_dir_attr())
             }
@@ -530,13 +638,13 @@ impl HostFs {
     /// path, or a purely virtual ancestor of an empty path. It
     /// stats the real host filesystem.
     fn is_listable_dir(&self, mirrored: &Path) -> bool {
-        if self.patterns.is_empty(mirrored)
-            || self.patterns.is_empty_prefix(mirrored)
-            || self.patterns.is_inject_prefix(mirrored)
+        if self.patterns.load().is_empty(mirrored)
+            || self.patterns.load().is_empty_prefix(mirrored)
+            || self.patterns.load().is_inject_prefix(mirrored)
         {
             return true;
         }
-        self.is_host_dir(&self.patterns.redirect(mirrored))
+        self.is_host_dir(&self.patterns.load().redirect(mirrored))
     }
 
     /// The visible entries of a mirrored directory, sorted by name: every
@@ -555,11 +663,16 @@ impl HostFs {
         inode: Inode,
         offset: usize,
     ) -> Vec<(std::ffi::OsString, std::io::Result<FileAttr>)> {
+        // One snapshot for the whole listing: the filter decisions, the
+        // cache validation and the cached entry's generation must come
+        // from the same pattern set, or a swap mid-listing could insert a
+        // cache entry stamped with a generation it was not filtered under.
+        let (patterns, policy_gen) = self.patterns.snapshot();
         // A directory named by a mirrored pattern itself is a recursive
         // mirror: all of its real entries are visible, not only pattern
         // matches (still minus hidden ones).
-        let unfiltered = self.patterns.matches(mirrored);
-        let base_real = self.patterns.redirect(mirrored);
+        let unfiltered = patterns.matches(mirrored);
+        let base_real = patterns.redirect(mirrored);
         let mut dir: Option<std::os::fd::OwnedFd> = None;
         let names: Vec<std::ffi::OsString> = match anchored::open_dir(&self.root, &base_real) {
             Ok(opened) => {
@@ -573,7 +686,10 @@ impl HostFs {
                 let mut cache = self.dir_cache.lock().unwrap_or_else(|e| e.into_inner());
                 let cached = cache
                     .get(&inode)
-                    .filter(|hit| hit.stamp == stamp)
+                    // A pattern-set swap (a different generation) stales the
+                    // entry even though the host timestamps are unchanged:
+                    // the filtered names depend on the patterns.
+                    .filter(|hit| hit.stamp == stamp && hit.policy_gen == policy_gen)
                     .map(|hit| hit.names.clone());
                 let names = cached.unwrap_or_else(|| {
                     if cache.len() > DIR_CACHE_MAX {
@@ -601,15 +717,22 @@ impl HostFs {
                         // visible, not even a mirror match. Denied entries (and
                         // everything below a hidden directory) are hidden even
                         // inside a recursively mirrored directory.
-                        if self.patterns.under_empty(&child) || self.patterns.hidden(&child) {
+                        if patterns.under_empty(&child) || patterns.hidden(&child) {
                             continue;
                         }
-                        if unfiltered || self.patterns.exists(&child) {
+                        if unfiltered || patterns.exists(&child) {
                             names.push(name);
                         }
                     }
                     names.sort();
-                    cache.insert(inode, DirNames { stamp, names: names.clone() });
+                    cache.insert(
+                        inode,
+                        DirNames {
+                            stamp,
+                            policy_gen,
+                            names: names.clone(),
+                        },
+                    );
                     names
                 });
                 dir = Some(opened);
@@ -628,10 +751,9 @@ impl HostFs {
         // listed — readdir would advertise a directory without its
         // visible entries.
         let mut names = names;
-        for (name, permission) in self.patterns.virtual_children(mirrored) {
+        for (name, permission) in patterns.virtual_children(mirrored) {
             let child = mirrored.join(&name);
-            if names.iter().any(|n| n.as_os_str() == OsStr::new(&name))
-                || !self.patterns.exists(&child)
+            if names.iter().any(|n| n.as_os_str() == OsStr::new(&name)) || !patterns.exists(&child)
             {
                 continue;
             }
@@ -657,7 +779,8 @@ impl HostFs {
             .skip(offset)
             .map(|name| {
                 let child = mirrored.join(&name);
-                let attr = self.child_attr(dir.as_ref().map(|d| d.as_fd()), &base_real, &child, &name);
+                let attr =
+                    self.child_attr(dir.as_ref().map(|d| d.as_fd()), &base_real, &child, &name);
                 (name, attr)
             })
             .collect()
@@ -679,11 +802,13 @@ impl HostFs {
     ) -> std::io::Result<FileAttr> {
         // Virtual children (empty paths, injected files and their purely
         // virtual ancestors) never resolve inside the listed directory.
-        let plain = self.patterns.is_inject(child).is_none()
-            && !self.patterns.is_empty(child)
-            && !self.patterns.is_empty_prefix(child)
-            && !self.patterns.is_inject_prefix(child)
-            && self.patterns.redirect(child) == child
+        // One snapshot: the five checks must agree on one pattern set.
+        let patterns = self.patterns.load();
+        let plain = patterns.is_inject(child).is_none()
+            && !patterns.is_empty(child)
+            && !patterns.is_empty_prefix(child)
+            && !patterns.is_inject_prefix(child)
+            && patterns.redirect(child) == child
             && base_real.join(name) == child;
         if plain && let Some(dir) = dir {
             let cname = cstring_of(Path::new(name))?;

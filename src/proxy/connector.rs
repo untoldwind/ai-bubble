@@ -25,7 +25,11 @@ const TARGET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// connection holds a file descriptor of the supervisor, so an unbounded
 /// number of idle connections would exhaust them. At capacity the new
 /// connection is dropped immediately.
-pub async fn serve_connector(listener: UnixListener, allow: Vec<String>, allow_private: bool) {
+pub async fn serve_connector(
+    listener: UnixListener,
+    allow: super::allowlist::SharedAllow,
+    allow_private: bool,
+) {
     let limit = ConnLimit::new();
     loop {
         match listener.accept().await {
@@ -33,7 +37,10 @@ pub async fn serve_connector(listener: UnixListener, allow: Vec<String>, allow_p
                 let Some(guard) = limit.try_acquire() else {
                     continue; // at capacity: drop the connection
                 };
-                let allow = allow.clone();
+                // Snapshot at accept time: this connection checks against
+                // these rules for its whole lifetime, so a runtime swap
+                // (crate::control's `net-set`) affects new connections only.
+                let allow = super::allowlist::load(&allow);
                 tokio::spawn(async move {
                     let _guard = guard;
                     handle_connector_conn(stream, &allow, allow_private).await;
@@ -72,9 +79,9 @@ async fn handle_connector_conn(mut stream: UnixStream, allow: &[String], allow_p
         Ok(t) => t,
         Err(e) => {
             eprintln!(
-            "ai-bubble proxy: can't connect to {}: {e}",
-            super::log_target(&target)
-        );
+                "ai-bubble proxy: can't connect to {}: {e}",
+                super::log_target(&target)
+            );
             crate::audit::record(
                 "proxy",
                 "connect",

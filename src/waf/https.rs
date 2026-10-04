@@ -90,7 +90,8 @@ async fn handle_tls(mut tcp: TcpStream, sock: &Path) {
     // the TLS handshake, which the client could equally stall — must
     // complete within HELLO_TIMEOUT. On timeout the connection is simply
     // dropped.
-    let (hello, sni) = match tokio::time::timeout(HELLO_TIMEOUT, read_client_hello(&mut tcp)).await {
+    let (hello, sni) = match tokio::time::timeout(HELLO_TIMEOUT, read_client_hello(&mut tcp)).await
+    {
         Ok(Some(pair)) => pair,
         _ => return, // timeout, EOF or not a usable TLS hello: just close
     };
@@ -141,11 +142,11 @@ async fn handle_tls(mut tcp: TcpStream, sock: &Path) {
     let svc = service_fn(move |req| {
         let sock = sock.clone();
         let sni = sni_service.clone();
-        async move {
-            Ok::<_, std::convert::Infallible>(handle_request(&sock, &sni, req).await)
-        }
+        async move { Ok::<_, std::convert::Infallible>(handle_request(&sock, &sni, req).await) }
     });
-    let _ = http1::Builder::new().serve_connection(TokioIo::new(&mut tls), svc).await;
+    let _ = http1::Builder::new()
+        .serve_connection(TokioIo::new(&mut tls), svc)
+        .await;
 }
 
 /// One decrypted HTTP request: enforce `Host == SNI`, rewrite the
@@ -491,7 +492,12 @@ mod tests {
         // AUDIT.md L4: the SNI must consist of printable ASCII only —
         // control bytes would be re-emitted verbatim on the host
         // connector's command line (`tls-cert <sni>`).
-        for evil in ["evil\nexample.com", "evil\r.com", "e\x01vil.com", "evil\x7f.com"] {
+        for evil in [
+            "evil\nexample.com",
+            "evil\r.com",
+            "e\x01vil.com",
+            "evil\x7f.com",
+        ] {
             let record = make_client_hello(Some(evil));
             assert_eq!(
                 sni_from_client_hello(&record[9..]),
@@ -573,11 +579,11 @@ mod tests {
     }
 
     /// Full MITM pipeline: a rustls client trusting only the waf CA ->
-/// the HTTPS server (SNI extraction, forged certificate, TLS
-/// termination) -> the command socket (tls-cert + tls-connect) -> a
-/// plain TCP echo server; the decrypted plaintext must reach it and
-/// its reply must come back through the TLS session.
-#[tokio::test]
+    /// the HTTPS server (SNI extraction, forged certificate, TLS
+    /// termination) -> the command socket (tls-cert + tls-connect) -> a
+    /// plain TCP echo server; the decrypted plaintext must reach it and
+    /// its reply must come back through the TLS session.
+    #[tokio::test]
     async fn end_to_end_mitm() {
         use crate::waf::host;
 
@@ -707,14 +713,16 @@ mod tests {
     #[test]
     fn host_header_must_match_the_sni() {
         use hyper::header::HeaderValue;
-        let ok = |h: &str| host_header_matches(
-            &{
-                let mut m = hyper::HeaderMap::new();
-                m.insert(hyper::header::HOST, HeaderValue::from_str(h).unwrap());
-                m
-            },
-            "example.com",
-        );
+        let ok = |h: &str| {
+            host_header_matches(
+                &{
+                    let mut m = hyper::HeaderMap::new();
+                    m.insert(hyper::header::HOST, HeaderValue::from_str(h).unwrap());
+                    m
+                },
+                "example.com",
+            )
+        };
         // Matching forms.
         assert!(ok("example.com"));
         assert!(ok("example.com:443"));
@@ -726,7 +734,10 @@ mod tests {
         assert!(!ok("example.com.evil.com"));
         assert!(!ok("sub.example.com"));
         // Missing or malformed Host.
-        assert!(!host_header_matches(&hyper::HeaderMap::new(), "example.com"));
+        assert!(!host_header_matches(
+            &hyper::HeaderMap::new(),
+            "example.com"
+        ));
     }
 
     /// The forged leaf for a host verifies under the waf CA.

@@ -88,7 +88,7 @@ mod tests {
         let unix = UnixListener::from_std(std_listener).unwrap();
         tokio::spawn(serve_connector(
             unix,
-            vec![format!("127.0.0.1:{}", echo_addr.port())],
+            crate::proxy::allowlist::shared(vec![format!("127.0.0.1:{}", echo_addr.port())]),
             true,
         ));
 
@@ -98,7 +98,7 @@ mod tests {
         tokio::spawn(serve_sandbox_proxy(
             proxy,
             sock_path.clone(),
-            vec![format!("127.0.0.1:{}", echo_addr.port())],
+            crate::proxy::allowlist::shared(vec![format!("127.0.0.1:{}", echo_addr.port())]),
         ));
 
         // Client: CONNECT, then echo through the tunnel.

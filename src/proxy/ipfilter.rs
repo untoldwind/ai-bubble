@@ -33,10 +33,7 @@ fn split_target(target: &str) -> io::Result<(String, u16)> {
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
     if host.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "empty host",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty host"));
     }
     let port: u16 = port
         .parse()
@@ -198,7 +195,6 @@ pub async fn connect_checked(target: &str, allow_private: bool) -> io::Result<Tc
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn blocked(s: &str) -> &'static str {
         blocked_reason(s.parse().unwrap()).expect("must be blocked")
@@ -213,7 +209,10 @@ mod tests {
 
     #[test]
     fn blocked_v4_ranges() {
-        assert_eq!(blocked("169.254.169.254"), "link-local (incl. cloud metadata)");
+        assert_eq!(
+            blocked("169.254.169.254"),
+            "link-local (incl. cloud metadata)"
+        );
         assert_eq!(blocked("127.0.0.1"), "loopback");
         assert_eq!(blocked("127.8.8.8"), "loopback");
         assert_eq!(blocked("10.1.2.3"), "private");
@@ -250,7 +249,10 @@ mod tests {
         assert_eq!(blocked("2001:db8::1"), "documentation");
         // Embedded/translated IPv4 must inherit the v4 verdict.
         assert_eq!(blocked("::ffff:10.0.0.1"), "private");
-        assert_eq!(blocked("::ffff:169.254.169.254"), "link-local (incl. cloud metadata)");
+        assert_eq!(
+            blocked("::ffff:169.254.169.254"),
+            "link-local (incl. cloud metadata)"
+        );
         assert_eq!(blocked("64:ff9b::a00:1"), "private");
         assert_eq!(blocked("2002:a00:1::"), "private");
         // AUDIT.md L5: Teredo and the NAT64 local-use prefix.
@@ -266,7 +268,10 @@ mod tests {
 
     #[test]
     fn split_target_forms() {
-        assert_eq!(split_target("example.com:443").unwrap(), ("example.com".into(), 443));
+        assert_eq!(
+            split_target("example.com:443").unwrap(),
+            ("example.com".into(), 443)
+        );
         assert_eq!(split_target("[::1]:80").unwrap(), ("::1".into(), 80));
         assert!(split_target("example.com").is_err());
         assert!(split_target(":443").is_err());
@@ -292,7 +297,10 @@ mod tests {
             .map(|s| s.parse().unwrap())
             .collect();
         let kept = filter_addrs("x.example", &addrs, false).unwrap();
-        assert_eq!(kept, vec!["93.184.216.34:80".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(
+            kept,
+            vec!["93.184.216.34:80".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     /// The connector must refuse to dial loopback targets unless the

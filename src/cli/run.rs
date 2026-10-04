@@ -3,47 +3,27 @@
 
 use std::path::Path;
 
-use crate::{audit, hostfs, netns, sandbox, spec, waf};
+use crate::{audit, control, hostfs, netns, sandbox, spec, waf};
 
-/// Runs the `run` sub-command. `spec_dir` is the `--spec-dir` value (if
-/// given), `die_with_parent` the (negatable) PDEATHSIG flag, `new_session`
-/// the (negatable) new-terminal-session flag, `require_spec` the
-/// `--require-spec` strictness flag (see above), `command` the command to
-/// execute inside the sandbox.
-pub fn run(
-    spec_dir: Option<&Path>,
-    die_with_parent: bool,
-    new_session: bool,
-    require_spec: bool,
-    mut command: Vec<String>,
+/// The preprocessing `ai-bubble run` applies to the freshly loaded spec
+/// before compiling it — replayed **idempotently** by `spec-reload` (see
+/// `crate::control`), so the reload diffs the same preprocessed spec the
+/// run was built from:
+///
+/// * in waf mode, the injected `/etc/resolv.conf` (pointing at the
+///   in-sandbox DNS server) and the MITM CA bundle mappings are appended
+///   last (they win over earlier mappings of the same path, but not over
+///   an explicit `hide`),
+/// * the cache mappings (`session-cache`, `project-cache`) are resolved
+///   against their backing directories — the *same* per-run session
+///   root on every call, so a reload never rewrites the resolved
+///   redirects and never resets the session cache mid-run
+///   (`create_dir_all` is idempotent).
+pub(crate) fn preprocess_spec(
+    spec: &mut spec::Spec,
+    spec_dir: &Path,
+    session_cache: Option<&Path>,
 ) {
-    if command.is_empty() {
-        sandbox::die(
-            "No command given; usage: ai-bubble run [--spec-dir DIR] -- COMMAND [args...]",
-        );
-    }
-    // AUDIT.md L9: an explicit `--spec-dir` that cannot be read is a hard
-    // error inside `Spec::load` already; `--require-spec` extends the same
-    // strictness to the default spec directory, so a missing `.ai-bubble/
-    // spec.json` (wrong CWD, renamed spec dir) cannot silently degrade the
-    // run to an empty policy with host networking.
-    if require_spec {
-        let dir = spec_dir.unwrap_or_else(|| Path::new(spec::file::DEFAULT_SPEC_DIR));
-        if !dir.join(spec::file::SPEC_FILE).exists() {
-            sandbox::die(&format!(
-                "--require-spec: no spec file at {}",
-                dir.join(spec::file::SPEC_FILE).display()
-            ));
-        }
-    }
-    let mut spec = spec::Spec::load(spec_dir);
-
-    // In waf mode the sandbox has no real resolver configuration:
-    // inject a virtual, in-memory `/etc/resolv.conf` pointing at
-    // the in-sandbox DNS server (127.0.0.2, see `crate::waf`). The
-    // mapping is appended last, so it wins over earlier mappings of
-    // the same path (`hide` still wins over it — a hidden path is
-    // invisible no matter what).
     if matches!(spec.net, spec::net::NetConfig::Waf { .. }) {
         spec.hostfs.mappings.push(spec::hostfs::Mapping::Inject {
             path: "/etc/resolv.conf".to_string(),
@@ -71,15 +51,56 @@ pub fn run(
         });
     }
 
-    // Resolve the cache mappings (`session-cache`,
-    // `project-cache`) against their backing directories before
-    // anything is compiled: the session-cache tmp directory is
-    // created here and wiped once ai-bubble terminates (the
-    // mirrored-fs server inherits the wipe).
+    // Resolve the cache mappings (`session-cache`, `project-cache`)
+    // against their backing directories before anything is compiled:
+    // the session-cache tmp directory is created here and wiped once
+    // ai-bubble terminates (the mirrored-fs server inherits the wipe).
+    spec.hostfs.prepare_caches(spec_dir, session_cache);
+}
+
+/// Runs the `run` sub-command. `spec_dir` is the `--spec-dir` value (if
+/// given), `die_with_parent` the (negatable) PDEATHSIG flag, `new_session`
+/// the (negatable) new-terminal-session flag, `require_spec` the
+/// `--require-spec` strictness flag (see above), `control_enabled` the
+/// (negatable) runtime-control switch — on by default, off via
+/// `--no-control` — `command` the command to execute inside the sandbox.
+pub fn run(
+    spec_dir: Option<&Path>,
+    die_with_parent: bool,
+    new_session: bool,
+    require_spec: bool,
+    control_enabled: bool,
+    mut command: Vec<String>,
+) {
+    if command.is_empty() {
+        sandbox::die(
+            "No command given; usage: ai-bubble run [--spec-dir DIR] -- COMMAND [args...]",
+        );
+    }
+    // AUDIT.md L9: an explicit `--spec-dir` that cannot be read is a hard
+    // error inside `Spec::load` already; `--require-spec` extends the same
+    // strictness to the default spec directory, so a missing `.ai-bubble/
+    // spec.json` (wrong CWD, renamed spec dir) cannot silently degrade the
+    // run to an empty policy with host networking.
+    if require_spec {
+        let dir = spec_dir.unwrap_or_else(|| Path::new(spec::file::DEFAULT_SPEC_DIR));
+        if !dir.join(spec::file::SPEC_FILE).exists() {
+            sandbox::die(&format!(
+                "--require-spec: no spec file at {}",
+                dir.join(spec::file::SPEC_FILE).display()
+            ));
+        }
+    }
+    let mut spec = spec::Spec::load(spec_dir);
+
+    // The run's preprocessing (waf injections, cache-mapping
+    // resolution) — factored out because `spec-reload` must replay it
+    // identically (see `crate::control::spec_reload_inner`).
+    // The session-cache tmp directory is created here and wiped once
+    // ai-bubble terminates (the mirrored-fs server inherits the wipe).
     let spec_dir = spec_dir.unwrap_or(Path::new(spec::file::DEFAULT_SPEC_DIR));
     let session_cache = hostfs::session_cache_needed(spec.hostfs.has_session_caches());
-    spec.hostfs
-        .prepare_caches(spec_dir, session_cache.as_deref());
+    preprocess_spec(&mut spec, spec_dir, session_cache.as_deref());
 
     // Compile the config-file spec down into the internal
     // configuration (ops, hostfs patterns, net settings) the
@@ -92,10 +113,38 @@ pub fn run(
     // here (inside the spec directory, or an already existing file):
     // the writers append with the operator's uid, so an arbitrary
     // path would be an arbitrary file create/append primitive.
-    audit::configure(
-        sandbox_config.audit_log.clone(),
-        spec_dir,
-    );
+    audit::configure(sandbox_config.audit_log.clone(), spec_dir);
+    // Single-writer audit: on the isolated path the launcher is the only
+    // process touching the log; the FUSE server and P send their events
+    // upstream over pre-fork socketpairs. On the non-isolated path the
+    // launcher has no runtime — unless runtime control is enabled, in
+    // which case its supervisor grows one and serves the hub too (see
+    // `sandbox::pidns_and_exec`).
+    audit::set_ipc_enabled(sandbox_config.net.isolated || control_enabled);
+
+    // Runtime control: register the authoritative mutable policy state
+    // (always — the bookkeeping is inert when control is disabled via
+    // `--no-control`), then bind
+    // the abstract socket and write the token. The bind must happen
+    // before the FUSE server forks, so the child can close the inherited
+    // listener (and, on `EADDRINUSE`, this run simply continues without
+    // control).
+    control::record_initial(control::Start {
+        fs_initial: sandbox_config
+            .patterns
+            .has_patterns()
+            .then(|| serde_json::to_value(&spec.hostfs.mappings).unwrap_or_default())
+            .and_then(|value| value.as_array().cloned()),
+        net_applicable: sandbox_config.net.isolated,
+        net_proxy: sandbox_config.net.isolated
+            && matches!(sandbox_config.net.mode, spec::internal::NetMode::Proxy),
+        config: sandbox_config.clone(),
+        spec_dir: std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf()),
+        session_cache: session_cache.clone(),
+    });
+    if control_enabled {
+        control::start(spec_dir);
+    }
 
     // Start the host FUSE filesystem server (in its own child
     // process) before any namespace setup: its filesystem becomes
@@ -108,7 +157,12 @@ pub fn run(
         if let Some(root) = &session_cache {
             hostfs::set_session_cache_root(root);
         }
-        hostfs::start_host_fs(&sandbox_config.patterns);
+        // The launcher wraps the compiled set in a shared handle: it keeps
+        // the authoritative copy (for later runtime-control updates), and
+        // the FUSE server child receives a cheap clone of the same
+        // instance.
+        let patterns = hostfs::SharedPatterns::new(sandbox_config.patterns.clone());
+        hostfs::start_host_fs(&patterns);
     }
 
     let command = std::mem::take(&mut command);

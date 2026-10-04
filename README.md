@@ -55,6 +55,62 @@ ai-bubble init
 ai-bubble --print-schema > ai-bubble.spec.schema.json
 ```
 
+## Runtime control
+
+`ai-bubble run ...` has **runtime control** on by default (pass
+`--no-control` to switch it off): the launcher binds an abstract-namespace Unix socket
+(`@ai-bubble-control-<hash of the spec directory>`, in the host network
+namespace — on the isolated-network modes the sandbox cannot even name
+it) and authenticates clients with a per-run token written mode `0600`
+to `<spec-dir>/run/control-token`. While the run is live:
+
+```sh
+# Read the current mutable policy of the running instance:
+ai-bubble --spec-dir .ai-bubble control --policy-get
+
+# Replace the whole hostfs pattern set (the same mapping objects as the
+# spec file's hostfs.mappings; affects new filesystem operations only):
+ai-bubble --spec-dir .ai-bubble control --fs-set '[{"type":"rw","glob":"/work/**"}]'
+
+# Replace the whole network allow-list (affects new connections only):
+ai-bubble --spec-dir .ai-bubble control --net-set '["example.com:443", "*.api.example.com"]'
+
+# Re-read the spec file and apply the mutable subset of what changed:
+ai-bubble --spec-dir .ai-bubble control --spec-reload
+# (equivalently: kill -HUP <pid of the ai-bubble run>)
+
+# Show the audit log path / follow the audit log like tail -f:
+ai-bubble --spec-dir .ai-bubble audit
+ai-bubble --spec-dir .ai-bubble audit --follow --lines 20
+```
+
+Notes:
+
+* Only the *runtime-mutable* subset of the policy can be changed: the
+  hostfs pattern set and the network allow-list. Seccomp, mounts, env,
+  cwd and the address-family gates are fixed at start.
+* `--spec-reload` (and the SIGHUP shim) re-read the spec file and apply
+  only what is runtime-mutable. If any *immutable* section changed, the
+  command fails and names it (e.g. `immutable section changed: seccomp`)
+  instead of silently ignoring the edit — restart the run for those. A
+  failed apply is reverted everywhere, so the run is never left
+  half-reloaded.
+* Replacements are **full**, never deltas, and are validated with the
+  same rules the spec loader applies before anything is swapped. A
+  failed apply (e.g. the in-sandbox proxy rejects a `net-set`) is
+  reverted everywhere and reported as a non-`ok` reply (exit status 1).
+* Because fuse3 mounts cannot be remounted, a control-enabled run
+  mounts its FUSE mirror **writable** even when every initial mapping
+  is `ro`: the per-operation pattern checks are then the only write
+  policy. That trade-off is why control is opt-in.
+* A second concurrent run of the same spec directory warns loudly and
+  runs *without* control — it must not clobber the first run's token
+  file. A control-enabled run cannot use the terminal relay (pty mode);
+  it refuses with an error.
+* The audit log, if configured, is written by the launcher alone; the
+  sandbox's helper processes forward their events to it, so `tail -f`
+  on the log is safe while the run lives.
+
 Notes:
 
 * `init` creates the spec directory (default `.ai-bubble`, or `--spec-dir
@@ -809,7 +865,7 @@ shows the effective permission for a host path under the current spec.
 Starter project — the spec file's `hostfs.mappings` (ro, rw, hide, empty,
 dev, tmpfs, proc, bind, symlink, redirect-ro, redirect-rw, session-cache,
 project-cache), `net.mode` (`host`, `proxy`, `waf`) and `net.allow` are implemented, along
-with the `run`, `ls` and `initinit` sub-commands and `--print-schema`. Namespace-wise ai-bubble
+with the `run`, `ls`, `init` and `control` sub-commands and `--print-schema`. Namespace-wise ai-bubble
 always unshares user, cgroup, ipc, pid, uts and mount namespaces (see
 "Equivalence with bwrap's namespace flags" above); the network namespace is
 unshared with `"net": { "mode": "proxy" }`.

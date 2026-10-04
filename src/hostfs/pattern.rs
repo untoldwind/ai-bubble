@@ -174,8 +174,7 @@ impl Pattern {
                 };
                 chars.clear();
                 chars.extend(name.chars());
-                match_component(tokens, &chars[..])
-                    && self.match_from(pi + 1, &comps[1..], chars)
+                match_component(tokens, &chars[..]) && self.match_from(pi + 1, &comps[1..], chars)
             }
         }
     }

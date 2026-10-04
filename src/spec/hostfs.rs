@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use schemars::JsonSchema;
 
@@ -25,7 +25,7 @@ use crate::{
     spec::internal::Op,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Globs(pub Vec<String>);
 
 impl<'de> Deserialize<'de> for Globs {
@@ -44,8 +44,8 @@ impl<'de> Deserialize<'de> for Globs {
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut globs = Vec::new();
-                while let Some(s) = seq.next_element::<&str>()? {
-                    globs.push(super::file::expand_str(s).map_err(serde::de::Error::custom)?);
+                while let Some(s) = seq.next_element::<String>()? {
+                    globs.push(super::file::expand_str(&s).map_err(serde::de::Error::custom)?);
                 }
                 Ok(Globs(globs))
             }
@@ -81,7 +81,7 @@ impl schemars::JsonSchema for Globs {
 /// Like [`Globs`], for the single-path-or-list fields (`empty`, `tmpfs`,
 /// `session-cache`, `project-cache`): a single absolute path, or a list
 /// of them (a list behaves like separate mappings in the listed order).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Paths(pub Vec<String>);
 
 impl<'de> Deserialize<'de> for Paths {
@@ -100,8 +100,8 @@ impl<'de> Deserialize<'de> for Paths {
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut paths = Vec::new();
-                while let Some(s) = seq.next_element::<&str>()? {
-                    paths.push(super::file::expand_str(s).map_err(serde::de::Error::custom)?);
+                while let Some(s) = seq.next_element::<String>()? {
+                    paths.push(super::file::expand_str(&s).map_err(serde::de::Error::custom)?);
                 }
                 Ok(Paths(paths))
             }
@@ -618,6 +618,167 @@ impl<'de> Deserialize<'de> for Mapping {
             .try_into()
             .map_err(serde::de::Error::custom)
     }
+}
+
+impl Serialize for Mapping {
+    /// The mapping as the same JSON object shape the spec file uses, so
+    /// the runtime-control protocol (`policy-get`'s `fs` domain and the
+    /// `fs-set` update frames) round-trips losslessly: the deserializer
+    /// accepts exactly these objects (plus its deprecated aliases, which
+    /// serialization never produces). Field names, the `"type"` tag and
+    /// the `redirect-*` renames mirror [`UncheckedMapping`].
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let (tag, fields): (&str, Vec<(&str, serde_json::Value)>) = match self {
+            Mapping::Ro { glob } => (
+                "ro",
+                vec![(
+                    "glob",
+                    serde_json::to_value(glob).map_err(serde::ser::Error::custom)?,
+                )],
+            ),
+            Mapping::Rw { glob } => (
+                "rw",
+                vec![(
+                    "glob",
+                    serde_json::to_value(glob).map_err(serde::ser::Error::custom)?,
+                )],
+            ),
+            Mapping::Hide { glob } => (
+                "hide",
+                vec![(
+                    "glob",
+                    serde_json::to_value(glob).map_err(serde::ser::Error::custom)?,
+                )],
+            ),
+            Mapping::Empty { path } => (
+                "empty",
+                vec![(
+                    "path",
+                    serde_json::to_value(path).map_err(serde::ser::Error::custom)?,
+                )],
+            ),
+            Mapping::Dev { path } => ("dev", vec![("path", serde_json::Value::from(path.clone()))]),
+            Mapping::Tmpfs { path, perms, size } => ("tmpfs", {
+                let mut fields = vec![(
+                    "path",
+                    serde_json::to_value(path).map_err(serde::ser::Error::custom)?,
+                )];
+                if let Some(perms) = perms {
+                    fields.push((
+                        "perms",
+                        serde_json::to_value(perms).map_err(serde::ser::Error::custom)?,
+                    ));
+                }
+                if let Some(size) = size {
+                    fields.push(("size", serde_json::Value::from(*size)));
+                }
+                fields
+            }),
+            Mapping::Proc { path } => (
+                "proc",
+                vec![("path", serde_json::Value::from(path.clone()))],
+            ),
+            Mapping::Bind { src, dest, rw } => {
+                let mut fields = vec![("src", serde_json::Value::from(src.clone()))];
+                if let Some(dest) = dest {
+                    fields.push(("dest", serde_json::Value::from(dest.clone())));
+                }
+                fields.push(("rw", serde_json::Value::from(*rw)));
+                ("bind", fields)
+            }
+            Mapping::RedirectRo { dest, source } => (
+                "redirect-ro",
+                vec![
+                    ("dest", serde_json::Value::from(dest.clone())),
+                    ("source", serde_json::Value::from(source.clone())),
+                ],
+            ),
+            Mapping::RedirectRw { dest, source } => (
+                "redirect-rw",
+                vec![
+                    ("dest", serde_json::Value::from(dest.clone())),
+                    ("source", serde_json::Value::from(source.clone())),
+                ],
+            ),
+            // Session/project caches only exist in the *unresolved* config
+            // view; `prepare_caches` rewrites them into `redirect-rw` before
+            // the run starts (and the control plane rejects them in `fs-set`).
+            Mapping::SessionCache { path } => (
+                "session-cache",
+                vec![(
+                    "path",
+                    serde_json::to_value(path).map_err(serde::ser::Error::custom)?,
+                )],
+            ),
+            Mapping::ProjectCache { path } => (
+                "project-cache",
+                vec![(
+                    "path",
+                    serde_json::to_value(path).map_err(serde::ser::Error::custom)?,
+                )],
+            ),
+            Mapping::Symlink { src, dest } => (
+                "symlink",
+                vec![
+                    ("src", serde_json::Value::from(src.clone())),
+                    ("dest", serde_json::Value::from(dest.clone())),
+                ],
+            ),
+            Mapping::Inject { path, content } => (
+                "inject",
+                vec![
+                    ("path", serde_json::Value::from(path.clone())),
+                    ("content", serde_json::Value::from(content.clone())),
+                ],
+            ),
+        };
+        let mut map = serializer.serialize_map(Some(1 + fields.len()))?;
+        map.serialize_entry("type", tag)?;
+        for (key, value) in fields {
+            map.serialize_entry(key, &value)?;
+        }
+        map.end()
+    }
+}
+
+/// Compile a mapping list into the pattern set it expresses — the
+/// fallible counterpart of [`HostFsConfig::patterns`], used by the
+/// runtime-control plane (`fs-set`): a bad glob or an inapplicable
+/// mapping must be reported to the control client instead of killing
+/// the FUSE server (which [`Patterns::new`] would do).
+///
+/// Two mappings are rejected here that the spec loader accepts only in
+/// their *preprocessed* form: the cache mappings (the loader rewrites
+/// them into `redirect-rw` with a resolved backing directory) and
+/// redirects with a relative `source` (the loader resolves those against
+/// the spec directory) — a control client must send the resolved shapes.
+pub fn patterns_from_mappings(mappings: &[Mapping]) -> Result<Patterns, String> {
+    let mut pairs: Vec<(String, Permission)> = Vec::new();
+    for mapping in mappings {
+        match mapping {
+            Mapping::SessionCache { .. } | Mapping::ProjectCache { .. } => {
+                return Err(
+                    "session-cache/project-cache mappings must be resolved by the spec loader; \
+                     use redirect-rw with an absolute backing directory"
+                        .into(),
+                );
+            }
+            Mapping::RedirectRo { source, .. } | Mapping::RedirectRw { source, .. }
+                if !Path::new(source).is_absolute() =>
+            {
+                return Err(format!(
+                    "redirect source {source:?} is relative; resolve it against the \
+                     spec directory before sending it to fs-set"
+                ));
+            }
+            _ => {}
+        }
+        for pattern in mapping.pattern() {
+            pairs.push((pattern.to_string(), mapping.permission()));
+        }
+    }
+    Patterns::try_new(pairs)
 }
 
 impl Mapping {

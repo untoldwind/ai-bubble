@@ -171,7 +171,8 @@ impl Filesystem for HostFs {
         perf::fuse_op!("forget");
         let path = self
             .inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .forget(inode);
         fuselog::event!(
             "INODE forget inode={inode} nlookup={nlookup} path={}",
@@ -208,12 +209,13 @@ impl Filesystem for HostFs {
             }
         };
         let mirrored = parent_path.join(name);
-        if self.patterns.exists(&mirrored) {
+        if self.patterns.load().exists(&mirrored) {
             match self.attr(&mirrored) {
                 Ok(mut attr) => {
                     let inode = self
                         .inodes
-                        .write().unwrap_or_else(|e| e.into_inner())
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get_or_insert(&mirrored, parent);
                     attr.ino = inode;
                     return Ok(ReplyEntry {
@@ -226,7 +228,7 @@ impl Filesystem for HostFs {
                     log_op_err(
                         "lookup",
                         &mirrored,
-                        Some(&self.patterns.redirect(&mirrored)),
+                        Some(&self.patterns.load().redirect(&mirrored)),
                         &e,
                     )
                     .await;
@@ -235,7 +237,8 @@ impl Filesystem for HostFs {
                         // next lookup re-maps the path (a zombie stays while
                         // open handles remain).
                         self.inodes
-                            .write().unwrap_or_else(|e| e.into_inner())
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
                             .release_path(&mirrored);
                     }
                     return Err(e.into());
@@ -250,7 +253,8 @@ impl Filesystem for HostFs {
         )
         .await;
         self.inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .release_path(&mirrored);
         Err(libc::ENOENT.into())
     }
@@ -275,7 +279,7 @@ impl Filesystem for HostFs {
             attr.ino = inode;
             return Ok(ReplyAttr { ttl: TTL, attr });
         }
-        if self.patterns.exists(&mirrored) {
+        if self.patterns.load().exists(&mirrored) {
             match self.attr(&mirrored) {
                 Ok(mut attr) => {
                     attr.ino = inode;
@@ -285,7 +289,7 @@ impl Filesystem for HostFs {
                     log_op_err(
                         "getattr",
                         &mirrored,
-                        Some(&self.patterns.redirect(&mirrored)),
+                        Some(&self.patterns.load().redirect(&mirrored)),
                         &e,
                     )
                     .await;
@@ -306,10 +310,10 @@ impl Filesystem for HostFs {
     async fn readlink(&self, _req: Request, inode: Inode) -> Result<ReplyData> {
         perf::fuse_op!("readlink");
         let mirrored = self.resolve(inode)?;
-        if !self.patterns.exists(&mirrored) {
+        if !self.patterns.load().exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        let target = anchored::read_link(&self.root, &self.patterns.redirect(&mirrored))?;
+        let target = anchored::read_link(&self.root, &self.patterns.load().redirect(&mirrored))?;
         Ok(ReplyData::from(Bytes::copy_from_slice(
             target.as_os_str().as_encoded_bytes(),
         )))
@@ -320,7 +324,7 @@ impl Filesystem for HostFs {
         let mirrored = self.resolve(inode)?;
         // The path is visible through the mirror; only real files are
         // openable (a directory that merely leads to a match is not).
-        if !self.patterns.exists(&mirrored) {
+        if !self.patterns.load().exists(&mirrored) {
             log_op_err(
                 "open",
                 &mirrored,
@@ -332,7 +336,7 @@ impl Filesystem for HostFs {
         }
         // An injected path is a purely virtual file: served from memory,
         // never writable, the host is not consulted at all.
-        if let Some(_content) = self.patterns.is_inject(&mirrored) {
+        if let Some(_content) = self.patterns.load().is_inject(&mirrored) {
             let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
             if write_flags {
                 log_op_err(
@@ -345,7 +349,8 @@ impl Filesystem for HostFs {
                 return Err(libc::EACCES.into());
             }
             self.inodes
-                .write().unwrap_or_else(|e| e.into_inner())
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
                 .open_handle(inode);
             return Ok(ReplyOpen { fh: 0, flags: 0 });
         }
@@ -356,7 +361,7 @@ impl Filesystem for HostFs {
         // register a stateful handle serving the real bytes, defeating the
         // mapping (the stateless read path already serves zero bytes for
         // empty paths; only the handle fast-path bypasses the spec check).
-        if self.patterns.is_empty(&mirrored) {
+        if self.patterns.load().is_empty(&mirrored) {
             let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
             if write_flags {
                 log_op_err(
@@ -369,7 +374,8 @@ impl Filesystem for HostFs {
                 return Err(libc::EACCES.into());
             }
             self.inodes
-                .write().unwrap_or_else(|e| e.into_inner())
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
                 .open_handle(inode);
             return Ok(ReplyOpen { fh: 0, flags: 0 });
         }
@@ -379,7 +385,7 @@ impl Filesystem for HostFs {
         // through the mirror (its target may not be mirrored at all). The
         // metadata is taken from the dirfd-anchored path: no intermediate
         // component may resolve through a host symlink.
-        let real = self.patterns.redirect(&mirrored);
+        let real = self.patterns.load().redirect(&mirrored);
         let md_stat = match self.real_lstat(&real) {
             Ok(st) => st,
             Err(e) => {
@@ -390,8 +396,8 @@ impl Filesystem for HostFs {
                 // a directory rather than as missing (the kernel only asks
                 // to open directories it has already resolved).
                 if e.kind() == std::io::ErrorKind::NotFound
-                    && (self.patterns.is_empty_prefix(&mirrored)
-                        || self.patterns.is_inject_prefix(&mirrored))
+                    && (self.patterns.load().is_empty_prefix(&mirrored)
+                        || self.patterns.load().is_inject_prefix(&mirrored))
                 {
                     return Err(libc::EISDIR.into());
                 }
@@ -419,7 +425,7 @@ impl Filesystem for HostFs {
             return Err(libc::EISDIR.into());
         }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
-        if write_flags && !self.patterns.writable(&mirrored) {
+        if write_flags && !self.patterns.load().writable(&mirrored) {
             // `ro` paths (and anything below an empty or hidden pattern) are
             // never writable; the real file permissions are checked by the
             // host filesystem on the actual write.
@@ -464,10 +470,10 @@ impl Filesystem for HostFs {
         // Stateful IO: the opened host file is reused for every read/write
         // on this handle (released with it in `release`).
         self.inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .open_handle(inode);
-        let writable = self.patterns.writable(&mirrored);
-        let fh = match self.insert_handle(file, mirrored, append, writable) {
+        let fh = match self.insert_handle(file, mirrored, append) {
             Ok(fh) => fh,
             Err(e) => {
                 // AUDIT.md L13: the speculative `open_handle` count above
@@ -475,7 +481,8 @@ impl Filesystem for HostFs {
                 // or the nodeid leaks a permanent zombie entry after
                 // `forget`.
                 self.inodes
-                    .write().unwrap_or_else(|e| e.into_inner())
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
                     .close_handle(inode);
                 return Err(e.into());
             }
@@ -519,7 +526,7 @@ impl Filesystem for HostFs {
                     log_op_err(
                         "read-io",
                         &handle.path,
-                        Some(&self.patterns.redirect(&handle.path)),
+                        Some(&self.patterns.load().redirect(&handle.path)),
                         &e,
                     )
                     .await;
@@ -541,7 +548,7 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
-        if !self.patterns.exists(&mirrored) {
+        if !self.patterns.load().exists(&mirrored) {
             log_op_err(
                 "read",
                 &mirrored,
@@ -553,7 +560,7 @@ impl Filesystem for HostFs {
         }
         // An injected path is served from memory: slice the content at
         // the requested offset (nothing is read from the host).
-        if let Some(content) = self.patterns.is_inject(&mirrored) {
+        if let Some(content) = self.patterns.load().is_inject(&mirrored) {
             let bytes = content.as_bytes();
             let offset = offset.min(bytes.len() as u64) as usize;
             let end = (offset + size as usize).min(bytes.len());
@@ -561,7 +568,7 @@ impl Filesystem for HostFs {
         }
         // An empty path has no content: an empty file reads as empty (the
         // host file is never opened).
-        if self.patterns.is_empty(&mirrored) {
+        if self.patterns.load().is_empty(&mirrored) {
             return Ok(ReplyData::from(Bytes::new()));
         }
         // Stateless IO fallback: reopen the host file relative to the pinned
@@ -570,7 +577,7 @@ impl Filesystem for HostFs {
         // intermediate component is followed either).
         let mut file = match anchored::open_at(
             &self.root,
-            &self.patterns.redirect(&mirrored),
+            &self.patterns.load().redirect(&mirrored),
             libc::O_RDONLY,
             0,
         ) {
@@ -579,7 +586,7 @@ impl Filesystem for HostFs {
                 log_op_err(
                     "read",
                     &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
+                    Some(&self.patterns.load().redirect(&mirrored)),
                     &e,
                 )
                 .await;
@@ -594,7 +601,7 @@ impl Filesystem for HostFs {
                 log_op_err(
                     "read-io",
                     &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
+                    Some(&self.patterns.load().redirect(&mirrored)),
                     &e,
                 )
                 .await;
@@ -638,16 +645,18 @@ impl Filesystem for HostFs {
                 }
             },
         };
-        // A real handle caches the spec verdict (`writable`) from open time;
-        // the exists/inject/empty checks are skipped entirely on this path
-        // (they re-match every pattern per request). Injected paths are
-        // never writable and never get a real handle, so only the writable
-        // verdict matters here.
-        let writable = match &handle {
-            Some(h) => h.writable,
-            None => self.patterns.writable(&mirrored),
-        };
-        if handle.is_none() && !self.patterns.exists(&mirrored) {
+        // The spec verdict is re-checked on **every** write, for handles and
+        // stateless reopens alike: the pattern set can be swapped at
+        // runtime (see [`SharedPatterns::set`]), so an already-open handle
+        // must apply the *current* rules — tightening a mapping `rw` →
+        // `ro` must stop writes through the open handle too. (The
+        // open-time exists/inject/empty checks stay skipped for a real
+        // handle: `open`/`create` established them, and the `writable`
+        // match below already rejects injected and empty paths, which are
+        // never `rw`.)
+        let patterns = self.patterns.load();
+        let writable = patterns.writable(&mirrored);
+        if handle.is_none() && !patterns.exists(&mirrored) {
             log_op_err(
                 "write",
                 &mirrored,
@@ -663,7 +672,7 @@ impl Filesystem for HostFs {
             log_op_err(
                 "write",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&patterns.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
@@ -689,7 +698,7 @@ impl Filesystem for HostFs {
                     log_op_err(
                         "write-io",
                         &mirrored,
-                        Some(&self.patterns.redirect(&mirrored)),
+                        Some(&self.patterns.load().redirect(&mirrored)),
                         &e,
                     )
                     .await;
@@ -714,20 +723,20 @@ impl Filesystem for HostFs {
         if append {
             oflags |= libc::O_APPEND;
         }
-        let mut file =
-            match anchored::open_at(&self.root, &self.patterns.redirect(&mirrored), oflags, 0) {
-                Ok(f) => f,
-                Err(e) => {
-                    log_op_err(
-                        "write",
-                        &mirrored,
-                        Some(&self.patterns.redirect(&mirrored)),
-                        &e,
-                    )
-                    .await;
-                    return Err(e.into());
-                }
-            };
+        let mut file = match anchored::open_at(&self.root, &patterns.redirect(&mirrored), oflags, 0)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log_op_err(
+                    "write",
+                    &mirrored,
+                    Some(&self.patterns.load().redirect(&mirrored)),
+                    &e,
+                )
+                .await;
+                return Err(e.into());
+            }
+        };
         if !append {
             file.seek(SeekFrom::Start(offset))?;
         }
@@ -737,7 +746,7 @@ impl Filesystem for HostFs {
                 log_op_err(
                     "write-io",
                     &mirrored,
-                    Some(&self.patterns.redirect(&mirrored)),
+                    Some(&self.patterns.load().redirect(&mirrored)),
                     &e,
                 )
                 .await;
@@ -774,17 +783,17 @@ impl Filesystem for HostFs {
         // holds for a purely virtual ancestor of an injected (or empty)
         // path with no real counterpart: it is a virtual directory, and
         // there is nothing to open on the host.
-        if self.patterns.is_inject(&mirrored).is_some()
-            || (self.patterns.is_empty_prefix(&mirrored)
-                || self.patterns.is_inject_prefix(&mirrored))
-                && !self.real_exists(&self.patterns.redirect(&mirrored))
+        if self.patterns.load().is_inject(&mirrored).is_some()
+            || (self.patterns.load().is_empty_prefix(&mirrored)
+                || self.patterns.load().is_inject_prefix(&mirrored))
+                && !self.real_exists(&self.patterns.load().redirect(&mirrored))
         {
             return Ok(minimal_statfs());
         }
         let real = if is_root(mirrored.as_os_str()) {
             PathBuf::from("/")
         } else {
-            self.patterns.redirect(&mirrored)
+            self.patterns.load().redirect(&mirrored)
         };
         // O_PATH works on any file type (including directories) and
         // O_NOFOLLOW keeps symlinked final components from being followed —
@@ -816,13 +825,14 @@ impl Filesystem for HostFs {
     async fn opendir(&self, _req: Request, inode: Inode, _flags: u32) -> Result<ReplyOpen> {
         perf::fuse_op!("opendir");
         let mirrored = self.resolve(inode)?;
-        if !self.patterns.exists(&mirrored)
+        if !self.patterns.load().exists(&mirrored)
             || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored)
         {
             return Err(libc::ENOENT.into());
         }
         self.inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .open_handle(inode);
         Ok(ReplyOpen { fh: 0, flags: 0 })
     }
@@ -837,7 +847,7 @@ impl Filesystem for HostFs {
     {
         perf::fuse_op!("readdir");
         let mirrored = self.resolve(parent)?;
-        if !self.patterns.exists(&mirrored)
+        if !self.patterns.load().exists(&mirrored)
             || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored)
         {
             return Err(libc::ENOENT.into());
@@ -888,7 +898,7 @@ impl Filesystem for HostFs {
     > {
         perf::fuse_op!("readdirplus");
         let mirrored = self.resolve(parent)?;
-        if !self.patterns.exists(&mirrored)
+        if !self.patterns.load().exists(&mirrored)
             || !is_root(mirrored.as_os_str()) && !self.is_listable_dir(&mirrored)
         {
             return Err(libc::ENOENT.into());
@@ -940,7 +950,7 @@ impl Filesystem for HostFs {
     async fn access(&self, _req: Request, inode: Inode, mask: u32) -> Result<()> {
         perf::fuse_op!("access");
         let mirrored = self.resolve(inode)?;
-        if !self.patterns.exists(&mirrored) {
+        if !self.patterns.load().exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
         // Empty paths (and purely virtual ancestors) are unwritable by
@@ -963,7 +973,7 @@ impl Filesystem for HostFs {
         // is the spec's decision, read/traverse are inherent to the
         // synthetic root (it is always listable and navigable).
         if is_root(mirrored.as_os_str()) {
-            if mask & libc::W_OK as u32 != 0 && !self.patterns.writable(&mirrored) {
+            if mask & libc::W_OK as u32 != 0 && !self.patterns.load().writable(&mirrored) {
                 return Err(libc::EACCES.into());
             }
             return Ok(());
@@ -971,7 +981,7 @@ impl Filesystem for HostFs {
         // W_OK is answered by the spec: only `rw` paths may be written (the
         // real file permissions are checked when a write is attempted).
         let non_write = mask & !(libc::W_OK as u32);
-        if mask & libc::W_OK as u32 != 0 && !self.patterns.writable(&mirrored) {
+        if mask & libc::W_OK as u32 != 0 && !self.patterns.load().writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
         // The rest (R_OK, X_OK) is decided by the real filesystem, with the
@@ -979,7 +989,7 @@ impl Filesystem for HostFs {
         if non_write == 0 {
             return Ok(());
         }
-        let real = self.patterns.redirect(&mirrored);
+        let real = self.patterns.load().redirect(&mirrored);
         let anchored = anchored::anchor_parent(&self.root, &real).map_err(|e| {
             // ENOENT mapping preserved from the old cpath construction.
             if e.raw_os_error() == Some(libc::EINVAL) {
@@ -1022,17 +1032,17 @@ impl Filesystem for HostFs {
         if is_root(mirrored.as_os_str()) {
             return Err(libc::EACCES.into());
         }
-        if self.patterns.is_empty(&mirrored) {
+        if self.patterns.load().is_empty(&mirrored) {
             // Empty paths are virtual: nothing to change.
             return Err(libc::EACCES.into());
         }
-        if !self.patterns.exists(&mirrored) {
+        if !self.patterns.load().exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        if !self.patterns.writable(&mirrored) {
+        if !self.patterns.load().writable(&mirrored) {
             return Err(libc::EACCES.into());
         }
-        let real = self.patterns.redirect(&mirrored);
+        let real = self.patterns.load().redirect(&mirrored);
         // Anchor the parent once: every operation below is an `*at()`
         // syscall relative to the pinned parent descriptor, so no component
         // of the path can resolve through a host symlink (final-component
@@ -1171,11 +1181,11 @@ impl Filesystem for HostFs {
         perf::fuse_op!("mkdir");
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
-        if !self.patterns.writable(&mirrored) {
+        if !self.patterns.load().writable(&mirrored) {
             log_op_err(
                 "mkdir",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
@@ -1184,17 +1194,17 @@ impl Filesystem for HostFs {
         // Only a *real* entry at the target means EEXIST; a path merely
         // matched by a wildcard pattern may not exist yet. (Anchored:
         // no symlink is followed anywhere on the host path.)
-        if self.real_exists(&self.patterns.redirect(&mirrored)) {
+        if self.real_exists(&self.patterns.load().redirect(&mirrored)) {
             log_op_err(
                 "mkdir",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EEXIST),
             )
             .await;
             return Err(libc::EEXIST.into());
         }
-        let real = self.patterns.redirect(&mirrored);
+        let real = self.patterns.load().redirect(&mirrored);
         let anchored = anchored::anchor_parent(&self.root, &real).map_err(|e| {
             if e.raw_os_error() == Some(libc::EINVAL) {
                 return std::io::Error::from_raw_os_error(libc::ENOENT);
@@ -1217,16 +1227,22 @@ impl Filesystem for HostFs {
             log_op_err(
                 "mkdir",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&self.patterns.load().redirect(&mirrored)),
                 &e,
             )
             .await;
             return Err(fuse3::Errno::from(e));
         }
-        log_op_ok("mkdir", &mirrored, &self.patterns.redirect(&mirrored)).await;
+        log_op_ok(
+            "mkdir",
+            &mirrored,
+            &self.patterns.load().redirect(&mirrored),
+        )
+        .await;
         let inode = self
             .inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .get_or_insert(&mirrored, parent);
         let mut attr = self.attr(&mirrored)?;
         attr.ino = inode;
@@ -1241,11 +1257,11 @@ impl Filesystem for HostFs {
         perf::fuse_op!("unlink");
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
-        if self.patterns.is_empty(&mirrored) {
+        if self.patterns.load().is_empty(&mirrored) {
             // Empty paths are virtual mount points; they cannot be removed.
             return Err(libc::EACCES.into());
         }
-        if !self.patterns.exists(&mirrored) {
+        if !self.patterns.load().exists(&mirrored) {
             log_op_err(
                 "unlink",
                 &mirrored,
@@ -1255,43 +1271,52 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::ENOENT.into());
         }
-        if !self.patterns.writable(&mirrored) {
+        if !self.patterns.load().writable(&mirrored) {
             log_op_err(
                 "unlink",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
             return Err(libc::EACCES.into());
         }
-        let anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&mirrored))?;
+        let anchored =
+            anchored::anchor_parent(&self.root, &self.patterns.load().redirect(&mirrored))?;
         if unsafe { libc::unlinkat(anchored.dir().as_raw_fd(), anchored.name().as_ptr(), 0) } != 0 {
             let e = std::io::Error::last_os_error();
             log_op_err(
                 "unlink",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&self.patterns.load().redirect(&mirrored)),
                 &e,
             )
             .await;
             if e.kind() == std::io::ErrorKind::NotFound {
                 // A stale kernel dentry: drop the mapping.
                 self.inodes
-                    .write().unwrap_or_else(|e| e.into_inner())
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
                     .release_path(&mirrored);
             } else if e.raw_os_error() == Some(libc::EISDIR) {
                 // Unlinking a directory: the kernel keeps the dentry, so the
                 // name must stay resolvable.
                 self.inodes
-                    .write().unwrap_or_else(|e| e.into_inner())
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get_or_insert(&mirrored, parent);
             }
             return Err(e.into());
         }
-        log_op_ok("unlink", &mirrored, &self.patterns.redirect(&mirrored)).await;
+        log_op_ok(
+            "unlink",
+            &mirrored,
+            &self.patterns.load().redirect(&mirrored),
+        )
+        .await;
         self.inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .release_path(&mirrored);
         Ok(())
     }
@@ -1299,10 +1324,10 @@ impl Filesystem for HostFs {
         perf::fuse_op!("rmdir");
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
-        if self.patterns.is_empty(&mirrored) {
+        if self.patterns.load().is_empty(&mirrored) {
             return Err(libc::EACCES.into());
         }
-        if !self.patterns.exists(&mirrored) {
+        if !self.patterns.load().exists(&mirrored) {
             log_op_err(
                 "rmdir",
                 &mirrored,
@@ -1312,17 +1337,18 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::ENOENT.into());
         }
-        if !self.patterns.writable(&mirrored) {
+        if !self.patterns.load().writable(&mirrored) {
             log_op_err(
                 "rmdir",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
             return Err(libc::EACCES.into());
         }
-        let anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&mirrored))?;
+        let anchored =
+            anchored::anchor_parent(&self.root, &self.patterns.load().redirect(&mirrored))?;
         if unsafe {
             libc::unlinkat(
                 anchored.dir().as_raw_fd(),
@@ -1335,27 +1361,35 @@ impl Filesystem for HostFs {
             log_op_err(
                 "rmdir",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&self.patterns.load().redirect(&mirrored)),
                 &e,
             )
             .await;
             if e.kind() == std::io::ErrorKind::NotFound {
                 // A stale kernel dentry: drop the mapping.
                 self.inodes
-                    .write().unwrap_or_else(|e| e.into_inner())
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
                     .release_path(&mirrored);
             } else if e.raw_os_error() == Some(libc::ENOTDIR) {
                 // Rmdir of a non-directory: the kernel keeps the dentry, so
                 // the name must stay resolvable.
                 self.inodes
-                    .write().unwrap_or_else(|e| e.into_inner())
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get_or_insert(&mirrored, parent);
             }
             return Err(e.into());
         }
-        log_op_ok("rmdir", &mirrored, &self.patterns.redirect(&mirrored)).await;
+        log_op_ok(
+            "rmdir",
+            &mirrored,
+            &self.patterns.load().redirect(&mirrored),
+        )
+        .await;
         self.inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .release_path(&mirrored);
         Ok(())
     }
@@ -1373,10 +1407,10 @@ impl Filesystem for HostFs {
         let new_parent_path = self.resolve(parent)?;
         let old = origin_parent_path.join(origin_name);
         let new = new_parent_path.join(name);
-        if self.patterns.is_empty(&old) || self.patterns.is_empty(&new) {
+        if self.patterns.load().is_empty(&old) || self.patterns.load().is_empty(&new) {
             return Err(libc::EACCES.into());
         }
-        if !self.patterns.exists(&old) {
+        if !self.patterns.load().exists(&old) {
             log_op_err(
                 "rename",
                 &old,
@@ -1386,18 +1420,18 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::ENOENT.into());
         }
-        if !self.patterns.writable(&old) || !self.patterns.writable(&new) {
+        if !self.patterns.load().writable(&old) || !self.patterns.load().writable(&new) {
             log_op_err(
                 "rename",
                 &old,
-                Some(&self.patterns.redirect(&new)),
+                Some(&self.patterns.load().redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
             return Err(libc::EACCES.into());
         }
-        let old_real = self.patterns.redirect(&old);
-        let new_real = self.patterns.redirect(&new);
+        let old_real = self.patterns.load().redirect(&old);
+        let new_real = self.patterns.load().redirect(&new);
         // A *directory* rename carries every child from one pattern
         // context to another: a `hide` or `ro` rule that might apply to a
         // child of the source (or of the destination) must block the
@@ -1409,7 +1443,8 @@ impl Filesystem for HostFs {
         // planted there and carried back out with the same effect.
         let dir_rename = self.is_host_dir(&old_real) || self.is_host_dir(&new_real);
         if dir_rename
-            && (self.patterns.subtree_restricted(&old) || self.patterns.subtree_restricted(&new))
+            && (self.patterns.load().subtree_restricted(&old)
+                || self.patterns.load().subtree_restricted(&new))
         {
             log_op_err(
                 "rename",
@@ -1482,7 +1517,7 @@ impl Filesystem for HostFs {
         log_op_err(
             "symlink",
             &mirrored,
-            Some(&self.patterns.redirect(&mirrored)),
+            Some(&self.patterns.load().redirect(&mirrored)),
             &std::io::Error::from_raw_os_error(libc::EACCES),
         )
         .await;
@@ -1526,10 +1561,10 @@ impl Filesystem for HostFs {
         let new_parent_path = self.resolve(new_parent)?;
         let old = source_path;
         let new = new_parent_path.join(new_name);
-        if self.patterns.is_empty(&old) || self.patterns.is_empty(&new) {
+        if self.patterns.load().is_empty(&old) || self.patterns.load().is_empty(&new) {
             return Err(libc::EACCES.into());
         }
-        if !self.patterns.exists(&old) {
+        if !self.patterns.load().exists(&old) {
             log_op_err(
                 "link",
                 &old,
@@ -1542,21 +1577,21 @@ impl Filesystem for HostFs {
         // The source must be writable, too: a read-only source must not be
         // linked into a writable path (the write would follow the host
         // inode and bypass the source path's `ro` permission).
-        if !self.patterns.writable(&old) {
+        if !self.patterns.load().writable(&old) {
             log_op_err(
                 "link",
                 &old,
-                Some(&self.patterns.redirect(&old)),
+                Some(&self.patterns.load().redirect(&old)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
             return Err(libc::EACCES.into());
         }
-        if !self.patterns.writable(&new) {
+        if !self.patterns.load().writable(&new) {
             log_op_err(
                 "link",
                 &new,
-                Some(&self.patterns.redirect(&new)),
+                Some(&self.patterns.load().redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
@@ -1570,8 +1605,10 @@ impl Filesystem for HostFs {
         // a link source is re-created as an identical symlink instead). The
         // check and the syscall below run in one await-free block — on the
         // single-threaded runtime nothing can swap the entry in between.
-        let old_anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&old))?;
-        let new_anchored = anchored::anchor_parent(&self.root, &self.patterns.redirect(&new))?;
+        let old_anchored =
+            anchored::anchor_parent(&self.root, &self.patterns.load().redirect(&old))?;
+        let new_anchored =
+            anchored::anchor_parent(&self.root, &self.patterns.load().redirect(&new))?;
         let source_stat = anchored::stat_entry(&old_anchored)?;
         if Self::stat_is_symlink(&source_stat) {
             // AUDIT.md M5: linking a host symlink used to re-create it on
@@ -1586,7 +1623,7 @@ impl Filesystem for HostFs {
             log_op_err(
                 "link",
                 &old,
-                Some(&self.patterns.redirect(&old)),
+                Some(&self.patterns.load().redirect(&old)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
@@ -1604,13 +1641,14 @@ impl Filesystem for HostFs {
         };
         if link_result != 0 {
             let e = std::io::Error::last_os_error();
-            log_op_err("link", &new, Some(&self.patterns.redirect(&new)), &e).await;
+            log_op_err("link", &new, Some(&self.patterns.load().redirect(&new)), &e).await;
             return Err(e.into());
         }
-        log_op_ok("link", &new, &self.patterns.redirect(&new)).await;
+        log_op_ok("link", &new, &self.patterns.load().redirect(&new)).await;
         let inode = self
             .inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .get_or_insert(&new, new_parent);
         let mut attr = self.attr(&new)?;
         attr.ino = inode;
@@ -1632,12 +1670,12 @@ impl Filesystem for HostFs {
         perf::fuse_op!("create");
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
-        let writable = self.patterns.writable(&mirrored);
+        let writable = self.patterns.load().writable(&mirrored);
         if !writable {
             log_op_err(
                 "create",
                 &mirrored,
-                Some(&self.patterns.redirect(&mirrored)),
+                Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
             )
             .await;
@@ -1650,7 +1688,7 @@ impl Filesystem for HostFs {
         // existing-entry check runs on it (`fstatat(AT_SYMLINK_NOFOLLOW)`):
         // a host symlink standing at the target is never followed — neither
         // by the check nor by the open below.
-        let real = self.patterns.redirect(&mirrored);
+        let real = self.patterns.load().redirect(&mirrored);
         let anchored = anchored::anchor_parent(&self.root, &real)?;
         let excl = flags & libc::O_EXCL as u32 != 0;
         let truncate = flags & libc::O_TRUNC as u32 != 0;
@@ -1705,22 +1743,25 @@ impl Filesystem for HostFs {
             log_op_ok("create", &mirrored, &real).await;
             let inode = self
                 .inodes
-                .write().unwrap_or_else(|e| e.into_inner())
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
                 .get_or_insert(&mirrored, parent);
             self.inodes
-                .write().unwrap_or_else(|e| e.into_inner())
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
                 .open_handle(inode);
-            let fh = match self.insert_handle(file, mirrored, append, writable) {
-            Ok(fh) => fh,
-            Err(e) => {
-                // AUDIT.md L13: release the speculative `open_handle`
-                // count (see the `open` op for the rationale).
-                self.inodes
-                    .write().unwrap_or_else(|e| e.into_inner())
-                    .close_handle(inode);
-                return Err(e.into());
-            }
-        };
+            let fh = match self.insert_handle(file, mirrored, append) {
+                Ok(fh) => fh,
+                Err(e) => {
+                    // AUDIT.md L13: release the speculative `open_handle`
+                    // count (see the `open` op for the rationale).
+                    self.inodes
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .close_handle(inode);
+                    return Err(e.into());
+                }
+            };
             let mut attr = attr_from_metadata(&md);
             attr.ino = inode;
             return Ok(ReplyCreated {
@@ -1740,32 +1781,38 @@ impl Filesystem for HostFs {
         if append {
             oflags |= libc::O_APPEND;
         }
-        let file =
-            match anchored::open_at(&self.root, &real, oflags, (mode & SAFE_MODE) as libc::mode_t)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    log_op_err("create-new", &mirrored, Some(&real), &e).await;
-                    return Err(e.into());
-                }
-            };
+        let file = match anchored::open_at(
+            &self.root,
+            &real,
+            oflags,
+            (mode & SAFE_MODE) as libc::mode_t,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                log_op_err("create-new", &mirrored, Some(&real), &e).await;
+                return Err(e.into());
+            }
+        };
         let md = file.metadata()?;
         let mut attr = attr_from_metadata(&md);
         log_op_ok("create-new", &mirrored, &real).await;
         let inode = self
             .inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .get_or_insert(&mirrored, parent);
         self.inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .open_handle(inode);
-        let fh = match self.insert_handle(file, mirrored, append, writable) {
+        let fh = match self.insert_handle(file, mirrored, append) {
             Ok(fh) => fh,
             Err(e) => {
                 // AUDIT.md L13: release the speculative `open_handle`
                 // count (see the `open` op for the rationale).
                 self.inodes
-                    .write().unwrap_or_else(|e| e.into_inner())
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
                     .close_handle(inode);
                 return Err(e.into());
             }
@@ -1797,7 +1844,8 @@ impl Filesystem for HostFs {
         // is all that remains — IO is stateful but needs no flush.
         self.remove_handle(fh);
         self.inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .close_handle(inode);
         Err(libc::ENOSYS.into())
     }
@@ -1805,7 +1853,8 @@ impl Filesystem for HostFs {
     async fn releasedir(&self, _req: Request, inode: Inode, _fh: u64, _flags: u32) -> Result<()> {
         perf::fuse_op!("releasedir");
         self.inodes
-            .write().unwrap_or_else(|e| e.into_inner())
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
             .close_handle(inode);
         Ok(())
     }

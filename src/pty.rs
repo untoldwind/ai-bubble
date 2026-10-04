@@ -115,8 +115,13 @@ pub(crate) unsafe fn open() -> Pty {
         if libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) != 0 {
             die_with_error("Can't determine the pseudo-terminal slave path");
         }
-        let path = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
-        let slave = libc::open(path.as_ptr() as *const libc::c_char, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+        let path = std::ffi::CStr::from_ptr(buf.as_ptr())
+            .to_string_lossy()
+            .into_owned();
+        let slave = libc::open(
+            path.as_ptr() as *const libc::c_char,
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        );
         if slave < 0 {
             die_with_error(&format!("Can't open the pseudo-terminal slave {path}"));
         }
@@ -290,7 +295,13 @@ pub(crate) unsafe fn parent_relay(pty: &Pty, child_pid: libc::pid_t) {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = handler as usize;
         action.sa_flags = libc::SA_RESTART;
-        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP, libc::SIGWINCH] {
+        for sig in [
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGWINCH,
+        ] {
             if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
                 die_with_error("Can't install the terminal relay signal handler");
             }
@@ -321,7 +332,13 @@ pub(crate) unsafe fn parent_relay(pty: &Pty, child_pid: libc::pid_t) {
         // process (the script(1) behaviour), SIGWINCH returns to its
         // default-ignore, and the waitpid is interruptible again.
         let default_action: libc::sigaction = std::mem::zeroed();
-        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP, libc::SIGWINCH] {
+        for sig in [
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGWINCH,
+        ] {
             if libc::sigaction(sig, &default_action, std::ptr::null_mut()) != 0 {
                 die_with_error("Can't restore the default signal handlers");
             }
@@ -402,17 +419,30 @@ unsafe fn relay(pty: &Pty, pipe_r: i32) -> RelayEnd {
             let mut fds = [
                 libc::pollfd {
                     fd: 0,
-                    events: if stdin_open && to_master.is_empty() { libc::POLLIN } else { 0 },
+                    events: if stdin_open && to_master.is_empty() {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                     revents: 0,
                 },
                 libc::pollfd {
                     fd: 1,
-                    events: if !to_stdout.is_empty() { libc::POLLOUT } else { 0 },
+                    events: if !to_stdout.is_empty() {
+                        libc::POLLOUT
+                    } else {
+                        0
+                    },
                     revents: 0,
                 },
                 libc::pollfd {
                     fd: master,
-                    events: libc::POLLIN | if to_master.is_empty() { 0 } else { libc::POLLOUT },
+                    events: libc::POLLIN
+                        | if to_master.is_empty() {
+                            0
+                        } else {
+                            libc::POLLOUT
+                        },
                     revents: 0,
                 },
                 libc::pollfd {
@@ -434,7 +464,11 @@ unsafe fn relay(pty: &Pty, pipe_r: i32) -> RelayEnd {
             // reaps the command, and exits with 128+sig).
             if fds[3].revents & libc::POLLIN != 0 {
                 let mut sig_bytes = [0u8; 32];
-                let got = libc::read(pipe_r, sig_bytes.as_mut_ptr() as *mut libc::c_void, sig_bytes.len());
+                let got = libc::read(
+                    pipe_r,
+                    sig_bytes.as_mut_ptr() as *mut libc::c_void,
+                    sig_bytes.len(),
+                );
                 if got > 0 {
                     if sig_bytes[..got as usize].contains(&WINCH_BYTE) {
                         forward_winsize(master);

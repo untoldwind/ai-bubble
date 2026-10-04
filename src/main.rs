@@ -34,11 +34,12 @@ use clap::Parser;
 mod audit;
 mod cli;
 mod connlimit;
+mod control;
 mod hostfs;
 mod line;
 mod netns;
-mod pty;
 mod proxy;
+mod pty;
 mod sandbox;
 mod spec;
 mod waf;
@@ -75,12 +76,14 @@ fn main() {
             die_with_parent,
             new_session,
             require_spec,
+            control,
             command,
         }) => cli::run(
             cli.spec.as_deref(),
             die_with_parent,
             new_session,
             require_spec,
+            control,
             command,
         ),
 
@@ -88,6 +91,21 @@ fn main() {
 
         Some(Command::Init) => cli::init(cli.spec.as_deref()),
 
-        None => sandbox::die("No sub-command given; usage: ai-bubble run|ls|init ..."),
+        Some(Command::Control {
+            policy_get,
+            fs_set,
+            net_set,
+            spec_reload,
+        }) => cli::control(
+            cli.spec.as_deref(),
+            policy_get,
+            fs_set,
+            net_set,
+            spec_reload,
+        ),
+
+        Some(Command::Audit { follow, lines }) => cli::audit(cli.spec.as_deref(), follow, lines),
+
+        None => sandbox::die("No sub-command given; usage: ai-bubble run|ls|init|control ..."),
     }
 }

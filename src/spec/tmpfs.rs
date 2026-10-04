@@ -12,6 +12,15 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TmpfsPerms(pub u32);
 
+impl serde::Serialize for TmpfsPerms {
+    /// Serialized as the octal digit string the spec file spells (the
+    /// deserializer accepts a number or such a string; a bare number
+    /// would be re-read as *decimal* and change the mode).
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{:o}", self.0))
+    }
+}
+
 impl schemars::JsonSchema for TmpfsPerms {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "TmpfsPerms".into()

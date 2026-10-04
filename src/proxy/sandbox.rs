@@ -29,7 +29,11 @@ const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Concurrent connections are capped (see [`crate::connlimit`]); when
 /// the cap is reached the newly accepted connection is dropped instead
 /// of spawning a task for it.
-pub async fn serve_sandbox_proxy(listener: TcpListener, sock: PathBuf, allow: Vec<String>) {
+pub async fn serve_sandbox_proxy(
+    listener: TcpListener,
+    sock: PathBuf,
+    allow: super::allowlist::SharedAllow,
+) {
     let limit = ConnLimit::new();
     loop {
         match listener.accept().await {
@@ -40,7 +44,9 @@ pub async fn serve_sandbox_proxy(listener: TcpListener, sock: PathBuf, allow: Ve
                     continue;
                 };
                 let sock = sock.clone();
-                let allow = allow.clone();
+                // Snapshot at accept time: a runtime swap of the shared
+                // list affects new connections only.
+                let allow = super::allowlist::load(&allow);
                 tokio::spawn(async move {
                     // Hold the connection slot for the task's lifetime.
                     let _guard = guard;
@@ -196,7 +202,7 @@ mod tests {
         tokio::spawn(serve_sandbox_proxy(
             proxy,
             dir.join("sock"),
-            vec!["allowed.example:443".to_string()],
+            crate::proxy::allowlist::shared(vec!["allowed.example:443".to_string()]),
         ));
 
         let mut c = TcpStream::connect(proxy_addr).await.unwrap();
