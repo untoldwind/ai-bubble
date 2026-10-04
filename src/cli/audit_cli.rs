@@ -9,21 +9,40 @@
 //! it resolves the configured log path from the spec and tails the file,
 //! no protocol involved.
 
+use clap::Args;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use crate::{sandbox, spec};
 
-/// Runs the `audit` sub-command: without `--follow`, print the audit log
-/// path configured in the spec; with `--follow`, print the last `lines`
-/// lines and then keep printing every appended line until interrupted.
-pub fn audit(spec_dir: Option<&Path>, follow: bool, lines: usize) {
-    let path = audit_log_path(spec_dir);
-    if !follow {
-        println!("{}", path.display());
-        return;
+/// Show the audit log path (or follow the audit log with `--follow`).
+#[derive(Debug, Args, PartialEq)]
+pub struct AuditCommand {
+    /// Follow the log: print the last `--lines` lines, then keep
+    /// printing every appended line until interrupted (like
+    /// `tail -f`; rotation — the log moved to `<name>.1` — is
+    /// detected and followed).
+    #[arg(long = "follow")]
+    pub(crate) follow: bool,
+
+    /// How many trailing lines `--follow` prints before it starts
+    /// following.
+    #[arg(long = "lines", default_value_t = 10)]
+    pub(crate) lines: usize,
+}
+
+impl AuditCommand {
+    /// Runs the `audit` sub-command: without `--follow`, print the audit log
+    /// path configured in the spec; with `--follow`, print the last `lines`
+    /// lines and then keep printing every appended line until interrupted.
+    pub fn run(self, spec_dir: Option<&Path>) {
+        let path = audit_log_path(spec_dir);
+        if !self.follow {
+            println!("{}", path.display());
+            return;
+        }
+        follow_log(&path, self.lines);
     }
-    follow_log(&path, lines);
 }
 
 /// The audit log path from the spec (expanded, like every downstream

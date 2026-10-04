@@ -662,7 +662,8 @@ impl HostFs {
             // listing despite the entries being lookable).
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
-                    && (patterns.is_empty_prefix(mirrored) || patterns.is_inject_prefix(mirrored)) =>
+                    && (patterns.is_empty_prefix(mirrored)
+                        || patterns.is_inject_prefix(mirrored)) =>
             {
                 Ok(self.empty_dir_attr())
             }

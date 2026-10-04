@@ -2,10 +2,16 @@
 //! default) with a starter `spec.json` and the matching JSON Schema, so
 //! `ai-bubble run -- /bin/sh` works out of the box.
 
+use clap::Args;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::{sandbox, spec};
+
+/// Bootstrap the spec directory (`.ai-bubble`, or `--spec-dir DIR`) if
+/// it does not exist yet (see the CLI docs for the full behaviour).
+#[derive(Debug, Args, PartialEq, Default)]
+pub struct InitCommand;
 
 /// The starter spec written by `init`, as a template. The
 /// `{{PROJECT_DIR}}` placeholder is replaced with the JSON-quoted absolute
@@ -60,80 +66,83 @@ fn starter_spec(project_dir: &Path) -> String {
     STARTER_SPEC_TEMPLATE.replace("{{PROJECT_DIR}}", &quoted)
 }
 
-/// Bootstraps the spec directory `dir` (defaulting to `.ai-bubble` in the
-/// current directory) if it does not exist yet: creates it, writes a
-/// starter `spec.json` and the JSON Schema for it. An existing directory
-/// is left completely untouched.
-///
-/// When the current directory is a git repository, the spec directory's
-/// project-cache backing store (`.ai-bubble/cache/`) is added to its
-/// `.gitignore` (created if missing, extended otherwise) — cache content
-/// is disposable and stays out of version control. The spec directory
-/// *itself* is deliberately **not** ignored: `spec.json` is the security
-/// policy, so tampering by an agent must show up in `git status`; the
-/// spec directory should be committed (or at least reviewed).
-pub fn init(spec_dir: Option<&Path>) {
-    let dir = spec_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(spec::file::DEFAULT_SPEC_DIR));
+impl InitCommand {
+    /// Bootstraps the spec directory `dir` (defaulting to `.ai-bubble` in the
+    /// current directory) if it does not exist yet: creates it, writes a
+    /// starter `spec.json` and the JSON Schema for it. An existing directory
+    /// is left completely untouched.
+    ///
+    /// When the current directory is a git repository, the spec directory's
+    /// project-cache backing store (`.ai-bubble/cache/`) is added to its
+    /// `.gitignore` (created if missing, extended otherwise) — cache content
+    /// is disposable and stays out of version control. The spec directory
+    /// *itself* is deliberately **not** ignored: `spec.json` is the security
+    /// policy, so tampering by an agent must show up in `git status`; the
+    /// spec directory should be committed (or at least reviewed).
+    pub fn run(self, spec_dir: Option<&Path>) {
+        let dir = spec_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(spec::file::DEFAULT_SPEC_DIR));
 
-    if dir.exists() {
-        eprintln!("{} already exists; leaving it untouched", dir.display());
-        return;
-    }
+        if dir.exists() {
+            eprintln!("{} already exists; leaving it untouched", dir.display());
+            return;
+        }
 
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        sandbox::die(&format!("Can't create {}: {e}", dir.display()));
-    }
-    // AUDIT.md L10: the spec directory holds the env file with its
-    // secrets. `create_dir_all` honors the umask (typically 0755), so the
-    // mode is enforced explicitly after creation.
-    if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
-        sandbox::die(&format!("Can't set the mode of {}: {e}", dir.display()));
-    }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            sandbox::die(&format!("Can't create {}: {e}", dir.display()));
+        }
+        // AUDIT.md L10: the spec directory holds the env file with its
+        // secrets. `create_dir_all` honors the umask (typically 0755), so the
+        // mode is enforced explicitly after creation.
+        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+            sandbox::die(&format!("Can't set the mode of {}: {e}", dir.display()));
+        }
 
-    // The project directory is the current directory: that is what the
-    // starter spec maps and uses as `cwd`. Resolve it to an absolute path
-    // so the spec no longer depends on `${PWD}`.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_dir = absolute(&cwd);
+        // The project directory is the current directory: that is what the
+        // starter spec maps and uses as `cwd`. Resolve it to an absolute path
+        // so the spec no longer depends on `${PWD}`.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let project_dir = absolute(&cwd);
 
-    let spec_path = dir.join(spec::file::SPEC_FILE);
-    if let Err(e) = std::fs::write(&spec_path, starter_spec(&project_dir)) {
-        sandbox::die(&format!("Can't write {}: {e}", spec_path.display()));
-    }
-    if let Err(e) = std::fs::set_permissions(&spec_path, std::fs::Permissions::from_mode(0o600)) {
-        sandbox::die(&format!(
-            "Can't set the mode of {}: {e}",
-            spec_path.display()
-        ));
-    }
+        let spec_path = dir.join(spec::file::SPEC_FILE);
+        if let Err(e) = std::fs::write(&spec_path, starter_spec(&project_dir)) {
+            sandbox::die(&format!("Can't write {}: {e}", spec_path.display()));
+        }
+        if let Err(e) = std::fs::set_permissions(&spec_path, std::fs::Permissions::from_mode(0o600))
+        {
+            sandbox::die(&format!(
+                "Can't set the mode of {}: {e}",
+                spec_path.display()
+            ));
+        }
 
-    let schema_path = dir.join(SCHEMA_FILE);
-    if let Err(e) = std::fs::write(&schema_path, crate::spec_schema()) {
-        sandbox::die(&format!("Can't write {}: {e}", schema_path.display()));
-    }
+        let schema_path = dir.join(SCHEMA_FILE);
+        if let Err(e) = std::fs::write(&schema_path, crate::spec_schema()) {
+            sandbox::die(&format!("Can't write {}: {e}", schema_path.display()));
+        }
 
-    ensure_ignored(&project_dir, &absolute(&dir));
+        ensure_ignored(&project_dir, &absolute(&dir));
 
-    // The spec directory holds the entire security policy (`spec.json`,
-    // the env file with its secrets, the cache): it is a trusted,
-    // tamper-sensitive asset. Keep it in version control (minus the
-    // disposable cache backing store) so any tampering is visible in
-    // `git status` — an agent able to rewrite the policy can grant itself
-    // arbitrary access on the next run.
-    eprintln!(
-        "warning: {} holds the security policy (spec.json, env file, cache) and is a trusted, \
+        // The spec directory holds the entire security policy (`spec.json`,
+        // the env file with its secrets, the cache): it is a trusted,
+        // tamper-sensitive asset. Keep it in version control (minus the
+        // disposable cache backing store) so any tampering is visible in
+        // `git status` — an agent able to rewrite the policy can grant itself
+        // arbitrary access on the next run.
+        eprintln!(
+            "warning: {} holds the security policy (spec.json, env file, cache) and is a trusted, \
          tamper-sensitive asset — commit it (or review it) rather than gitignoring it",
-        dir.display()
-    );
+            dir.display()
+        );
 
-    eprintln!(
-        "Bootstrapped {} ({} + {})",
-        dir.display(),
-        spec::file::SPEC_FILE,
-        SCHEMA_FILE
-    );
+        eprintln!(
+            "Bootstrapped {} ({} + {})",
+            dir.display(),
+            spec::file::SPEC_FILE,
+            SCHEMA_FILE
+        );
+    }
 }
 
 /// Canonicalizes `path` if possible, so relative paths and symlinks are
@@ -242,7 +251,7 @@ mod tests {
     #[test]
     fn bootstraps_a_missing_directory() {
         let dir = TempDir::new("missing");
-        init(Some(&dir.0));
+        InitCommand.run(Some(&dir.0));
 
         let spec_path = dir.0.join("spec.json");
         assert!(spec_path.is_file());
@@ -261,7 +270,7 @@ mod tests {
         std::fs::create_dir_all(&dir.0).unwrap();
         std::fs::write(dir.0.join("spec.json"), r#"{"keep": true}"#).unwrap();
 
-        init(Some(&dir.0));
+        InitCommand.run(Some(&dir.0));
 
         assert_eq!(
             std::fs::read_to_string(dir.0.join("spec.json")).unwrap(),

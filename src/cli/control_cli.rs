@@ -8,55 +8,95 @@
 //! reply — see [`crate::control`] for the protocol and its security
 //! properties.
 
+use clap::Args;
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 
 use crate::{control, sandbox};
 
-/// Runs the `control` sub-command (see the CLI docs): at most one action
-/// is given; `policy_get` is the default when the others are absent.
-pub fn control(
-    spec_dir: Option<&Path>,
-    policy_get: bool,
-    fs_set: Option<String>,
-    net_set: Option<String>,
-    spec_reload: bool,
-) {
-    let given =
-        policy_get as u8 + fs_set.is_some() as u8 + net_set.is_some() as u8 + spec_reload as u8;
-    if given > 1 {
-        sandbox::die("give exactly one of --policy-get, --fs-set, --net-set, --spec-reload");
-    }
-    let command = if let Some(json) = fs_set {
-        let mappings: serde_json::Value = serde_json::from_str(&json)
-            .unwrap_or_else(|e| sandbox::die(&format!("--fs-set is not valid JSON: {e}")));
-        if !mappings.is_array() {
-            sandbox::die("--fs-set must be a JSON array of mapping objects");
-        }
-        serde_json::json!({ "cmd": "fs-set", "mappings": mappings })
-    } else if let Some(json) = net_set {
-        let allow: serde_json::Value = serde_json::from_str(&json)
-            .unwrap_or_else(|e| sandbox::die(&format!("--net-set is not valid JSON: {e}")));
-        if !allow.is_array() {
-            sandbox::die("--net-set must be a JSON array of strings");
-        }
-        serde_json::json!({ "cmd": "net-set", "allow": allow })
-    } else if spec_reload {
-        serde_json::json!({ "cmd": "spec-reload" })
-    } else {
-        serde_json::json!({ "cmd": "policy-get" })
-    };
+/// Talk to a running instance's control socket (see the CLI docs for the
+/// full behaviour and the four actions).
+#[derive(Debug, Args, PartialEq)]
+pub struct ControlCommand {
+    /// Print the current mutable policy as JSON: `{"fs":
+    /// {"mappings": [...]}}` and/or `{"net": {"allow": [...]}}`,
+    /// each `null` when not applicable to the run.
+    #[arg(long = "policy-get")]
+    pub(crate) policy_get: bool,
 
-    let spec_dir = spec_dir.unwrap_or(Path::new(crate::spec::file::DEFAULT_SPEC_DIR));
-    let reply = request(spec_dir, &command);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&reply).unwrap_or_else(|_| reply.to_string())
-    );
-    // A control failure is the client's exit status: scripts can branch
-    // on it instead of parsing the JSON.
-    if reply.get("ok").and_then(|ok| ok.as_bool()) != Some(true) {
-        std::process::exit(1);
+    /// Replace the whole hostfs pattern set. The argument is a JSON
+    /// array of mapping objects in the exact shape of the spec file's
+    /// `hostfs.mappings` (with `session-cache`/`project-cache`
+    /// disallowed — use their resolved `redirect-rw` form). The same
+    /// validation the spec loader applies runs before anything is
+    /// swapped.
+    #[arg(long = "fs-set", value_name = "JSON")]
+    pub(crate) fs_set: Option<String>,
+
+    /// Send `spec-reload`: re-read the spec file and apply the runtime-
+    /// mutable subset (hostfs mappings, net allow-list). Every changed
+    /// immutable section (seccomp, mounts, env, cwd, rlimits, audit
+    /// log, immutable net settings) is named in the error — nothing is
+    /// silently ignored. `kill -HUP` on the run's launcher does the
+    /// same.
+    #[arg(long = "spec-reload")]
+    pub(crate) spec_reload: bool,
+
+    /// Replace the whole network allow-list. The argument is a JSON
+    /// array of `host`/`host:port` strings (as in the spec's
+    /// `net.allow`, `*.` wildcards included). In proxy mode the
+    /// in-sandbox proxy receives the same list; if it rejects, the
+    /// change is reverted everywhere.
+    #[arg(long = "net-set", value_name = "JSON")]
+    pub(crate) net_set: Option<String>,
+}
+
+impl ControlCommand {
+    /// Runs the `control` sub-command (see the CLI docs): at most one action
+    /// is given; `policy_get` is the default when the others are absent.
+    pub fn run(self, spec_dir: Option<&Path>) {
+        let ControlCommand {
+            policy_get,
+            fs_set,
+            net_set,
+            spec_reload,
+        } = self;
+        let given =
+            policy_get as u8 + fs_set.is_some() as u8 + net_set.is_some() as u8 + spec_reload as u8;
+        if given > 1 {
+            sandbox::die("give exactly one of --policy-get, --fs-set, --net-set, --spec-reload");
+        }
+        let command = if let Some(json) = fs_set {
+            let mappings: serde_json::Value = serde_json::from_str(&json)
+                .unwrap_or_else(|e| sandbox::die(&format!("--fs-set is not valid JSON: {e}")));
+            if !mappings.is_array() {
+                sandbox::die("--fs-set must be a JSON array of mapping objects");
+            }
+            serde_json::json!({ "cmd": "fs-set", "mappings": mappings })
+        } else if let Some(json) = net_set {
+            let allow: serde_json::Value = serde_json::from_str(&json)
+                .unwrap_or_else(|e| sandbox::die(&format!("--net-set is not valid JSON: {e}")));
+            if !allow.is_array() {
+                sandbox::die("--net-set must be a JSON array of strings");
+            }
+            serde_json::json!({ "cmd": "net-set", "allow": allow })
+        } else if spec_reload {
+            serde_json::json!({ "cmd": "spec-reload" })
+        } else {
+            serde_json::json!({ "cmd": "policy-get" })
+        };
+
+        let spec_dir = spec_dir.unwrap_or(Path::new(crate::spec::file::DEFAULT_SPEC_DIR));
+        let reply = request(spec_dir, &command);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&reply).unwrap_or_else(|_| reply.to_string())
+        );
+        // A control failure is the client's exit status: scripts can branch
+        // on it instead of parsing the JSON.
+        if reply.get("ok").and_then(|ok| ok.as_bool()) != Some(true) {
+            std::process::exit(1);
+        }
     }
 }
 

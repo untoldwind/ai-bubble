@@ -72,39 +72,15 @@ fn main() {
     }
 
     match cli.command {
-        Some(Command::Run {
-            die_with_parent,
-            new_session,
-            require_spec,
-            control,
-            command,
-        }) => cli::run(
-            cli.spec.as_deref(),
-            die_with_parent,
-            new_session,
-            require_spec,
-            control,
-            command,
-        ),
+        Some(Command::Run(cmd)) => cmd.run(cli.spec.as_deref()),
 
-        Some(Command::Ls { path }) => cli::ls(cli.spec.as_deref(), &path),
+        Some(Command::Ls(cmd)) => cmd.run(cli.spec.as_deref()),
 
-        Some(Command::Init) => cli::init(cli.spec.as_deref()),
+        Some(Command::Init(cmd)) => cmd.run(cli.spec.as_deref()),
 
-        Some(Command::Control {
-            policy_get,
-            fs_set,
-            net_set,
-            spec_reload,
-        }) => cli::control(
-            cli.spec.as_deref(),
-            policy_get,
-            fs_set,
-            net_set,
-            spec_reload,
-        ),
+        Some(Command::Control(cmd)) => cmd.run(cli.spec.as_deref()),
 
-        Some(Command::Audit { follow, lines }) => cli::audit(cli.spec.as_deref(), follow, lines),
+        Some(Command::Audit(cmd)) => cmd.run(cli.spec.as_deref()),
 
         None => sandbox::die("No sub-command given; usage: ai-bubble run|ls|init|control ..."),
     }

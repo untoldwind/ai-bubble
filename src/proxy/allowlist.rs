@@ -59,9 +59,7 @@ fn split_host_port(s: &str) -> (&str, Option<&str>) {
         return (host, rest[end + 1..].strip_prefix(':'));
     }
     match s.rsplit_once(':') {
-        Some((h, p)) if !h.contains(':') && p.bytes().all(|b| b.is_ascii_digit()) => {
-            (h, Some(p))
-        }
+        Some((h, p)) if !h.contains(':') && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
         _ => (s, None),
     }
 }
@@ -73,8 +71,7 @@ fn split_host_port(s: &str) -> (&str, Option<&str>) {
 /// [`split_host_port`] (which must stay lenient for *targets*), a
 /// load-time entry with a colon must be unambiguous.
 pub(crate) fn validate_entry(entry: &str) -> Result<(), String> {
-    let invalid =
-        |why: &str| format!("invalid allow entry {entry:?}: {why}").to_string();
+    let invalid = |why: &str| format!("invalid allow entry {entry:?}: {why}").to_string();
     if entry.is_empty() {
         return Err(invalid("empty entry"));
     }

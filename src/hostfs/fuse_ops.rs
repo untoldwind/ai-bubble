@@ -785,20 +785,20 @@ impl Filesystem for HostFs {
         if append {
             oflags |= libc::O_APPEND;
         }
-        let mut file =
-            match anchored::open_at(&self.root, &patterns.redirect(&mirrored), oflags, 0) {
-                Ok(f) => f,
-                Err(e) => {
-                    log_op_err(
-                        "write",
-                        &mirrored,
-                        Some(&self.patterns.load().redirect(&mirrored)),
-                        &e,
-                    )
-                    .await;
-                    return Err(e.into());
-                }
-            };
+        let mut file = match anchored::open_at(&self.root, &patterns.redirect(&mirrored), oflags, 0)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log_op_err(
+                    "write",
+                    &mirrored,
+                    Some(&self.patterns.load().redirect(&mirrored)),
+                    &e,
+                )
+                .await;
+                return Err(e.into());
+            }
+        };
         // HF-2: never proxy host device nodes/sockets (authoritative
         // post-open check; see `open`).
         match file.metadata() {
@@ -1112,10 +1112,7 @@ impl Filesystem for HostFs {
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
-                    if !Self::stat_is_symlink(&anchored::lstat(
-                        &self.root,
-                        &real,
-                    )?) => {}
+                    if !Self::stat_is_symlink(&anchored::lstat(&self.root, &real)?) => {}
                 _ => return Err(err.into()),
             }
             let file = anchored::open_at(&self.root, &real, libc::O_RDONLY, 0)?;

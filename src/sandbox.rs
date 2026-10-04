@@ -75,7 +75,11 @@ pub(crate) fn mkdtemp_dir(template: &[u8], msg: &str) -> PathBuf {
     let path = if raw.is_null() {
         die_with_error(msg);
     } else {
-        PathBuf::from(unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned())
+        PathBuf::from(
+            unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     };
     drop(unsafe { CString::from_raw(raw as *mut libc::c_char) });
     path
@@ -228,10 +232,7 @@ fn ensure_file(newroot: &Path, dest: &Path) {
         }
         if fs::metadata(&full).is_err() {
             if let Err(e) = fs::File::create(&full) {
-                die_with_error(&format!(
-                    "Can't create bind target {}: {e}",
-                    dest.display()
-                ));
+                die_with_error(&format!("Can't create bind target {}: {e}", dest.display()));
             }
         }
     } else {
