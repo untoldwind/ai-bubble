@@ -82,6 +82,18 @@
 //! common distro default) the socket gate is best-effort only —
 //! host-network mode must be treated as full local IPC for untrusted
 //! commands; use proxy/waf mode instead.
+//!
+//! **Known limitation (the x32 ABI, same class).** The x32 ABI
+//! (`CONFIG_X86_X32`) has the same shape: syscalls issued through it are
+//! x86_64-table numbers ORed with `__X32_SYSCALL_BIT` (0x40000000) and
+//! the kernel still reports `AUDIT_ARCH_X86_64`, so the arch check
+//! passes and the filter's number-based rules simply do not recognize
+//! the offset numbers — a blocklist preset can be bypassed via x32 for
+//! syscalls whose plain numbers are denied. Like the ia32 case this is
+//! kernel attack-surface exposure (not an immediate breakout), with the
+//! same socket-gate caveat when the family gate relies on denying
+//! specific x86_64 numbers. Kernels without `CONFIG_X86_X32` are
+//! unaffected; the ABI is rare and disabled by default on most distros.
 
 use std::sync::LazyLock;
 
@@ -177,7 +189,15 @@ pub enum Preset {
     ///   normal command.
     /// - `pidfd_getfd`: steal a **file descriptor from another process**
     ///   in the sandbox (its files, sockets, pipes) purely by PID —
-    ///   lateral movement between the sandbox's processes.
+    ///   lateral movement between the sandbox's processes. (`ptrace` and
+    ///   `process_vm_readv/writev` are strictly stronger within the
+    ///   sandbox — they read and *write* another process's memory — but
+    ///   are deliberately not preset-blocked: they are legitimate tools
+    ///   (debuggers) that real workloads need, and everything they can
+    ///   reach is already confined inside the sandbox. `pidfd_getfd` has
+    ///   no such legitimate use and additionally reaches descriptors of
+    ///   processes outside any pid-ns-confined group, so it is denied
+    ///   while `ptrace` stays a command choice.)
     /// - `settimeofday`, `clock_settime`, `adjtimex`: the kernel clock is
     ///   shared with the host; changing it falsifies the host's time and
     ///   every audit/log timestamp on the machine.

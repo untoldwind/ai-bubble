@@ -51,6 +51,14 @@
         }
       ]
     },
+    "rlimits": {
+      "description": "Resource limits (setrlimit) for the sandboxed command, applied\nright before exec (see [`super::rlimits`]). They protect the host\nsupervisor from a resource-hungry or malicious command (fork\nbombs, fd exhaustion, memory hoarding — AUDIT.md M4); every\nfield is optional and absent fields mean the limit is not set.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Rlimits"
+        }
+      ]
+    },
     "seccomp": {
       "description": "The syscall filter installed for the sandboxed command right\nbefore exec (see [`super::seccomp`]). Either an `allow` or a\n`block` list of syscall names (mutually exclusive, enforced at\nparse time), a `preset` blocklist baseline (`block` adds to it,\n`allow` takes exceptions back out); without any of these no\nfilter is installed.",
       "allOf": [
@@ -63,7 +71,7 @@
   "additionalProperties": false,
   "definitions": {
     "AuditConfig": {
-      "description": "Audit logging configuration. Without a `log` path (the default) the\naudit subsystem is disabled entirely: no events are collected and no\nfile is written.",
+      "description": "Audit logging configuration. Without a `log` path (the default) the\naudit subsystem is disabled entirely: no events are collected and no\nfile is written.\n\nThe path is constrained at startup: it must live inside the spec\ndirectory (where it is created automatically) or point at a file that\nalready exists. This keeps the audit writers — which append with the\noperator's uid — from turning a spec-controlled path into an\narbitrary file create/append primitive on the host. The log is also\nsize-capped: when it outgrows 64 MiB it is rotated to `<name>.1`\nbefore the next batch is appended, so a sandbox spraying audit\nevents cannot fill the host disk.",
       "type": "object",
       "properties": {
         "log": {
@@ -109,6 +117,7 @@
         "mappings": {
           "description": "An ordered list of mappings. `ro`, `rw` and `hide` select paths\nwith glob patterns (`glob`: a string or a list of strings — the\nlist also spellable `globs`) of absolute host paths: matched paths\nare mirrored into the sandbox — read-only (`ro`) or read-write\n(`rw`, as far as the underlying host permissions allow) — or\nhidden (`hide`). `empty`, `tmpfs`, `session-cache` and\n`project-cache` likewise take one absolute path (`path`) or\nseveral (`paths`): `empty` exposes it empty (an empty, unwritable\ndirectory, or an empty file when the path matches a real file),\n`tmpfs` stacks a fresh tmpfs on it, and the cache mappings back it\nwith a session or project cache. Order matters — when a path\nmatches several mappings, the **last** matching mapping decides,\nand the mount/symlink ops the mappings generate are applied in\nmapping order. Matched paths appear at the same absolute path\ninside the sandbox (`/etc/passwd` → `/etc/passwd`); matched\ndirectories are mirrored recursively (or, when hidden, disappear\nwith their whole subtree). Nothing below an empty path is visible,\nand empty paths are shown even when a mirror mapping (or the real\nhost path) covers them. Missing or empty mappings expose nothing.",
           "type": "array",
+          "default": [],
           "items": {
             "$ref": "#/definitions/Mapping"
           }
@@ -522,18 +531,33 @@
       ]
     },
     "NetConfig": {
-      "description": "Network-related configuration for the sandboxed command: how it\nreaches the network.\n\n- `{\"mode\": \"host\"}` (the default): the command shares the host\n  network.\n- `{\"mode\": \"proxy\", \"allow\": [...]}`: the command runs in a fresh\n  network namespace and its connections are proxied from the host\n  side, gated by `allow`.\n- `{\"mode\": \"waf\", \"allow\": [...]}`: like proxy, but the sandbox\n  gets DNS/HTTP/HTTPS servers on 127.0.0.2 (ports 53, 80, 443) that\n  resolve allow-listed names to 127.0.0.2 and forward the traffic\n  from the host side over a Unix socket.\n\nHost mode carries `unix_sockets` (default `false`): whether the\ncommand may create Unix-domain sockets. Off by default — Unix\nsockets are a local-IPC escape hatch (abstract-namespace sockets\nlike the D-Bus system bus live in the *network namespace*, so\nhost-network mode without this default would expose them to an\nuntrusted command; see AUDIT.md M3). Proxy/waf modes run in a fresh\nnetwork namespace, where the abstract-socket exposure does not\nexist, and always allow Unix-domain sockets.",
+      "description": "Network-related configuration for the sandboxed command: how it\nreaches the network.\n\n- `{\"mode\": \"host\"}` (the default): the command shares the host\n  network.\n- `{\"mode\": \"proxy\", \"allow\": [...]}`: the command runs in a fresh\n  network namespace and its connections are proxied from the host\n  side, gated by `allow`.\n- `{\"mode\": \"waf\", \"allow\": [...]}`: like proxy, but the sandbox\n  gets DNS/HTTP/HTTPS servers on 127.0.0.2 (ports 53, 80, 443) that\n  resolve allow-listed names to 127.0.0.2 and forward the traffic\n  from the host side over a Unix socket.\n\nHost mode carries four opt-in flags (all default `false`) for the\naddress families that are *not* the point of host networking and are\ndangerous by default:\n\n- `unix_sockets` (default `false`): whether the command may create\n  Unix-domain sockets. Off by default — Unix sockets are a\n  local-IPC escape hatch (abstract-namespace sockets like the D-Bus\n  system bus live in the *network namespace*, so host-network mode\n  without this default would expose them to an untrusted command;\n  see AUDIT.md M3).\n- `netlink` (default `false`): whether the command may create\n  netlink sockets. Unprivileged `NETLINK_ROUTE`/`NETLINK_SOCK_DIAG`\n  hand the command the host's network state and unix-socket\n  inventory (reconnaissance), and the netlink surface is a\n  recurring kernel-CVE area (AUDIT.md M3).\n- `vsock` (default `false`): whether the command may create\n  AF_VSOCK sockets. Socket creation is unprivileged and vsock is\n  *not* network-namespaced, so on VMs the command could connect to\n  host/hypervisor vsock services (e.g. CID 2) (AUDIT.md M3).\n- `bluetooth` (default `false`): whether the command may create\n  AF_BLUETOOTH sockets (AUDIT.md M3).\n\nProxy/waf modes run in a fresh network namespace, where the\nabstract-socket exposure does not exist, and always allow all four\nfamilies.",
       "oneOf": [
         {
           "description": "Share the host network (the default).",
           "type": "object",
           "properties": {
+            "bluetooth": {
+              "description": "Whether the command may create AF_BLUETOOTH sockets. Off by\ndefault.",
+              "type": "boolean",
+              "default": false
+            },
             "mode": {
               "type": "string",
               "const": "host"
             },
+            "netlink": {
+              "description": "Whether the command may create netlink sockets. Off by\ndefault: unprivileged netlink exposes the host's network\nstate (reconnaissance) and is a recurring kernel-CVE area.",
+              "type": "boolean",
+              "default": false
+            },
             "unix_sockets": {
               "description": "Whether the command may create Unix-domain sockets (abstract\nor filesystem). Off by default: a seccomp filter denies\n`socket(AF_UNIX)`/`socketpair(AF_UNIX)` (and `io_uring_setup`,\nwhich can create sockets without `socket(2)`).",
+              "type": "boolean",
+              "default": false
+            },
+            "vsock": {
+              "description": "Whether the command may create AF_VSOCK sockets. Off by\ndefault: creation is unprivileged and vsock is not\nnetwork-namespaced, so on VMs the command could reach\nhost/hypervisor vsock services.",
               "type": "boolean",
               "default": false
             }
@@ -608,7 +632,7 @@
           "const": "none"
         },
         {
-          "description": "The **default** blocklist: the syscalls no sandboxed command\nshould ever need, each of them a known danger in a sandbox:\n\n- `init_module`, `finit_module`, `delete_module`: load and\n  unload **kernel code**. Loading a module is unconditional\n  compromise of the host — nothing inside a sandbox ever needs it.\n- `kexec_load`, `kexec_file_load`: replace the **running kernel**\n  with another image. The ultimate host takeover primitive.\n- `reboot`, `acct`: host-wide state changes. `reboot` is self-\n  explanatory; `acct` turns on kernel process accounting into an\n  arbitrary file (host disk fill, and a window into every other\n  process on the host).\n- `swapon`, `swapoff`: add/remove swap devices. Swapping host\n  memory into a sandbox-controlled file would leak other\n  processes' memory contents.\n- `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`,\n  `fsmount`, `fspick`, `mount_setattr`: the mount table is part\n  of the sandbox's isolation — rearranging it (detach what it is\n  confined to, re-mount something over a sensitive path, change\n  mount propagation to make host mounts appear) is a classic\n  escape vector. Both the classic interface (`mount`, `umount2`)\n  and the new mount-API syscalls are blocked. All sandbox mounts\n  are set up *before* the filter is installed, so the command\n  never needs these.\n- `userfaultfd`: user-space page-fault handling. Its fine-grained\n  control over fault timing is a staple of kernel use-after-free\n  exploits (it reliably widens race windows), and it is a\n  recognized sandbox-escape primitive.\n- `bpf`: load and inspect eBPF programs. In the presence of\n  historic verifier bugs this is kernel code execution; even\n  without capabilities it leaks kernel internals (KASLR) and\n  other-process data.\n- `perf_event_open`: the kernel profiling interface — historically\n  rich in CVEs, a well-known side-channel (and thus KASLR/secret-\n  leak) source, and a reconnaissance tool against other processes.\n- `io_uring_setup`, `io_uring_enter`, `io_uring_register`: a huge,\n  fast-moving, hard-to-audit kernel subsystem that bypasses the\n  usual syscall path; a disproportionate share of recent kernel\n  LPEs and sandbox escapes involve it (major sandboxes such as\n  Docker and gVisor block it by default for exactly this reason).\n  Nothing a sandboxed build/test command does needs it.\n- `open_by_handle_at`: open a file **by inode handle**, skipping\n  the path-based permission checks the FUSE mirror's policy is\n  built on. With `CAP_DAC_READ_SEARCH` this is the classic\n  \"Shocker\"-style escape; without it there is still no reason to\n  allow an interface designed to bypass path checks.\n- `unshare`, `setns`: create or join namespaces. The sandbox's\n  isolation rests on the namespaces it sets up before exec;\n  letting the command create new ones (unprivileged user/mount\n  namespaces) or join others mid-flight undermines exactly that.\n- `personality`: change the execution domain — notably disable\n  ASLR (`ADDR_NO_RANDOMIZE`) and select alternate syscall\n  behaviors, both useful for exploitation and none needed by a\n  normal command.\n- `pidfd_getfd`: steal a **file descriptor from another process**\n  in the sandbox (its files, sockets, pipes) purely by PID —\n  lateral movement between the sandbox's processes.\n- `settimeofday`, `clock_settime`, `adjtimex`: the kernel clock is\n  shared with the host; changing it falsifies the host's time and\n  every audit/log timestamp on the machine.\n- `add_key`, `keyctl`, `request_key`: the kernel **keyring**.\n  Keys persist in the host session across sandbox runs — both a\n  cross-sandbox data channel and a way to poison host lookups.\n- `quotactl`: manipulate disk quotas of host filesystems (and\n  learn host usage numbers the sandbox has no business seeing).\n- `lookup_dcookie`: a kernel-profiling cookie lookup that only\n  profiling daemons on the host ever need (and that requires\n  capabilities anyway).\n- `ioperm`, `iopl`, `modify_ldt` (x86_64 only): the legacy x86\n  privilege interfaces. `ioperm`/`iopl` grant user space direct\n  **I/O port access** — raw hardware I/O that by bypasses every\n  driver, with arbitrary host device access; `modify_ldt` writes\n  the local descriptor table, a classic exploit primitive (its\n  grant-on-use handling has shipped multiple kernel CVEs, and it\n  historically bypassed seccomp's own checks). The syscalls only\n  exist on x86_64, so they are blocked only there.",
+          "description": "The **default** blocklist: the syscalls no sandboxed command\nshould ever need, each of them a known danger in a sandbox:\n\n- `init_module`, `finit_module`, `delete_module`: load and\n  unload **kernel code**. Loading a module is unconditional\n  compromise of the host — nothing inside a sandbox ever needs it.\n- `kexec_load`, `kexec_file_load`: replace the **running kernel**\n  with another image. The ultimate host takeover primitive.\n- `reboot`, `acct`: host-wide state changes. `reboot` is self-\n  explanatory; `acct` turns on kernel process accounting into an\n  arbitrary file (host disk fill, and a window into every other\n  process on the host).\n- `swapon`, `swapoff`: add/remove swap devices. Swapping host\n  memory into a sandbox-controlled file would leak other\n  processes' memory contents.\n- `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`,\n  `fsmount`, `fspick`, `mount_setattr`: the mount table is part\n  of the sandbox's isolation — rearranging it (detach what it is\n  confined to, re-mount something over a sensitive path, change\n  mount propagation to make host mounts appear) is a classic\n  escape vector. Both the classic interface (`mount`, `umount2`)\n  and the new mount-API syscalls are blocked. All sandbox mounts\n  are set up *before* the filter is installed, so the command\n  never needs these.\n- `userfaultfd`: user-space page-fault handling. Its fine-grained\n  control over fault timing is a staple of kernel use-after-free\n  exploits (it reliably widens race windows), and it is a\n  recognized sandbox-escape primitive.\n- `bpf`: load and inspect eBPF programs. In the presence of\n  historic verifier bugs this is kernel code execution; even\n  without capabilities it leaks kernel internals (KASLR) and\n  other-process data.\n- `perf_event_open`: the kernel profiling interface — historically\n  rich in CVEs, a well-known side-channel (and thus KASLR/secret-\n  leak) source, and a reconnaissance tool against other processes.\n- `io_uring_setup`, `io_uring_enter`, `io_uring_register`: a huge,\n  fast-moving, hard-to-audit kernel subsystem that bypasses the\n  usual syscall path; a disproportionate share of recent kernel\n  LPEs and sandbox escapes involve it (major sandboxes such as\n  Docker and gVisor block it by default for exactly this reason).\n  Nothing a sandboxed build/test command does needs it.\n- `open_by_handle_at`: open a file **by inode handle**, skipping\n  the path-based permission checks the FUSE mirror's policy is\n  built on. With `CAP_DAC_READ_SEARCH` this is the classic\n  \"Shocker\"-style escape; without it there is still no reason to\n  allow an interface designed to bypass path checks.\n- `unshare`, `setns`: create or join namespaces. The sandbox's\n  isolation rests on the namespaces it sets up before exec;\n  letting the command create new ones (unprivileged user/mount\n  namespaces) or join others mid-flight undermines exactly that.\n- `personality`: change the execution domain — notably disable\n  ASLR (`ADDR_NO_RANDOMIZE`) and select alternate syscall\n  behaviors, both useful for exploitation and none needed by a\n  normal command.\n- `pidfd_getfd`: steal a **file descriptor from another process**\n  in the sandbox (its files, sockets, pipes) purely by PID —\n  lateral movement between the sandbox's processes. (`ptrace` and\n  `process_vm_readv/writev` are strictly stronger within the\n  sandbox — they read and *write* another process's memory — but\n  are deliberately not preset-blocked: they are legitimate tools\n  (debuggers) that real workloads need, and everything they can\n  reach is already confined inside the sandbox. `pidfd_getfd` has\n  no such legitimate use and additionally reaches descriptors of\n  processes outside any pid-ns-confined group, so it is denied\n  while `ptrace` stays a command choice.)\n- `settimeofday`, `clock_settime`, `adjtimex`: the kernel clock is\n  shared with the host; changing it falsifies the host's time and\n  every audit/log timestamp on the machine.\n- `add_key`, `keyctl`, `request_key`: the kernel **keyring**.\n  Keys persist in the host session across sandbox runs — both a\n  cross-sandbox data channel and a way to poison host lookups.\n- `quotactl`: manipulate disk quotas of host filesystems (and\n  learn host usage numbers the sandbox has no business seeing).\n- `lookup_dcookie`: a kernel-profiling cookie lookup that only\n  profiling daemons on the host ever need (and that requires\n  capabilities anyway).\n- `ioperm`, `iopl`, `modify_ldt` (x86_64 only): the legacy x86\n  privilege interfaces. `ioperm`/`iopl` grant user space direct\n  **I/O port access** — raw hardware I/O that by bypasses every\n  driver, with arbitrary host device access; `modify_ldt` writes\n  the local descriptor table, a classic exploit primitive (its\n  grant-on-use handling has shipped multiple kernel CVEs, and it\n  historically bypassed seccomp's own checks). The syscalls only\n  exist on x86_64, so they are blocked only there.",
           "type": "string",
           "const": "default"
         },
@@ -618,6 +642,43 @@
           "const": "strict"
         }
       ]
+    },
+    "Rlimits": {
+      "description": "The spec file's `rlimits` section (see the module docs).\n\nThe same type serves as the internal representation (no names to\nresolve, unlike the seccomp section), so [`super::internal`]\ncompiles this section down by value and [`crate::sandbox`] applies\nit with setrlimit right before exec (see `crate::sandbox::\napply_rlimits`).",
+      "type": "object",
+      "properties": {
+        "as": {
+          "description": "The maximum address-space size in bytes (soft == hard). Absent:\nnot set.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "nofile": {
+          "description": "The maximum number of open file descriptors (soft == hard).\nAbsent: not set.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "nproc": {
+          "description": "The maximum number of processes/threads for the command's real\nuid (soft == hard). Absent: not set.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     },
     "SeccompConfig": {
       "description": "The spec file's `seccomp` section (see the module docs).\n\nThe custom `Deserialize` impl (backed by a derived internal struct)\nenforces the mutual exclusions at parse time, so a contradictory\nspec is rejected like any other spec error: without a `preset`,\n`allow` and `block` are mutually exclusive; with one, a name in both\nis ambiguous and rejected.",

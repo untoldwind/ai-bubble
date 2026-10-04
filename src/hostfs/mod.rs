@@ -15,6 +15,19 @@
 //! hides it with its whole subtree); `**` matches across directory
 //! boundaries.
 //!
+//! Accepted residuals (documented, not fixed):
+//!
+//! * HF-10 — a host filesystem with case-folding enabled resolves
+//!   `/work/SECRET` to a hidden `secret` pattern: hide patterns are
+//!   case-sensitive, the *host* lookup is not. Rare (casefold is
+//!   typically off on Linux); keep hidden names case-correct.
+//! * HF-11 — a blocking FIFO read inside a mirrored directory stalls
+//!   the single-threaded FUSE runtime *including the 200 ms parent-
+//!   death watchdog* (see `anchored.rs`): a parked FIFO read plus
+//!   launcher death leaks the mount until the reader is killed. The
+//!   watchdog could run on its own thread; self-inflicted, hence
+//!   accepted.
+//!
 //! The patterns are *not* expanded at startup: the host tree is never
 //! crawled. Every FUSE operation matches the requested path against the
 //! compiled patterns on the fly (see `pattern.rs` for the supported glob
@@ -79,7 +92,6 @@ use std::io::SeekFrom;
 use std::io::{Read, Seek, Write};
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -156,7 +168,7 @@ async fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
 pub const SANDBOX_MOUNT_POINT: &str = "/mirrored";
 
 /// Whether the host filesystem should become the sandbox root instead of
-/// being mounted at `/host`. Set once before any fork.
+/// being mounted at [`SANDBOX_MOUNT_POINT`]. Set once before any fork.
 static ROOT_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Select hostfs-root mode. Must be called before any process forks.
@@ -250,10 +262,8 @@ impl SharedPatterns {
     }
 
     /// The current generation (bumped on every [`SharedPatterns::set`]).
-    // `generation`/`set` have no in-crate caller yet: their consumer is the
-    // runtime-control wiring (`control::fs_apply` swaps the set, and the
-    // readdir cache reads the generation), which lands with the control
-    // channel in the FUSE server's serve loop.
+    // No non-test caller yet: the runtime-control plane reads it in tests;
+    // the dir cache keys on it in `dir_names`.
     #[allow(dead_code)]
     pub fn generation(&self) -> u64 {
         self.inner.generation.load(Ordering::SeqCst)
@@ -262,8 +272,7 @@ impl SharedPatterns {
     /// Replace the whole pattern set with a newly compiled one. Returns
     /// the new generation. In-flight operations that already loaded the
     /// old set finish against it; every later request applies the new
-    /// rules. (See `generation` for why this is currently unused.)
-    #[allow(dead_code)]
+    /// rules. (Wired into the runtime-control plane: `control::fs_apply`.)
     pub fn set(&self, patterns: Patterns) -> u64 {
         let mut guard = self
             .inner
@@ -346,11 +355,6 @@ struct HostFs {
     /// on the handle, instead of being reopened per request. `fh = 0` stays
     /// stateless (injected files, directories); an unknown `fh` falls back
     /// to the stateless reopen, so a lost entry degrades instead of failing.
-    /// Open host files keyed by FUSE handle (`fh`): stateful IO — the file
-    /// is opened once (`open`/`create`) and reused for every `read`/`write`
-    /// on the handle, instead of being reopened per request. `fh = 0` stays
-    /// stateless (injected files, directories); an unknown `fh` falls back
-    /// to the stateless reopen, so a lost entry degrades instead of failing.
     handles: std::sync::Mutex<HashMap<u64, std::sync::Arc<OpenHandle>>>,
     /// Cached real-entry names per directory inode, validated by the
     /// directory's mtime/ctime (AUDIT.md L14: readdir must not re-list
@@ -388,15 +392,23 @@ const DIR_CACHE_MAX: usize = 64;
 /// rare and only costs lock wait, never a reopen.
 struct OpenHandle {
     file: std::sync::Mutex<std::fs::File>,
-    /// The mirrored path the handle was opened with, cached for the handle's
-    /// lifetime. `read`/`write` never look the inode up in the map on this
-    /// fast path; the path is only consulted for error logging.
+    /// The mirrored path the handle was opened with. Only consulted for
+    /// error logging (and as a fallback): the *policy* path is resolved
+    /// per request from `inode` below.
     path: PathBuf,
+    /// The nodeid the handle was opened on (HF-3): the write path
+    /// resolves the *current* mirrored path through the inode map on
+    /// every write, because the map is re-pointed on rename — checking
+    /// the open-time `path` instead would let writes through an
+    /// already-open handle escape a runtime policy tightening (open
+    /// `/work/f` rw, rename to `/vault/f`, make `/vault/**` ro: the
+    /// stale-path check would still see `/work/f` as rw).
+    inode: Inode,
     /// Opened with `O_APPEND`: every write goes to the end, offsets ignored.
     append: bool,
     // No cached `writable` verdict here: the pattern set can be swapped at
     // runtime, so the write path re-checks
-    // `patterns.writable(&self.path)` on every write — tightening a
+    // `patterns.writable(&current_path)` on every write — tightening a
     // mapping `rw` → `ro` must also stop writes through an already-open
     // handle. (The open-time exists/inject/empty checks stay skipped on
     // the handle's fast path: a real handle only comes from
@@ -441,6 +453,7 @@ impl HostFs {
         &self,
         file: std::fs::File,
         path: PathBuf,
+        inode: Inode,
         append: bool,
     ) -> std::io::Result<u64> {
         let mut table = self.handles.lock().unwrap_or_else(|e| e.into_inner());
@@ -453,6 +466,7 @@ impl HostFs {
             std::sync::Arc::new(OpenHandle {
                 file: std::sync::Mutex::new(file),
                 path,
+                inode,
                 append,
             }),
         );
@@ -502,11 +516,13 @@ impl HostFs {
     /// directories (mode 0555) — or injected files — that are never
     /// writable. It stats the real host filesystem (anchored, no-follow).
     fn virtual_only(&self, mirrored: &Path) -> bool {
-        self.patterns.load().is_empty(mirrored)
-            || self.patterns.load().is_inject(mirrored).is_some()
-            || (self.patterns.load().is_empty_prefix(mirrored)
-                || self.patterns.load().is_inject_prefix(mirrored))
-                && !self.real_exists(&self.patterns.load().redirect(mirrored))
+        // One snapshot for the whole decision (AUDIT.md cleanup): the
+        // callers used to load the shared pattern set up to five times.
+        let patterns = self.patterns.load();
+        patterns.is_empty(mirrored)
+            || patterns.is_inject(mirrored).is_some()
+            || (patterns.is_empty_prefix(mirrored) || patterns.is_inject_prefix(mirrored))
+                && !self.real_exists(&patterns.redirect(mirrored))
     }
 
     /// The attributes of an empty path (or a purely virtual ancestor of
@@ -582,6 +598,26 @@ impl HostFs {
         st.st_mode & libc::S_IFMT == libc::S_IFLNK
     }
 
+    /// Whether a raw `stat` result describes a host device node or
+    /// socket (HF-2): `open`/`create` must refuse these — the FUSE handle
+    /// would open the *host* device file with FS's credentials and proxy
+    /// read/write into the sandbox, giving the command exactly the
+    /// per-path host-device access the mirror exists to police. FIFOs
+    /// remain deliberately allowed.
+    fn stat_is_special(st: &libc::stat) -> bool {
+        let f = st.st_mode & libc::S_IFMT;
+        f == libc::S_IFCHR || f == libc::S_IFBLK || f == libc::S_IFSOCK
+    }
+
+    /// Like [`Self::stat_is_special`], for a post-open `fstat` result:
+    /// the authoritative check after the file is actually opened, so a
+    /// check-time/open-time swap cannot slip a device node through.
+    fn metadata_is_special(md: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        let ft = md.file_type();
+        ft.is_char_device() || ft.is_block_device() || ft.is_socket()
+    }
+
     /// Anchored `lstat` of a real host path: every component no-follow
     /// (the anchored `symlink_metadata`).
     fn real_lstat(&self, real: &Path) -> std::io::Result<libc::stat> {
@@ -596,22 +632,24 @@ impl HostFs {
     /// The `lstat`-style attribute of a mirrored path, or ENOENT. It
     /// stats the real host filesystem.
     fn attr(&self, mirrored: &Path) -> std::io::Result<FileAttr> {
+        // One snapshot for the whole decision (AUDIT.md cleanup).
+        let patterns = self.patterns.load();
         // Injected paths take precedence over everything: they are purely
         // virtual files served from memory.
-        if let Some(content) = self.patterns.load().is_inject(mirrored) {
+        if let Some(content) = patterns.is_inject(mirrored) {
             return Ok(self.inject_file_attr(content.as_bytes()));
         }
         // Empty paths take precedence: they appear even when the real host
         // path exists (with different attributes) — as an empty directory
         // when the path is (or would be) a directory, as an empty file
         // when it matches a real file.
-        if self.patterns.load().is_empty(mirrored) {
+        if patterns.is_empty(mirrored) {
             return match self.real_lstat(mirrored) {
                 Ok(st) if !Self::stat_is_dir(&st) => Ok(Self::empty_file_attr(&st)),
                 _ => Ok(self.empty_dir_attr()),
             };
         }
-        let real = self.patterns.load().redirect(mirrored);
+        let real = patterns.redirect(mirrored);
         match self.real_lstat(&real) {
             Ok(md) => Ok(attr_from_stat(&md)),
             // A purely virtual ancestor of an empty path has no real
@@ -624,8 +662,7 @@ impl HostFs {
             // listing despite the entries being lookable).
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
-                    && (self.patterns.load().is_empty_prefix(mirrored)
-                        || self.patterns.load().is_inject_prefix(mirrored)) =>
+                    && (patterns.is_empty_prefix(mirrored) || patterns.is_inject_prefix(mirrored)) =>
             {
                 Ok(self.empty_dir_attr())
             }

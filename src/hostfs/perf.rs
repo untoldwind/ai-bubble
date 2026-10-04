@@ -115,31 +115,40 @@ fn spawn_dump_thread() {
     std::thread::Builder::new()
         .name("fuse-stats-dump".into())
         .spawn(move || {
-            loop {
-                std::thread::sleep(DUMP_INTERVAL);
-                let elapsed = started.elapsed();
-                started = Instant::now();
-                // Swap out the interval's counters and fold them into the
-                // cumulative totals.
-                let Ok(mut stats) = stats().lock() else {
-                    continue;
-                };
-                let Some(path) = file() else { continue };
-                let interval = std::mem::take(&mut *stats);
-                drop(stats);
-                for (op, s) in &interval {
-                    cumulative.entry(op).or_default().add(s.real_ns, s.cpu_ns);
-                }
-                let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
+            let Some(path) = file() else { return };
+                // HF-4: open the stats file once, eagerly, through the
+                // audit log's safe open (`O_NOFOLLOW` — a sandbox-swapped
+                // symlink must never be followed; `O_NONBLOCK` — a
+                // swapped-in FIFO must not hang this thread; regular-file
+                // check), then keep writing to the descriptor. Re-opening
+                // the attacker-influenceable path every interval was the
+                // bug class already fixed for the fuselog writer.
+                let Ok(f) =
+                    crate::audit::writer::safe_open_read(std::path::Path::new(path), "FUSE stats file")
                 else {
-                    continue;
+                    return;
                 };
-                let _ = write_table(&mut f, "interval", elapsed, &interval);
-                let _ = write_table(&mut f, "cumulative", elapsed, &cumulative);
-            }
+                let f = std::sync::Mutex::new(f);
+                loop {
+                    std::thread::sleep(DUMP_INTERVAL);
+                    let elapsed = started.elapsed();
+                    started = Instant::now();
+                    // Swap out the interval's counters and fold them into the
+                    // cumulative totals.
+                    let Ok(mut stats) = stats().lock() else {
+                        continue;
+                    };
+                    let interval = std::mem::take(&mut *stats);
+                    drop(stats);
+                    for (op, s) in &interval {
+                        cumulative.entry(op).or_default().add(s.real_ns, s.cpu_ns);
+                    }
+                    let Ok(mut f) = f.lock() else {
+                        continue;
+                    };
+                    let _ = write_table(&mut *f, "interval", elapsed, &interval);
+                    let _ = write_table(&mut *f, "cumulative", elapsed, &cumulative);
+                }
         })
         .ok();
 }

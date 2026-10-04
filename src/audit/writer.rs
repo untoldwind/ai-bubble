@@ -15,7 +15,6 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -29,9 +28,10 @@ use super::Event;
 const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Start a write once a batch exceeds roughly this size: small enough
-/// for a single `write(2)` on an `O_APPEND` file (which concurrent
-/// writers from the forked ai-bubble processes rely on to keep lines
-/// intact), large enough to batch a burst.
+/// for a single `write(2)` on an `O_APPEND` file (keeping every line
+/// intact against concurrent writers — on the single-writer design the
+/// only concurrent writer left is another forked ai-bubble process on
+/// the non-isolated path), large enough to batch a burst.
 const MAX_BYTES: usize = 32 * 1024;
 
 /// The audit log path and its eagerly opened descriptor, configured
@@ -144,7 +144,13 @@ pub(crate) fn validate_path(path: &Path, spec_dir: &Path) -> Result<PathBuf, Str
         let name = resolved
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
-        if name.as_deref() == Some("spec.json") || name.as_deref() == Some(".env") {
+        if name.as_deref() == Some("spec.json")
+            || name.as_deref() == Some(".env")
+            // SP-6: appending audit events onto the control token would
+            // break its strict hex format and brick control
+            // authentication for the run.
+            || name.as_deref() == Some("control-token")
+        {
             return Err(format!(
                 "audit log {} would overwrite the spec's policy file; pick a \
                  different name inside the spec directory",
@@ -197,6 +203,25 @@ pub(crate) fn safe_open(path: &Path, what: &str) -> std::io::Result<std::fs::Fil
     Ok(file)
 }
 
+/// Like [`safe_open`], but for *reading* (SP-8): `O_NOFOLLOW` (a
+/// swapped-in symlink must never be followed), `O_NONBLOCK` (a
+/// swapped-in FIFO must not block the open) and a regular-file check —
+/// without O_CREAT and mode 0600, which only make sense for the writer.
+/// Used by `audit --follow`, which re-opens the log path repeatedly and
+/// would otherwise follow whatever stands at the path at that moment.
+pub(crate) fn safe_open_read(path: &Path, what: &str) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(format!(
+            "not a regular file (the {what} must be one)"
+        )));
+    }
+    Ok(file)
+}
+
 /// The writer: collect events from the channel and append them to the
 /// log file in batches. Runs as a tokio task for the process's
 /// lifetime; ends when all senders are gone (process exit).
@@ -227,22 +252,19 @@ pub(crate) async fn writer(path: PathBuf, file: std::fs::File, mut rx: mpsc::Rec
                 }
             },
             // A quiet stream must still reach the file in bounded time.
-            _ = tokio::time::sleep(FLUSH_INTERVAL), if !batch.is_empty() => {
+            _ = tokio::time::sleep(super::FLUSH_INTERVAL), if !batch.is_empty() => {
                 flush(&path, &file, std::mem::take(&mut batch)).await;
             }
         }
     }
 }
 
-/// Flush at least this often, so a quiet stream still reaches the file
-/// in bounded time.
-const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
-
 /// Serialize a batch to JSON lines and append it to the file, on the
 /// blocking pool. The batch is written in chunks of at most
 /// [`MAX_BYTES`]: every chunk is one `write(2)` on the `O_APPEND` file,
 /// which concurrent writers (the other forked ai-bubble processes)
-/// cannot interleave into.
+/// cannot interleave into. (The interval between flushes is the shared
+/// [`super::FLUSH_INTERVAL`].)
 ///
 /// Before the batch is written, the file size is checked against
 /// [`MAX_LOG_BYTES`]: an oversized log is rotated to `<name>.1` first,
@@ -268,7 +290,12 @@ async fn flush(path: &Path, file: &Arc<Mutex<std::fs::File>>, batch: Vec<Event>)
     let file = file.clone();
     let path = path.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        let mut file = file.lock().unwrap();
+        // SP-11: `unwrap()` here is poisonable — a panic inside a flush
+        // poisons the mutex and every later flush would panic again,
+        // killing the launcher mid-run. The guarded data is a plain
+        // `File` with no cross-call invariant, so recovering from a
+        // poisoned lock is safe.
+        let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
         // Size cap: rotate before this batch pushes the log further past
         // it. The rename keeps the (still open) old file as the backup.
         if let Ok(meta) = file.metadata()
@@ -288,8 +315,12 @@ async fn flush(path: &Path, file: &Arc<Mutex<std::fs::File>>, batch: Vec<Event>)
         }
     })
     .await;
+    // SP-11: a panic in the blocking-pool flush no longer kills the whole
+    // launcher (`die()`); the writer keeps running and the batch is
+    // dropped — losing audit events is reported, not fatal (the log is
+    // best effort, like every other write error here).
     if result.is_err() {
-        crate::sandbox::die("The audit writer panicked while writing the log");
+        eprintln!("warning: the audit writer's flush task panicked; continuing without that batch");
     }
 }
 
@@ -308,6 +339,29 @@ pub(crate) fn rotate(path: &Path, file: &mut std::fs::File) {
         // A path without a file name component cannot be rotated.
         None => return,
     };
+    // SP-7: on the two-writer non-isolated path (the launcher *and* FS each
+    // run a file writer) two rotations can race: A renames the real log
+    // (full history) to `<name>.1` and creates a fresh log; B then
+    // renames the *fresh* log over `<name>.1` — replacing the real
+    // history with a near-empty file. Detect the race before renaming:
+    // when the descriptor we hold no longer refers to the file at the
+    // path, another writer has already rotated this generation away, so
+    // we must not touch the backup — re-open the canonical path instead
+    // (our old fd keeps the backup alive either way).
+    let fd_id = {
+        use std::os::unix::fs::MetadataExt as _;
+        file.metadata().ok().map(|m| (m.dev(), m.ino()))
+    };
+    let path_id = {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    };
+    if fd_id.is_some() && path_id != fd_id {
+        if let Ok(reopened) = safe_open(path, "audit log") {
+            *file = reopened;
+        }
+        return;
+    }
     // `rename` atomically replaces an earlier `<name>.1`. If it fails
     // (e.g. a concurrent rotation by one of the other forked ai-bubble
     // processes won the race), fall through: the fresh open below either

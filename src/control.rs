@@ -363,6 +363,18 @@ pub fn cleanup() {
     if !ACTIVE.load(Ordering::Relaxed) {
         return;
     }
+    // NET-3: only the process that still *holds the control listener* may
+    // remove the token file. The atexit hook registered by `start` is
+    // inherited by fork children, and `std::process::exit` (every `die()`
+    // path) runs atexit handlers — without this gate, a mid-run `die()`
+    // in P or FS (e.g. a frontend bind failure) would delete
+    // `<spec-dir>/run/control-token` while A is still serving, silently
+    // killing runtime control for the rest of the run. The child's
+    // `close_inherited_listener` already reset the fd to -1; A keeps its
+    // own copy and still cleans up.
+    if LISTENER_FD.load(Ordering::Relaxed) < 0 {
+        return;
+    }
     ACTIVE.store(false, Ordering::Relaxed);
     if let Some(server) = SERVER.get() {
         let _ = std::fs::remove_file(&server.token_path);
@@ -383,6 +395,9 @@ pub fn close_inherited_listener() {
     if fd >= 0 {
         unsafe { libc::close(fd) };
     }
+    // NET-3: see `cleanup` — the child no longer holds the listener, so
+    // its inherited atexit hook becomes a no-op (the token file stays;
+    // the launcher's own hook removes it when the run ends).
 }
 
 /// Hand `A`'s authoritative allow-list to the control plane. Called by
@@ -537,10 +552,25 @@ pub async fn serve(replies: Replies) {
     *NET_REPLIES.lock().unwrap_or_else(|e| e.into_inner()) = replies.net;
 
     let token = server.token;
+    // NET-2: every other listener caps its connections (see
+    // `crate::connlimit`); the control listener must too. Without a cap,
+    // the sandboxed command in host-network mode (with `unix_sockets`)
+    // can compute the deterministic abstract socket name and open
+    // hundreds of token-less connections — each holding an fd for up to
+    // TOKEN_TIMEOUT — exhausting A's fds. A is also the network
+    // connector, so this is a full network DoS of the run; the listener
+    // is likewise exposed to any same-uid host process.
+    let limit = crate::connlimit::ConnLimit::new();
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(handle_connection(stream, token));
+                let Some(guard) = limit.try_acquire() else {
+                    continue; // at capacity: drop the connection
+                };
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    handle_connection(stream, token).await;
+                });
             }
             Err(_) => return,
         }
@@ -741,7 +771,22 @@ async fn fs_apply_list(mappings: &[Value]) -> Result<(), String> {
         Err(e) => return Err(format!("invalid mapping: {e}")),
     };
     crate::spec::hostfs::patterns_from_mappings(&parsed)?;
-    let owned = mappings.to_vec();
+    // Apply the spec-directory protection invariants (SP-1): reject
+    // bind/redirect sources covering the spec directory and re-append the
+    // auto-hide mapping, exactly like the spec loader does — otherwise a
+    // token holder could re-open spec.json, the env file (secrets) and
+    // the control token, or silently drop the auto-hide pattern with a
+    // hand-written full-replacement list.
+    let spec_dir = SPEC_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or("no spec directory recorded for this run")?;
+    let parsed = crate::spec::file::Spec::control_plane_mapping_list(parsed, &spec_dir)?;
+    let owned: Vec<Value> = parsed
+        .iter()
+        .map(|m| serde_json::to_value(m).expect("mapping serializes"))
+        .collect();
     let _gate = UPD_GATE.lock().await;
     match push_upd(serde_json::json!({ "fs": { "mappings": owned } }), Role::Fs).await {
         Ok(()) => {
@@ -799,6 +844,11 @@ fn allow_entries(allow: &[Value]) -> Result<Vec<String>, String> {
         if entry.is_empty() || entry.len() > 253 || !entry.bytes().all(|b| b.is_ascii_graphic()) {
             return Err(format!("invalid allow-list entry {entry:?}"));
         }
+        // NET-6: reject dead entries at load — a port suffix that does
+        // not parse can never match, and the spec parse does no
+        // validation otherwise (the control plane validating what the
+        // spec file accepts would be inconsistent).
+        crate::proxy::allowlist::validate_entry(entry)?;
         list.push(entry.to_string());
     }
     Ok(list)
@@ -945,7 +995,7 @@ async fn spec_reload_inner() -> Result<(), String> {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     let mut spec = crate::spec::Spec::try_load(Some(spec_dir.as_path()))?;
-    crate::cli::preprocess_spec(&mut spec, spec_dir.as_path(), session_cache.as_deref());
+    crate::cli::preprocess_spec(&mut spec, spec_dir.as_path(), session_cache.as_deref())?;
     let fresh = crate::spec::internal::SandboxConfig::try_compile(&spec)?;
 
     let changed = immutable_changes(&running, &fresh);
@@ -1813,7 +1863,7 @@ mod tests {
 
         // The run-time baseline, exactly like cli::run builds it.
         let mut spec = crate::spec::Spec::try_load(Some(&spec_dir)).unwrap();
-        crate::cli::preprocess_spec(&mut spec, &spec_dir, None);
+        crate::cli::preprocess_spec(&mut spec, &spec_dir, None).unwrap();
         let config = crate::spec::internal::SandboxConfig::compile(&spec);
         let mappings = serde_json::to_value(&spec.hostfs.mappings)
             .unwrap()

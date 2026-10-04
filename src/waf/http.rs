@@ -140,6 +140,25 @@ impl Proxy {
         // elsewhere via the original `Host`.
         parts.headers.insert(hyper::header::HOST, host);
 
+        // NET-7: strip hop-by-hop headers (RFC 7230 §6.1) — they belong
+        // to *this* connection, not to the forwarded request, and
+        // `Proxy-Authorization` in particular must never be relayed to
+        // the upstream. CONNECT/Upgrade requests are not supported by
+        // this module (test-only plain-HTTP frontend) and fail above.
+        for header in [
+            "proxy-authorization",
+            "proxy-authenticate",
+            "proxy-connection",
+            "connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "keep-alive",
+            "upgrade",
+        ] {
+            parts.headers.remove(header);
+        }
+
         let (mut sender, conn) =
             match hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await {
                 Ok(conn) => conn,

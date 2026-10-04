@@ -985,7 +985,7 @@ fn open_handles_are_capped() {
                 "f0".to_string()
             });
             match anchored::open_at(&f.root, &real, libc::O_RDONLY, 0) {
-                Ok(file) => match f.insert_handle(file, real.clone(), false) {
+                Ok(file) => match f.insert_handle(file, real.clone(), 1, false) {
                     Ok(fh) => fhs.push(fh),
                     Err(e) => {
                         assert_eq!(i, HostFs::MAX_HANDLES, "ENFILE must come at the cap");
@@ -1000,7 +1000,7 @@ fn open_handles_are_capped() {
             f.remove_handle(fh);
         }
         let file = anchored::open_at(&f.root, &base.join("f0"), libc::O_RDONLY, 0).unwrap();
-        assert!(f.insert_handle(file, base.join("f0"), false).is_ok());
+        assert!(f.insert_handle(file, base.join("f0"), 2, false).is_ok());
     });
 
     std::fs::remove_dir_all(&base).unwrap();

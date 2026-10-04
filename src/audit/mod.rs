@@ -92,14 +92,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Sender};
 
 // The public API, unchanged for every caller outside this directory:
-// `crate::audit::<name>` keeps working exactly as before. Some entries
-// are part of the API surface (documented callers) without in-crate
-// call sites, hence the allow.
+// `crate::audit::<name>` keeps working exactly as before.
 pub(crate) use ipc::{FRAME_CAP, UpdReply, channel_reader, reply_writer};
-#[allow(unused_imports)]
 pub use ipc::{
-    PeerRole, add_peer, init_channel_sink, ipc_channel_wanted, ipc_enabled, peer_writer,
-    set_channel, set_ipc_enabled, shutdown_peers, spawn_hub,
+    PeerRole, add_peer, init_channel_sink, ipc_channel_wanted, peer_writer, set_channel,
+    set_ipc_enabled, shutdown_peers, spawn_hub,
 };
 pub(crate) use ipc::{close_inherited, drop_log_fd};
 pub use writer::configure;
@@ -150,11 +147,7 @@ pub async fn record(
     result: Option<&str>,
     detail: Option<String>,
 ) {
-    let Some(sender) = SENDER
-        .get_or_init(setup)
-        .as_ref()
-        .and_then(|cell| cell.tx.lock().unwrap().clone())
-    else {
+    let Some(sender) = queue_sender() else {
         return;
     };
     // A closed channel can only mean the writer task is gone (it dies
@@ -165,10 +158,10 @@ pub async fn record(
             // launcher's hub) forwards the frame verbatim.
             ts: now_micros(),
             pid: std::process::id(),
-            source: source.to_string(),
-            op: op.to_string(),
-            path: path.map(|p| p.to_string()),
-            result: result.map(|r| r.to_string()),
+            source: fit_field(source),
+            op: fit_field(op),
+            path: path.map(fit_field),
+            result: result.map(fit_field),
             detail: detail.map(fit_detail),
         })
         .await;
@@ -223,6 +216,29 @@ fn fit_detail(mut detail: String) -> String {
     }
     detail.push_str(TRUNCATED);
     detail
+}
+
+/// The per-field cap for `source`/`op`/`path`/`result` (SP-9): like
+/// `detail`, these arrive from code paths that could in principle carry
+/// very long strings (a path with thousands of components), and an
+/// over-cap frame would be treated as malformed by the hub readers and
+/// kill that child's whole audit channel. Capped with the same
+/// truncation discipline as `detail`.
+const MAX_FIELD: usize = 4096;
+
+/// Truncate a `source`/`op`/`path`/`result` field to [`MAX_FIELD`] bytes
+/// at a UTF-8 character boundary.
+fn fit_field(s: &str) -> String {
+    if s.len() <= MAX_FIELD {
+        return s.to_string();
+    }
+    let mut cut = MAX_FIELD;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = s[..cut].to_string();
+    out.push_str(TRUNCATED);
+    out
 }
 
 /// A sender into this process's event queue, spawning the queue (and
@@ -331,8 +347,19 @@ pub async fn drain() {
 /// audit channels (the frame *is* the line: the launcher's hub
 /// deserializes and re-serializes it, so there is one code path and no
 /// format drift). `ts`/`pid` are stamped by the emitting process at
-/// `record` time and forwarded verbatim by relays.
+/// `record` time and forwarded verbatim by relays. `source` is
+/// cross-checked by the launcher's hub against the channel's peer role
+/// (SP-2): a child cannot claim another component's source (e.g. a
+/// compromised FS emitting `source: "control"` with the launcher's pid).
 #[derive(Serialize, Deserialize)]
+// Unknown fields are rejected so a frame that is an event *plus* a
+// control-reply key (`"ack"`) cannot be diverted to the reply channel by
+// the hub's demultiplexer — an audit-suppression primitive for a
+// compromised child (SP-2). With this, such a frame fails the event
+// parse; the reply parse (which now refuses frames carrying event
+// fields) fails too, so the reader treats it as malformed and closes the
+// offending channel — fail-closed.
+#[serde(deny_unknown_fields)]
 pub(crate) struct Event {
     ts: u64,
     pid: u32,
@@ -764,6 +791,7 @@ mod tests {
         let (reply_tx, _reply_rx) = tokio::sync::mpsc::channel::<UpdReply>(8);
         let hub = tokio::spawn(ipc::hub_reader(
             tokio::net::UnixStream::from_std(hub_stream).unwrap(),
+            ipc::PeerRole::HostFs,
             Some(file_tx.clone()),
             reply_tx,
         ));
@@ -825,6 +853,7 @@ mod tests {
         let (reply_tx, _reply_rx) = tokio::sync::mpsc::channel::<UpdReply>(8);
         let reader = tokio::spawn(ipc::hub_reader(
             tokio::net::UnixStream::from_std(b).unwrap(),
+            ipc::PeerRole::HostFs,
             Some(file_tx),
             reply_tx,
         ));
@@ -862,5 +891,103 @@ mod tests {
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
         assert_eq!(ret, 0, "mkfifo failed");
+    }
+
+    /// SP-2: a child cannot forge another component's source. An event
+    /// claiming `source: "control"` on the FS channel is stamped back to
+    /// the channel's trusted label, with the claimed value preserved in
+    /// `detail`.
+    #[tokio::test]
+    async fn hub_reader_overrides_a_forged_source() {
+        let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _ = a.set_nonblocking(true);
+        let _ = b.set_nonblocking(true);
+        let (file_tx, mut file_rx) = mpsc::channel::<Event>(CAPACITY);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::channel::<UpdReply>(8);
+        let reader = tokio::spawn(ipc::hub_reader(
+            tokio::net::UnixStream::from_std(b).unwrap(),
+            ipc::PeerRole::HostFs,
+            Some(file_tx),
+            reply_tx,
+        ));
+        let event = Event {
+            ts: 7,
+            pid: 8,
+            source: "control".into(),
+            op: "op".into(),
+            path: None,
+            result: None,
+            detail: None,
+        };
+        a.write_all(format!("{}\n", event.to_line()).as_bytes())
+            .unwrap();
+        a.flush().unwrap();
+        let forwarded = file_rx.recv().await.unwrap();
+        assert_eq!(forwarded.source, "hostfs");
+        let detail = forwarded.detail.unwrap();
+        assert!(detail.contains("forged source"), "{detail}");
+        // A legit source passes through unchanged.
+        let mut event = event;
+        event.source = "hostfs".into();
+        event.ts = 9;
+        a.write_all(format!("{}\n", event.to_line()).as_bytes())
+            .unwrap();
+        a.flush().unwrap();
+        let forwarded = file_rx.recv().await.unwrap();
+        assert_eq!(forwarded.source, "hostfs");
+        assert!(forwarded.detail.is_none());
+        drop(a);
+        tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("reader must end at EOF")
+            .unwrap();
+    }
+
+    /// SP-2: a frame that is a valid event *plus* a control-reply key
+    /// (`"ack": true`) must not be diverted to the reply channel and
+    /// silently dropped from the log. `Event` rejects unknown fields and
+    /// the reply parse refuses frames carrying event fields, so such a
+    /// frame is malformed: the reader ends the channel (fail-closed)
+    /// instead of suppressing the event.
+    #[tokio::test]
+    async fn hub_reader_fails_closed_on_event_plus_reply_key() {
+        let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _ = a.set_nonblocking(true);
+        let _ = b.set_nonblocking(true);
+        let (file_tx, mut file_rx) = mpsc::channel::<Event>(CAPACITY);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<UpdReply>(8);
+        let reader = tokio::spawn(ipc::hub_reader(
+            tokio::net::UnixStream::from_std(b).unwrap(),
+            ipc::PeerRole::HostFs,
+            Some(file_tx),
+            reply_tx,
+        ));
+        // A real reply still demultiplexes cleanly.
+        a.write_all(b"{\"ack\":true}\n").unwrap();
+        a.flush().unwrap();
+        assert_eq!(reply_rx.recv().await, Some(ipc::UpdReply::Ack));
+        // The attack frame: event fields + a reply key.
+        let event = Event {
+            ts: 7,
+            pid: 8,
+            source: "hostfs".into(),
+            op: "op".into(),
+            path: None,
+            result: None,
+            detail: None,
+        };
+        let mut line = event.to_line();
+        line.truncate(line.len() - 1); // drop the closing brace
+        a.write_all(format!("{line}, \"ack\": true}}\n").as_bytes())
+            .unwrap();
+        a.flush().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("hub reader must end on the attack frame")
+            .unwrap();
+        // Nothing was diverted: no reply, and no silently-dropped event
+        // (the reader ended before forwarding anything).
+        assert!(reply_rx.try_recv().is_err());
+        assert!(file_rx.try_recv().is_err());
     }
 }

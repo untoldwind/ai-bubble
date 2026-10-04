@@ -36,7 +36,8 @@ const STARTER_SPEC_TEMPLATE: &str = r#"{
     ]
   },
   "cwd": {{PROJECT_DIR}},
-  "net": { "mode": "host" },
+  "seccomp": { "preset": "default" },
+  "net": { "mode": "proxy", "allow": ["example.com:443"] },
   "rlimits": { "nproc": 1024, "nofile": 4096 },
   "env": {
     "values": { "PATH": "${PATH}", "HOME": "${HOME}", "TERM": "${TERM}" }
@@ -175,9 +176,6 @@ fn ensure_ignored(project_dir: &Path, spec_dir: &Path) {
     // the whole spec directory covers its cache too — no need to append
     // anything (that is the previous, now-discouraged behavior).
     let bare = entry.trim_end_matches('/');
-    // The whole spec directory being ignored covers its cache too —
-    // no need to append anything (that is the previous, now-discouraged
-    // behavior, tolerated for idempotence).
     let spec_dir_entry = entry.strip_suffix("cache/").unwrap_or(entry.as_str());
     let spec_dir_bare = spec_dir_entry.trim_end_matches('/');
     if existing.lines().any(|line| {

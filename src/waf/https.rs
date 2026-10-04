@@ -360,7 +360,32 @@ async fn read_client_hello(tcp: &mut TcpStream) -> Option<(Vec<u8>, Option<Strin
             continue; // the hello is not complete yet: keep reading
         }
         let sni = sni_from_client_hello(&buf[9..9 + len]);
-        buf.truncate(9 + len);
+        // NET-4: truncate the replay prefix at the *record* boundary that
+        // covers the end of the hello, not at the handshake-message
+        // boundary. Truncating at `9 + len` dropped the tail of a
+        // coalesced record (e.g. a ChangeCipherSpec sent in the same TCP
+        // segment) from the replay — rustls then saw a torn stream and
+        // the handshake failed — and could not represent a ClientHello
+        // fragmented across records at all. The scan walks the record
+        // headers from the start; the first boundary at or past the
+        // hello's end is the cut point. A boundary past `buf.len()` means
+        // the last record is only partially read: everything read so far
+        // must be replayed, and the record's remainder is still in the
+        // socket for the acceptor to read.
+        let mut pos = 0usize;
+        let mut end = buf.len();
+        while pos + 5 <= buf.len() {
+            let rlen = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
+            if rlen == 0 || rlen > 16 * 1024 {
+                return None; // malformed record header
+            }
+            pos += 5 + rlen;
+            if pos >= 9 + len {
+                end = pos.min(buf.len());
+                break;
+            }
+        }
+        buf.truncate(end);
         return Some((buf, sni));
     }
 }

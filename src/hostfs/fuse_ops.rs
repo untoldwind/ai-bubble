@@ -68,45 +68,28 @@ pub(super) fn attr_from_stat(st: &libc::stat) -> FileAttr {
     }
 }
 
+/// The single attribute-construction path: a `Metadata` result is
+/// marshalled into a `stat` and mapped by [`attr_from_stat`], so the
+/// field mapping exists exactly once (AUDIT.md cleanup: the two
+/// functions used to duplicate it field-for-field).
 pub(super) fn attr_from_metadata(md: &std::fs::Metadata) -> FileAttr {
-    let kind = md.file_type();
-    let kind = if kind.is_dir() {
-        FileType::Directory
-    } else if kind.is_symlink() {
-        FileType::Symlink
-    } else if kind.is_char_device() {
-        FileType::CharDevice
-    } else if kind.is_block_device() {
-        FileType::BlockDevice
-    } else if kind.is_fifo() {
-        FileType::NamedPipe
-    } else if kind.is_socket() {
-        FileType::Socket
-    } else {
-        FileType::RegularFile
-    };
-    FileAttr {
-        // Filled in by the reply sites that know the nodeid.
-        ino: 0,
-        size: md.size(),
-        blocks: md.blocks(),
-        atime: (SystemTime::UNIX_EPOCH
-            + Duration::new(md.atime().max(0) as u64, md.atime_nsec().max(0) as u32))
-        .into(),
-        mtime: (SystemTime::UNIX_EPOCH
-            + Duration::new(md.mtime().max(0) as u64, md.mtime_nsec().max(0) as u32))
-        .into(),
-        ctime: (SystemTime::UNIX_EPOCH
-            + Duration::new(md.ctime().max(0) as u64, md.ctime_nsec().max(0) as u32))
-        .into(),
-        kind,
-        perm: (md.mode() & 0o7777) as u16,
-        nlink: md.nlink() as u32,
-        uid: md.uid(),
-        gid: md.gid(),
-        rdev: md.rdev() as u32,
-        blksize: md.blksize() as u32,
-    }
+    use std::os::unix::fs::MetadataExt as _;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    st.st_mode = md.mode();
+    st.st_size = md.size() as libc::off_t;
+    st.st_blocks = md.blocks() as libc::blkcnt_t;
+    st.st_atime = md.atime();
+    st.st_atime_nsec = md.atime_nsec();
+    st.st_mtime = md.mtime();
+    st.st_mtime_nsec = md.mtime_nsec();
+    st.st_ctime = md.ctime();
+    st.st_ctime_nsec = md.ctime_nsec();
+    st.st_nlink = md.nlink();
+    st.st_uid = md.uid();
+    st.st_gid = md.gid();
+    st.st_rdev = md.rdev();
+    st.st_blksize = md.blksize() as libc::blksize_t;
+    attr_from_stat(&st)
 }
 
 pub(super) fn root_attr(uid: u32, gid: u32) -> FileAttr {
@@ -128,8 +111,9 @@ pub(super) fn root_attr(uid: u32, gid: u32) -> FileAttr {
     }
 }
 
-/// The bridge passes absolute paths ("/etc/passwd") and is lenient about a
-/// missing leading slash.
+/// Mirrored paths are absolute ("/etc/passwd"); the check is lenient
+/// about a missing leading slash. (The doc used to reference a removed
+/// path-bridge mechanism; only the leniency remains.)
 pub(super) fn is_root(path: &OsStr) -> bool {
     path == Path::new("/") || path.is_empty()
 }
@@ -313,6 +297,12 @@ impl Filesystem for HostFs {
         if !self.patterns.load().exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
+        // HF-7: an `empty`-mapped path is purely synthetic — the host file
+        // behind it is never read, and that includes the *target string*
+        // of a symlink standing at the real host path. Reveal nothing.
+        if self.patterns.load().is_empty(&mirrored) {
+            return Err(libc::ENOENT.into());
+        }
         let target = anchored::read_link(&self.root, &self.patterns.load().redirect(&mirrored))?;
         Ok(ReplyData::from(Bytes::copy_from_slice(
             target.as_os_str().as_encoded_bytes(),
@@ -424,6 +414,21 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EISDIR.into());
         }
+        // HF-2: host device nodes and sockets are never opened — the
+        // open would happen on the host tree with FS's credentials and
+        // the resulting handle would proxy host-device access into the
+        // sandbox (the mount's `nodev` does not help: the open is on the
+        // host, not on the FUSE mount). FIFOs remain allowed.
+        if Self::stat_is_special(&md_stat) {
+            log_op_err(
+                "open",
+                &mirrored,
+                Some(&real),
+                &std::io::Error::from_raw_os_error(libc::EPERM),
+            )
+            .await;
+            return Err(libc::EPERM.into());
+        }
         let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
         if write_flags && !self.patterns.load().writable(&mirrored) {
             // `ro` paths (and anything below an empty or hidden pattern) are
@@ -467,13 +472,34 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
+        // HF-2, authoritative post-open check: between the pre-open `lstat`
+        // and the `open_at` the entry could have been swapped (an
+        // out-of-band same-uid process or an aliased rw bind); a device
+        // node that slipped in is detected here and the handle is refused.
+        match file.metadata() {
+            Ok(md) if Self::metadata_is_special(&md) => {
+                log_op_err(
+                    "open",
+                    &mirrored,
+                    Some(&real),
+                    &std::io::Error::from_raw_os_error(libc::EPERM),
+                )
+                .await;
+                return Err(libc::EPERM.into());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log_op_err("open", &mirrored, Some(&real), &e).await;
+                return Err(e.into());
+            }
+        }
         // Stateful IO: the opened host file is reused for every read/write
         // on this handle (released with it in `release`).
         self.inodes
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .open_handle(inode);
-        let fh = match self.insert_handle(file, mirrored, append) {
+        let fh = match self.insert_handle(file, mirrored, inode, append) {
             Ok(fh) => fh,
             Err(e) => {
                 // AUDIT.md L13: the speculative `open_handle` count above
@@ -593,6 +619,22 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
+        // HF-2: never proxy host device nodes/sockets (authoritative
+        // post-open check; see `open`).
+        match file.metadata() {
+            Ok(md) if Self::metadata_is_special(&md) => {
+                log_op_err(
+                    "read",
+                    &mirrored,
+                    Some(&self.patterns.load().redirect(&mirrored)),
+                    &std::io::Error::from_raw_os_error(libc::EPERM),
+                )
+                .await;
+                return Err(libc::EPERM.into());
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
         file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; size as usize];
         let n = match file.read(&mut buf) {
@@ -627,10 +669,30 @@ impl Filesystem for HostFs {
         // mirrored path from open time, so the stateful fast path never
         // consults the inode map.
         let handle = if fh != 0 { self.handle_of(fh) } else { None };
+        // HF-3: for a stateful handle, the *policy* path is the entry's
+        // **current** mirrored path, resolved from the handle's nodeid —
+        // the inode map is re-pointed on rename (and repoints its
+        // descendants), so a handle opened at `/work/f` and later renamed
+        // to `/vault/f` is checked against `/vault/f`. Checking the
+        // open-time `path` instead would let a write escape a runtime
+        // policy tightening (open rw, rename into a path the control
+        // plane just made ro, keep writing through the stale path).
+        // Fail closed when the nodeid is unknown to the map.
         let mirrored = match &handle {
-            // Only used for logging on this path; the IO goes through the
-            // cached file descriptor.
-            Some(h) => h.path.clone(),
+            Some(h) => match self.resolve(h.inode) {
+                Ok(p) => p,
+                Err(e) => {
+                    log_op_err(
+                        "write",
+                        Path::new("<stale>"),
+                        None,
+                        &std::io::Error::from_raw_os_error(libc::EACCES),
+                    )
+                    .await;
+                    let _ = e;
+                    return Err(libc::EACCES.into());
+                }
+            },
             None => match self.resolve(inode) {
                 Ok(p) => p,
                 Err(e) => {
@@ -723,20 +785,36 @@ impl Filesystem for HostFs {
         if append {
             oflags |= libc::O_APPEND;
         }
-        let mut file = match anchored::open_at(&self.root, &patterns.redirect(&mirrored), oflags, 0)
-        {
-            Ok(f) => f,
-            Err(e) => {
+        let mut file =
+            match anchored::open_at(&self.root, &patterns.redirect(&mirrored), oflags, 0) {
+                Ok(f) => f,
+                Err(e) => {
+                    log_op_err(
+                        "write",
+                        &mirrored,
+                        Some(&self.patterns.load().redirect(&mirrored)),
+                        &e,
+                    )
+                    .await;
+                    return Err(e.into());
+                }
+            };
+        // HF-2: never proxy host device nodes/sockets (authoritative
+        // post-open check; see `open`).
+        match file.metadata() {
+            Ok(md) if Self::metadata_is_special(&md) => {
                 log_op_err(
                     "write",
                     &mirrored,
                     Some(&self.patterns.load().redirect(&mirrored)),
-                    &e,
+                    &std::io::Error::from_raw_os_error(libc::EPERM),
                 )
                 .await;
-                return Err(e.into());
+                return Err(libc::EPERM.into());
             }
-        };
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
         if !append {
             file.seek(SeekFrom::Start(offset))?;
         }
@@ -778,12 +856,19 @@ impl Filesystem for HostFs {
         if is_root(mirrored.as_os_str()) {
             return Ok(minimal_statfs());
         }
+        // HF-6: a path hidden by a runtime policy swap must not leak the
+        // real filesystem it sits on (the kernel may still hold the cached
+        // dentry from before the hide).
+        if !self.patterns.load().exists(&mirrored) {
+            return Err(libc::ENOENT.into());
+        }
         // An injected path has no host counterpart: report a minimal,
         // self-consistent statfs instead of opening anything. The same
         // holds for a purely virtual ancestor of an injected (or empty)
         // path with no real counterpart: it is a virtual directory, and
         // there is nothing to open on the host.
         if self.patterns.load().is_inject(&mirrored).is_some()
+            || self.patterns.load().is_empty(&mirrored)
             || (self.patterns.load().is_empty_prefix(&mirrored)
                 || self.patterns.load().is_inject_prefix(&mirrored))
                 && !self.real_exists(&self.patterns.load().redirect(&mirrored))
@@ -860,7 +945,17 @@ impl Filesystem for HostFs {
         // Every listed entry needs a nodeid for the kernel's dentry cache:
         // "." is the directory itself, ".." its parent, everything else is
         // mapped (or re-mapped) under the directory's nodeid.
-        let mut map = self.inodes.write().unwrap_or_else(|e| e.into_inner());
+        //
+        // HF-5: plain `readdir` no longer permanently inserts a nodeid +
+        // PathBuf per listed name — the kernel never sends `forget` for
+        // plain-readdir entries, so walking a large mirror grew the map
+        // without bound (memory growth in a host-privileged process).
+        // Children get inode 0 ("unknown nodeid"): the kernel then does a
+        // proper `lookup` — which allocates a forgetable nodeid — for
+        // exactly the entries the command actually uses. `readdirplus`
+        // (below) keeps `get_or_insert`: it returns full attributes per
+        // entry and needs real nodeids.
+        let map = self.inodes.write().unwrap_or_else(|e| e.into_inner());
         let entries: Vec<_> = entries
             .into_iter()
             .map(|(i, (name, attr))| {
@@ -869,7 +964,7 @@ impl Filesystem for HostFs {
                 } else if name == *OsStr::new("..") {
                     map.parent_of(parent).unwrap_or(inodes::ROOT_INODE)
                 } else {
-                    map.get_or_insert(&mirrored.join(&name), parent)
+                    0
                 };
                 Ok(DirectoryEntry {
                     inode,
@@ -999,17 +1094,42 @@ impl Filesystem for HostFs {
         })?;
         // `faccessat` with `AT_SYMLINK_NOFOLLOW` on the pinned parent —
         // never follow symlinks (final component or otherwise) when
-        // deciding access on the real host filesystem.
-        if unsafe {
+        // deciding access on the real host filesystem. HF-8: on kernels
+        // without `faccessat` flag support (pre-5.8) the flag is ignored
+        // or EINVAL, and the check would follow a swapped-in symlink — a
+        // 1-bit access oracle. Fall back to opening the final component
+        // `O_NOFOLLOW` (race-free against swaps: an already-open fd can
+        // never be re-pointed) and querying the descriptor itself.
+        let rc = unsafe {
             libc::faccessat(
                 anchored.dir().as_raw_fd(),
                 anchored.name().as_ptr(),
                 non_write as libc::c_int,
                 libc::AT_SYMLINK_NOFOLLOW,
             )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error().into());
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
+                    if !Self::stat_is_symlink(&anchored::lstat(
+                        &self.root,
+                        &real,
+                    )?) => {}
+                _ => return Err(err.into()),
+            }
+            let file = anchored::open_at(&self.root, &real, libc::O_RDONLY, 0)?;
+            if unsafe {
+                libc::faccessat(
+                    file.as_raw_fd(),
+                    b"\0".as_ptr().cast(),
+                    non_write as libc::c_int,
+                    libc::AT_EMPTY_PATH,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
         }
         Ok(())
     }
@@ -1461,6 +1581,34 @@ impl Filesystem for HostFs {
         // either name (the operation acts *inside* the pinned directories).
         let old_anchored = anchored::anchor_parent(&self.root, &old_real)?;
         let new_anchored = anchored::anchor_parent(&self.root, &new_real)?;
+        // HF-1: the `is_host_dir` checks above are a *separate* syscall
+        // from the `renameat` below. If the source is a file at check time
+        // but a directory at rename time (swapped via an out-of-band
+        // channel — e.g. a tree that is both rw-mirrored and rw-bound, or
+        // a hostile same-uid host process), a directory would be moved
+        // with no subtree analysis: a `hide`d subtree could be carried
+        // into a broad `rw /**` region and become visible/writable.
+        // Re-stat the source and destination through the pinned parents
+        // immediately before the rename and re-run the subtree check on
+        // the *fresh* verdict — directories always require it. The stats
+        // and the rename run in one await-free block, so on the
+        // single-threaded runtime nothing can swap the entry in between.
+        let old_stat = anchored::stat_entry(&old_anchored)?;
+        let new_stat = anchored::stat_entry(&new_anchored)?;
+        let dir_rename = Self::stat_is_dir(&old_stat) || Self::stat_is_dir(&new_stat);
+        if dir_rename
+            && (self.patterns.load().subtree_restricted(&old)
+                || self.patterns.load().subtree_restricted(&new))
+        {
+            log_op_err(
+                "rename",
+                &old,
+                Some(&new_real),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            )
+            .await;
+            return Err(libc::EACCES.into());
+        }
         if unsafe {
             libc::renameat(
                 old_anchored.dir().as_raw_fd(),
@@ -1533,13 +1681,14 @@ impl Filesystem for HostFs {
     /// affect the other's).
     ///
     /// The source is **never followed**, and a host symlink at the source
-    /// name is not linked at all: Linux `linkat` cannot no-follow the
-    /// source, and re-creating the symlink (as this used to do) would be
-    /// a real symlink creation on the host — the `symlink` op is
-    /// unconditionally denied, so `link` of a symlink is denied too
-    /// (AUDIT.md M5). A symlink's target may also live outside every
-    /// mapping; following it would be a variant of the C1 escape the
-    /// anchored resolution closes.
+    /// name is not linked at all: `linkat` without `AT_SYMLINK_FOLLOW`
+    /// would link the symlink inode itself — a name aliasing a symlink
+    /// through the mirror, whose target may not be mirrored at all;
+    /// following it would be a variant of the C1 escape the anchored
+    /// resolution closes (AUDIT.md M5; and re-creating the symlink — as
+    /// this used to do — would be a real symlink creation on the host,
+    /// which the unconditionally-denied `symlink` op forbids). A
+    /// symlink's target may also live outside every mapping.
     ///
     /// **Both** names must be writable. Checking only the new name would
     /// let the sandbox link a *read-only* mapped file (say, from
@@ -1601,9 +1750,11 @@ impl Filesystem for HostFs {
         // host symlink standing at the source name must be linked *as a
         // link*, never followed to its target — the target may live
         // outside every mapping, and following it here would be a variant
-        // of the C1 escape (Linux `linkat` cannot no-follow the source, so
-        // a link source is re-created as an identical symlink instead). The
-        // check and the syscall below run in one await-free block — on the
+        // of the C1 escape. (The doc comment above wrongly claimed Linux
+        // `linkat` cannot no-follow the source: without
+        // `AT_SYMLINK_FOLLOW`, `linkat` links the symlink itself — the
+        // behavior is correct, the comment was not.) The check and the
+        // syscall below run in one await-free block — on the
         // single-threaded runtime nothing can swap the entry in between.
         let old_anchored =
             anchored::anchor_parent(&self.root, &self.patterns.load().redirect(&old))?;
@@ -1725,6 +1876,17 @@ impl Filesystem for HostFs {
                 .await;
                 return Err(libc::EISDIR.into());
             }
+            // HF-2: like `open`, refuse host device nodes and sockets.
+            if Self::stat_is_special(&st) {
+                log_op_err(
+                    "create",
+                    &mirrored,
+                    Some(&real),
+                    &std::io::Error::from_raw_os_error(libc::EPERM),
+                )
+                .await;
+                return Err(libc::EPERM.into());
+            }
             let mut oflags = libc::O_WRONLY;
             if truncate {
                 oflags |= libc::O_TRUNC;
@@ -1739,6 +1901,24 @@ impl Filesystem for HostFs {
                     return Err(e.into());
                 }
             };
+            // HF-2, authoritative post-open check (see `open`).
+            match file.metadata() {
+                Ok(md) if Self::metadata_is_special(&md) => {
+                    log_op_err(
+                        "create",
+                        &mirrored,
+                        Some(&real),
+                        &std::io::Error::from_raw_os_error(libc::EPERM),
+                    )
+                    .await;
+                    return Err(libc::EPERM.into());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log_op_err("create", &mirrored, Some(&real), &e).await;
+                    return Err(e.into());
+                }
+            }
             let md = file.metadata()?;
             log_op_ok("create", &mirrored, &real).await;
             let inode = self
@@ -1750,7 +1930,7 @@ impl Filesystem for HostFs {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .open_handle(inode);
-            let fh = match self.insert_handle(file, mirrored, append) {
+            let fh = match self.insert_handle(file, mirrored, inode, append) {
                 Ok(fh) => fh,
                 Err(e) => {
                     // AUDIT.md L13: release the speculative `open_handle`
@@ -1805,7 +1985,7 @@ impl Filesystem for HostFs {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .open_handle(inode);
-        let fh = match self.insert_handle(file, mirrored, append) {
+        let fh = match self.insert_handle(file, mirrored, inode, append) {
             Ok(fh) => fh,
             Err(e) => {
                 // AUDIT.md L13: release the speculative `open_handle`
@@ -1857,6 +2037,29 @@ impl Filesystem for HostFs {
             .unwrap_or_else(|e| e.into_inner())
             .close_handle(inode);
         Ok(())
+    }
+
+    /// Flush pending writes of an open handle to stable storage (HF-9):
+    /// fuse3's default implementation returns `Ok(())` without doing
+    /// anything — a durability lie to sandboxed git/cargo/databases that
+    /// believe their `fsync` succeeded. For a stateful handle the host
+    /// file is really synced (`fdatasync` for `datasync`, `fsync`
+    /// otherwise); for stateless IO (injected content, `fh = 0`) there
+    /// is nothing on disk to sync, so the op reports `ENOSYS` like the
+    /// other unsupported operations instead of pretending success.
+    async fn fsync(&self, _req: Request, inode: Inode, fh: u64, datasync: bool) -> Result<()> {
+        perf::fuse_op!("fsync");
+        let _ = inode;
+        let Some(handle) = (if fh != 0 { self.handle_of(fh) } else { None }) else {
+            return Err(libc::ENOSYS.into());
+        };
+        let file = handle.file.lock().unwrap_or_else(|e| e.into_inner());
+        let result = if datasync {
+            file.sync_data()
+        } else {
+            file.sync_all()
+        };
+        result.map_err(Into::into)
     }
 }
 

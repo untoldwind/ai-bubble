@@ -77,6 +77,11 @@ pub(crate) struct InodeMap {
 }
 
 impl InodeMap {
+    /// The hard cap on remembered nodeid↔path entries (HF-5): past it,
+    /// fresh paths get a nodeid for the current reply but are not
+    /// remembered (see `get_or_insert`).
+    const MAP_CAP: usize = 1_000_000;
+
     /// A fresh map with only the root (inode 1, its own parent).
     pub(crate) fn new() -> Self {
         let mut map = Self {
@@ -134,6 +139,18 @@ impl InodeMap {
             return ROOT_INODE;
         }
         if let Some(&inode) = self.path_to_inode.get(path) {
+            return inode;
+        }
+        // HF-5: a hard cap on the map. Unbounded growth turned every
+        // directory listing into permanent memory in this host-privileged
+        // process (plain `readdir` no longer inserts children at all; the
+        // cap bounds `readdirplus`/`lookup`-driven insertions). Past the
+        // cap a *new* path still gets a fresh nodeid for the reply, but
+        // is not remembered — the next operation on it fails ENOENT
+        // (degraded, never wrong-content) instead of growing the map.
+        if self.inodes.len() >= Self::MAP_CAP {
+            let inode = self.next_inode;
+            self.next_inode += 1;
             return inode;
         }
         let inode = self.next_inode;

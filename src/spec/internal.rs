@@ -186,31 +186,47 @@ impl From<&NetConfig> for Net {
             NetConfig::Proxy {
                 allow,
                 allow_private,
-            } => Net {
-                isolated: true,
-                mode: NetMode::Proxy,
-                allow: allow.clone(),
-                allow_private: *allow_private,
-                // The fresh network namespace already isolates abstract
-                // sockets; all four families are always allowed here.
-                unix_sockets: true,
-                netlink: true,
-                vsock: true,
-                bluetooth: true,
-            },
+            } => {
+                // NET-6: validate the entries at load time, so a dead
+                // entry (`example.com:443x`) is a spec error instead of a
+                // silently never-matching rule.
+                for entry in allow {
+                    crate::proxy::allowlist::validate_entry(entry)
+                        .unwrap_or_else(|e| crate::sandbox::die(&e));
+                }
+                Net {
+                    isolated: true,
+                    mode: NetMode::Proxy,
+                    allow: allow.clone(),
+                    allow_private: *allow_private,
+                    // The fresh network namespace already isolates abstract
+                    // sockets; all four families are always allowed here.
+                    unix_sockets: true,
+                    netlink: true,
+                    vsock: true,
+                    bluetooth: true,
+                }
+            }
             NetConfig::Waf {
                 allow,
                 allow_private,
-            } => Net {
-                isolated: true,
-                mode: NetMode::Waf,
-                allow: allow.clone(),
-                allow_private: *allow_private,
-                unix_sockets: true,
-                netlink: true,
-                vsock: true,
-                bluetooth: true,
-            },
+            } => {
+                // NET-6: see the Proxy arm.
+                for entry in allow {
+                    crate::proxy::allowlist::validate_entry(entry)
+                        .unwrap_or_else(|e| crate::sandbox::die(&e));
+                }
+                Net {
+                    isolated: true,
+                    mode: NetMode::Waf,
+                    allow: allow.clone(),
+                    allow_private: *allow_private,
+                    unix_sockets: true,
+                    netlink: true,
+                    vsock: true,
+                    bluetooth: true,
+                }
+            }
         }
     }
 }
@@ -435,7 +451,8 @@ pub enum Op {
     },
     /// Mount a fresh tmpfs instance, like bwrap's `--tmpfs`. Options mirror
     /// bwrap: `perms` is the octal mode of the mount root (default 0755) and
-    /// `size` the maximum size in bytes (default: unlimited/half of RAM).
+    /// `size` the maximum size in bytes (default: capped at 512 MiB, SB-3 —
+    /// tmpfs pages are host memory and `RLIMIT_AS` does not cover tmpfs).
     /// The mount is made with `MS_NOSUID | MS_NODEV`, like bwrap's.
     Tmpfs {
         dest: PathBuf,
@@ -476,7 +493,7 @@ mod tests {
         // cache mapping resolves the same way on both sides).
         let mut spec = spec;
         let root = crate::hostfs::session_cache_needed(true).unwrap();
-        crate::cli::preprocess_spec(&mut spec, Path::new("/repo/.ai-bubble"), Some(&root));
+        crate::cli::preprocess_spec(&mut spec, Path::new("/repo/.ai-bubble"), Some(&root)).unwrap();
         let compiled = SandboxConfig::compile(&spec);
         let tried = SandboxConfig::try_compile(&spec).unwrap();
         assert_eq!(compiled, tried);

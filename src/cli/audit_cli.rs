@@ -91,7 +91,10 @@ fn follow_log(path: &Path, lines: usize) {
 }
 
 fn open(path: &Path) -> std::fs::File {
-    std::fs::File::open(path)
+    // SP-8: no plain `File::open` — it follows a swapped-in symlink and
+    // blocks on a swapped-in FIFO. Reuse the writer's safe open
+    // (no-follow, non-blocking, regular-file check), minus O_CREAT.
+    crate::audit::writer::safe_open_read(path, "audit log")
         .unwrap_or_else(|e| sandbox::die(&format!("Can't open {}: {e}", path.display())))
 }
 

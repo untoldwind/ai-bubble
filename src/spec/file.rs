@@ -291,7 +291,7 @@ impl Spec {
         let dir = absolute_dir(spec_dir);
         // Rebuild the absolute path as a pattern: a `/` root plus one
         // escaped component per directory level. Non-UTF-8 components are
-        // lossy-converted (as before); they can never match a pattern in
+        // lossy-converted; they can never match a pattern in
         // the first place, so every derived decision fails closed.
         let pattern = format!(
             "/{}",
@@ -418,6 +418,25 @@ impl Spec {
             }
         }
         Ok(())
+    }
+
+    /// Security validation and hardening of a *replacement* mapping list
+    /// applied through the control plane (SP-1): runs
+    /// [`Spec::validate_sources`] (which rejects bind/redirect sources
+    /// covering the spec directory) against `spec_dir` and appends the
+    /// [`Spec::hide_spec_dir`] auto-hide pattern, so a runtime `fs-set`
+    /// can never re-expose the spec directory or silently drop the
+    /// auto-hide mapping. Returns the hardened list to swap in.
+    pub(crate) fn control_plane_mapping_list(
+        mut mappings: Vec<super::hostfs::Mapping>,
+        spec_dir: &Path,
+    ) -> Result<Vec<super::hostfs::Mapping>, String> {
+        let mut spec = Spec::default();
+        spec.hostfs.mappings = mappings;
+        spec.validate_sources(spec_dir)?;
+        spec.hide_spec_dir(spec_dir);
+        mappings = spec.hostfs.mappings;
+        Ok(mappings)
     }
 
     /// Expand and validate the [`Spec::cwd`] field for compilation: the

@@ -69,8 +69,23 @@ pub(crate) enum UpdReply {
 impl UpdReply {
     /// Parse one channel line as a reply frame; `None` when the line is
     /// not a reply (it may still be a valid audit event).
+    ///
+    /// SP-2: a frame that carries any event field is never a reply, even
+    /// if it also has `"ack"`/`"err"` — a compromised child must not be
+    /// able to divert its audit events into the reply channel (where
+    /// they would be silently dropped instead of logged) by appending a
+    /// reply key to a valid event. The hub parses the `Event` first; a
+    /// frame that is an event plus a reply key fails the event parse
+    /// (`deny_unknown_fields`) and the reply parse here, so the reader
+    /// ends the channel instead of dropping the event.
     pub(crate) fn parse(line: &str) -> Option<UpdReply> {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        // Event fields present ⇒ not a reply, whatever else it says.
+        for field in ["ts", "pid", "source", "op"] {
+            if value.get(field).is_some() {
+                return None;
+            }
+        }
         if value.get("ack").and_then(serde_json::Value::as_bool) == Some(true) {
             return Some(UpdReply::Ack);
         }
@@ -291,23 +306,44 @@ pub fn spawn_hub() -> Hub {
         // one outstanding update per channel, so a small buffer suffices.
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<UpdReply>(8);
         replies.push((role, reply_rx));
-        readers.push(tokio::spawn(hub_reader(stream, sender.clone(), reply_tx)));
+        readers.push(tokio::spawn(hub_reader(
+            stream,
+            role,
+            sender.clone(),
+            reply_tx,
+        )));
     }
     Hub { readers, replies }
 }
 
 /// One hub reader: read frames from a child's channel until EOF (the
-/// child's "queue flushed" signal). Each frame is either a control
-/// reply ([`UpdReply`], forwarded to the per-role receiver — a missing
-/// or gone receiver only means the control server is not running, never
-/// a reason to end the reader) or an audit `Event` forwarded into the
-/// launcher's queue (dropped when the process has no audit sink: the
-/// pair exists for the control plane then). A malformed frame (over
-/// cap, non-UTF-8, NUL, neither reply nor event) is a bug in a trusted
-/// fork child, not an attack: warn once on stderr and end the reader —
-/// a bug in a child must not kill the run.
+/// child's "queue flushed" signal). Each frame is either an audit
+/// `Event` forwarded into the launcher's queue (dropped when the process
+/// has no audit sink: the pair exists for the control plane then) or a
+/// control reply ([`UpdReply`], forwarded to the per-role receiver — a
+/// missing or gone receiver only means the control server is not
+/// running, never a reason to end the reader). The `Event` parse runs
+/// first (SP-2): an event always carries `ts`/`pid`/`source`/`op` and
+/// rejects unknown fields, so a reply-shaped frame is unambiguously
+/// distinguishable and a frame that is an event plus a reply key cannot
+//  be diverted to the reply channel (where it would be dropped from the
+//  log).
+///
+/// The event's `source` is cross-checked against the channel's peer role
+/// (SP-2): each child is trusted to emit only its own component's source
+/// (`hostfs` for FS, `proxy`/`waf` for P), and a claimed source outside
+/// that set — e.g. a compromised FS claiming `source: "control"` with
+/// the launcher's pid to forge attribution — is overridden with the
+/// role's trusted label, with the claimed value preserved in `detail`.
+///
+/// A malformed frame (over cap, non-UTF-8, NUL, neither reply nor event)
+/// is a bug in a trusted fork child, or an attack by a compromised child
+/// (see SP-2), not something to tolerate: warn once on stderr and end
+/// the reader — a bug in a child must not kill the run, and a child that
+/// attacks the audit channel is cut off instead of being obeyed.
 pub(crate) async fn hub_reader(
     mut stream: UnixStream,
+    role: PeerRole,
     tx: Option<Sender<Event>>,
     reply_tx: Sender<UpdReply>,
 ) {
@@ -323,14 +359,9 @@ pub(crate) async fn hub_reader(
     loop {
         match crate::line::read_frame_limited(&mut stream, FRAME_CAP).await {
             Ok(Some(line)) => {
-                if let Some(reply) = UpdReply::parse(&line) {
-                    // The control plane is not listening on this channel
-                    // (or is gone): drop the reply, keep reading events.
-                    let _ = reply_tx.send(reply).await;
-                    continue;
-                }
                 match serde_json::from_str::<Event>(&line) {
-                    Ok(event) => {
+                    Ok(mut event) => {
+                        stamp_source(&mut event, role);
                         if let Some(tx) = &tx
                             && tx.send(event).await.is_err()
                         {
@@ -339,8 +370,22 @@ pub(crate) async fn hub_reader(
                             return;
                         }
                     }
-                    Err(e) => {
-                        warn(&format!("not an audit event: {e}"), &mut malformed_reported);
+                    // Not an event: a control reply (or malformed).
+                    Err(_) => {
+                        if let Some(reply) = UpdReply::parse(&line) {
+                            // The control plane is not listening on this
+                            // channel (or is gone): drop the reply, keep
+                            // reading events.
+                            let _ = reply_tx.send(reply).await;
+                            continue;
+                        }
+                        warn(
+                            &format!(
+                                "neither an audit event nor a control reply: {}",
+                                &line[..line.len().min(120)]
+                            ),
+                            &mut malformed_reported,
+                        );
                         return;
                     }
                 }
@@ -352,6 +397,25 @@ pub(crate) async fn hub_reader(
                 return;
             }
         }
+    }
+}
+
+/// The `source` values each peer role may legitimately claim, and the
+/// trusted label a forgery is overridden with (SP-2).
+fn stamp_source(event: &mut Event, role: PeerRole) {
+    let (allowed, trusted): (&[&str], &str) = match role {
+        PeerRole::HostFs => (&["hostfs"], "hostfs"),
+        // P serves both the proxy frontends and the waf host.
+        PeerRole::Network => (&["proxy", "waf"], "proxy"),
+    };
+    if !allowed.contains(&event.source.as_str()) {
+        let claimed = std::mem::take(&mut event.source);
+        event.source = trusted.to_string();
+        let note = format!("forged source \"{claimed}\" overridden by hub");
+        event.detail = Some(match event.detail.take() {
+            Some(d) => format!("{d}; {note}"),
+            None => note,
+        });
     }
 }
 

@@ -348,13 +348,22 @@ async fn take_keygen_token() -> bool {
 /// interpolated verbatim into a command line on the host socket, and a
 /// control byte would inject a second line into that protocol once more
 /// than one command per connection is ever processed (AUDIT.md L4).
-fn valid_name(name: &str) -> bool {
+/// Whether `name` is a DNS name safe to handle: ASCII only, no control
+/// bytes or whitespace, no leading label wildcards (see the tests).
+/// Used by both the waf HTTP/CONNECT frontends (against the allow-list)
+/// and the DNS server (NET-5: the raw qname is interpolated into the
+/// host command line `resolve-dns {name}` — DNS labels may contain `\n`,
+/// so the name is validated *before* it is sent, instead of riding on
+/// the accidental invariant that only one line is read per connection).
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains([' ', '*', '\0'])
         && name.len() <= 253
         && name
             .split('.')
-            .all(|label| !label.is_empty() && label.len() <= 63 && name.is_ascii())
+            .all(|label| !label.is_empty() && label.len() <= 63)
+        // ASCII-graphic covers the `is_ascii` check the per-label closure
+        // used to repeat (AUDIT.md cleanup): no control bytes, no space.
         && name.bytes().all(|b| b.is_ascii_graphic())
 }
 

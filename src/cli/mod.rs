@@ -9,7 +9,7 @@
 //! * `ls`  — list a host path and show the mappings of the current config,
 //! * `init` — bootstrap a spec directory with a starter spec file.
 //!
-//! Each sub-command's implementation lives in its own module (`run`, `ls`,,,,,,,,,,,,,,,,,,
+//! Each sub-command's implementation lives in its own module (`run`, `ls`,
 //! `init`); this module holds only the argument parsing.
 
 mod audit_cli;

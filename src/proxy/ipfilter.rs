@@ -81,6 +81,13 @@ fn blocked_reason_v6(ip: Ipv6Addr) -> Option<&'static str> {
     // private v4 target past the filter.
     let embedded = if s[..5] == [0, 0, 0, 0, 0] && s[5] == 0xffff {
         Some(v4_from(s[6], s[7]))
+    } else if s[..4] == [0, 0, 0, 0] && s[4] == 0xffff && s[5] == 0 {
+        // RFC 6052 IPv4-*translated* form ::ffff:0:0/96 (SP audit NET-1):
+        // `::ffff:0:10.0.0.1` parses to [0,0,0,0, 0xffff, 0, 0x0a00,
+        // 0x0001] — a different segment layout from the mapped form above,
+        // so it used to fall through every check. A NAT64/SIIT translator
+        // routes it to the embedded v4 address, so apply the same rules.
+        Some(v4_from(s[6], s[7]))
     } else if s[0] == 0x2002 {
         // 6to4: the embedded IPv4 address follows the prefix.
         Some(v4_from(s[1], s[2]))
@@ -105,6 +112,15 @@ fn blocked_reason_v6(ip: Ipv6Addr) -> Option<&'static str> {
         // handled by the embedded-v4 check above.
         [0x0064, 0xff9b, 1, ..] => "nat64 local-use",
         [0x2001, 0x0db8, ..] => "documentation",
+        // NET-8: the remaining IANA special-purpose v6 ranges.
+        [0x2001, 0x0002, ..] => "benchmarking (RFC 5180)",
+        // 3fff::/20 — documentation (RFC 9637): the fixed 20 bits span
+        // the first segment plus the second's top nibble.
+        [0x3fff, s1, ..] if s1 & 0xf000 == 0 => "documentation",
+        // 2001:20::/28 — ORCHIDv2 (RFC 7343): 28 fixed bits.
+        [0x2001, s1, ..] if s1 & 0xfff0 == 0x0020 => "orchidv2",
+        // 100::/64 — discard-only (RFC 6666).
+        [0x0100, 0, 0, 0, ..] => "discard-only",
         _ => return None,
     };
     Some(reason)
@@ -255,9 +271,25 @@ mod tests {
         );
         assert_eq!(blocked("64:ff9b::a00:1"), "private");
         assert_eq!(blocked("2002:a00:1::"), "private");
+        // RFC 6052 IPv4-translated form (::ffff:0:0/96, NET-1).
+        assert_eq!(blocked("::ffff:0:10.0.0.1"), "private");
+        assert_eq!(
+            blocked("::ffff:0:169.254.169.254"),
+            "link-local (incl. cloud metadata)"
+        );
         // AUDIT.md L5: Teredo and the NAT64 local-use prefix.
         assert_eq!(blocked("2001:0::1"), "teredo");
         assert_eq!(blocked("64:ff9b:1::1"), "nat64 local-use");
+        // NET-8: the remaining IANA special-purpose v6 ranges.
+        assert_eq!(blocked("2001:2::1"), "benchmarking (RFC 5180)");
+        assert_eq!(blocked("3fff::1"), "documentation");
+        assert_eq!(blocked("3fff:1::1"), "documentation");
+        not_blocked("3fff:2000::1"); // just outside 3fff::/20
+        assert_eq!(blocked("2001:20::1"), "orchidv2");
+        assert_eq!(blocked("2001:2f::1"), "orchidv2");
+        not_blocked("2001:30::1"); // just outside 2001:20::/28
+        assert_eq!(blocked("100::1"), "discard-only");
+        not_blocked("100:1::1"); // outside 100::/64 (second segment set)
         // Public addresses pass.
         not_blocked("2606:4700::1111");
         not_blocked("::ffff:8.8.8.8");

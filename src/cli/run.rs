@@ -23,7 +23,7 @@ pub(crate) fn preprocess_spec(
     spec: &mut spec::Spec,
     spec_dir: &Path,
     session_cache: Option<&Path>,
-) {
+) -> Result<(), String> {
     if matches!(spec.net, spec::net::NetConfig::Waf { .. }) {
         spec.hostfs.mappings.push(spec::hostfs::Mapping::Inject {
             path: "/etc/resolv.conf".to_string(),
@@ -55,7 +55,7 @@ pub(crate) fn preprocess_spec(
     // against their backing directories before anything is compiled:
     // the session-cache tmp directory is created here and wiped once
     // ai-bubble terminates (the mirrored-fs server inherits the wipe).
-    spec.hostfs.prepare_caches(spec_dir, session_cache);
+    spec.hostfs.prepare_caches(spec_dir, session_cache)
 }
 
 /// Runs the `run` sub-command. `spec_dir` is the `--spec-dir` value (if
@@ -76,6 +76,27 @@ pub fn run(
         sandbox::die(
             "No command given; usage: ai-bubble run [--spec-dir DIR] -- COMMAND [args...]",
         );
+    }
+    // SP-5: the security-relevant negatable run flags parse ahead of the
+    // command, so a wrapper that forwards untrusted arguments *without*
+    // `--` could smuggle `--no-new-session` (host pts bound in,
+    // TIOCSTI injection), `--no-die-with-parent` or `--no-control` into
+    // ai-bubble itself. When one of these flags appears *inside* the
+    // forwarded command vector, the arguments were almost certainly
+    // mixed with untrusted input — refuse the run and tell the caller to
+    // separate the command with `--`. (ai-bubble's own flags are parsed
+    // out before this point and never end up in `command`.)
+    for arg in &command {
+        if matches!(
+            arg.as_str(),
+            "--no-new-session" | "--no-die-with-parent" | "--no-control"
+        ) {
+            sandbox::die(&format!(
+                "{arg} appears inside the forwarded command; ai-bubble's own options must \
+                 come before the command and the command must be separated from them with \
+                 `--` (untrusted arguments must never be forwarded without that separator)"
+            ));
+        }
     }
     // AUDIT.md L9: an explicit `--spec-dir` that cannot be read is a hard
     // error inside `Spec::load` already; `--require-spec` extends the same
@@ -99,8 +120,10 @@ pub fn run(
     // The session-cache tmp directory is created here and wiped once
     // ai-bubble terminates (the mirrored-fs server inherits the wipe).
     let spec_dir = spec_dir.unwrap_or(Path::new(spec::file::DEFAULT_SPEC_DIR));
+    warn_risky_spec(&spec, spec_dir);
     let session_cache = hostfs::session_cache_needed(spec.hostfs.has_session_caches());
-    preprocess_spec(&mut spec, spec_dir, session_cache.as_deref());
+    preprocess_spec(&mut spec, spec_dir, session_cache.as_deref())
+        .unwrap_or_else(|e| crate::sandbox::die(&e));
 
     // Compile the config-file spec down into the internal
     // configuration (ops, hostfs patterns, net settings) the
@@ -188,4 +211,58 @@ pub fn run(
             sandbox_config.seccomp.as_ref(),
         );
     }
+}
+
+/// Warn once on stderr about dangerous-but-legal spec constructs (SP-10):
+/// the spec is the operator's trusted input, so these are warnings, not
+/// errors — but a run that hands the sandbox `$HOME` or `/etc` writable,
+/// or runs with no seccomp filter at all, deserves a loudly visible
+/// heads-up (the `init` starter now teaches proxy-mode networking plus a
+/// seccomp preset instead).
+fn warn_risky_spec(spec: &spec::Spec, spec_dir: &Path) {
+    fn warn(msg: &str) {
+        eprintln!("warning: {msg}");
+    }
+    for mapping in &spec.hostfs.mappings {
+        let globs: Option<&spec::hostfs::Globs> = match mapping {
+            spec::hostfs::Mapping::Rw { glob } => Some(glob),
+            _ => None,
+        };
+        if let Some(globs) = globs {
+            for g in &globs.0 {
+                if g == "/etc" || g == "/etc/**" {
+                    warn("the spec maps /etc read-write into the sandbox; system-wide \
+                          configuration is writable by the command");
+                }
+                if g == "${HOME}"
+                    || g == "~"
+                    || g.starts_with("${HOME}")
+                    || g.starts_with("~/")
+                {
+                    warn(&format!(
+                        "the spec maps the home directory ({g}) read-write into the sandbox; \
+                         consider narrower mappings (project dir, caches)"
+                    ));
+                }
+                if g.contains(".ssh") {
+                    warn(&format!(
+                        "the spec maps an .ssh path ({g}) into the sandbox; keys and \
+                         configuration are exposed (read-only mappings expose them too)"
+                    ));
+                }
+            }
+        }
+    }
+    // No filter configured: the section is absent (or all-default).
+    let no_seccomp = spec.seccomp == spec::seccomp::SeccompConfig::default();
+    if no_seccomp {
+        warn("the spec has no `seccomp` section: the command runs without a syscall \
+              filter. Consider `\"seccomp\": { \"preset\": \"default\" }`.");
+    }
+    if matches!(spec.net, spec::net::NetConfig::Host { .. }) && no_seccomp {
+        warn("host networking without a seccomp filter: the command can reach every \
+              address family the kernel allows (see the seccomp module docs for the \
+              documented gaps). Proxy or waf mode restricts egress to the allow-list.");
+    }
+    let _ = spec_dir;
 }

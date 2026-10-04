@@ -67,15 +67,18 @@ fn fd_sweep_limit() -> u32 {
 pub(crate) fn mkdtemp_dir(template: &[u8], msg: &str) -> PathBuf {
     let mut tmpl: Vec<u8> = template.to_vec();
     tmpl.push(0);
-    let raw = unsafe { libc::mkdtemp(CString::from_vec_with_nul(tmpl).unwrap().into_raw()) };
-    if raw.is_null() {
+    let c = CString::from_vec_with_nul(tmpl).unwrap();
+    let raw = unsafe { libc::mkdtemp(c.clone().into_raw()) };
+    // Reclaim the template allocation (AUDIT.md cleanup: `into_raw`
+    // leaks the CString if it is never rebuilt); keep `c` alive until
+    // `mkdtemp` has consumed its copy.
+    let path = if raw.is_null() {
         die_with_error(msg);
-    }
-    PathBuf::from(
-        unsafe { CStr::from_ptr(raw) }
-            .to_string_lossy()
-            .into_owned(),
-    )
+    } else {
+        PathBuf::from(unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned())
+    };
+    drop(unsafe { CString::from_raw(raw as *mut libc::c_char) });
+    path
 }
 
 /// The spec's `rlimits` section, registered when the spec is compiled
@@ -149,6 +152,20 @@ pub(crate) fn cstring(s: &OsStr) -> CString {
     CString::new(s.as_bytes()).unwrap_or_else(|_| die(&format!("Path contains NUL byte: {s:?}")))
 }
 
+/// Run `fut` to completion on a fresh current-thread tokio runtime.
+/// Shared by the launcher's supervisor loop (sandbox.rs) and the netns
+/// parent (netns.rs) — the duplicated construction used to live in both.
+pub(crate) fn block_on<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| die_with_error(&format!("Can't start async runtime: {e}")));
+    rt.block_on(fut)
+}
+
 /// Exit with the raw waitpid status of the sandboxed command.
 pub fn exit_with_status(status: libc::c_int) -> ! {
     if libc::WIFEXITED(status) {
@@ -197,6 +214,30 @@ fn ensure_dir(newroot: &Path, dest: &Path) {
         }
     } else {
         mkdir_p(newroot, dest);
+    }
+}
+
+/// SB-5: ensure the destination for a *file* bind source exists — an
+/// empty file on the tmpfs root (bwrap behavior), or an existing entry
+/// in the hostfs root. The bind then replaces the empty placeholder.
+fn ensure_file(newroot: &Path, dest: &Path) {
+    if crate::hostfs::root_mode() {
+        let full = sandbox_path(newroot, dest);
+        if let Some(parent) = full.parent() {
+            mkdir_p(newroot, parent.strip_prefix(newroot).unwrap_or(parent));
+        }
+        if fs::metadata(&full).is_err() {
+            if let Err(e) = fs::File::create(&full) {
+                die_with_error(&format!(
+                    "Can't create bind target {}: {e}",
+                    dest.display()
+                ));
+            }
+        }
+    } else {
+        // hostfs-root: only the existence check applies (the mirror
+        // must already expose the destination).
+        ensure_dir(newroot, dest);
     }
 }
 
@@ -251,6 +292,23 @@ pub(crate) fn userns_id() -> Option<(u64, u64)> {
     Some((md.dev(), md.ino()))
 }
 
+/// SB-11: set a neutral hostname in the (freshly unshared) UTS
+/// namespace, so the sandboxed command does not see a copy of the
+/// operator's hostname. Best effort.
+fn set_neutral_hostname() {
+    const HOSTNAME: &[u8] = b"ai-bubble\0";
+    unsafe {
+        if libc::sethostname(HOSTNAME.as_ptr().cast(), HOSTNAME.len() - 1) != 0 {
+            eprintln!("warning: can't set a neutral hostname (keeping the inherited one)");
+        }
+    }
+}
+
+/// Crate-visible wrapper for the netns path (see [`set_neutral_hostname`]).
+pub(crate) fn set_neutral_hostname_pub() {
+    set_neutral_hostname();
+}
+
 /// The cgroup namespace part of the unshare flags, bwrap-style
 /// (`--unshare-cgroup-try`): `CLONE_NEWCGROUP` only when the kernel exposes
 /// `/proc/self/ns/cgroup` (on pre-4.6 kernels it does not exist and the flag
@@ -285,6 +343,30 @@ pub(crate) fn check_new_userns(old_userns: Option<(u64, u64)>) {
             "unshare() returned success, but the user namespace was not created.\n\
              Your environment (seccomp filter, sandbox or LSM) may be blocking \
              CLONE_NEWUSER.",
+        );
+    }
+}
+
+/// The (dev, inode) identity of `/proc/self/ns/net`, like [`userns_id`].
+pub(crate) fn netns_id() -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let md = fs::metadata("/proc/self/ns/net").ok()?;
+    Some((md.dev(), md.ino()))
+}
+
+/// Verify that unshare() really created a new *network* namespace (SB-2):
+/// like the user-namespace check above, some supervisors silently strip
+/// `CLONE_NEWNET` while still returning success — leaving P and the
+/// command on the host network while the operator believes networking is
+/// proxied (P's frontends bind on host loopback and the command gets
+/// direct, unfiltered Internet/LAN access).
+pub(crate) fn check_new_netns(old_netns: Option<(u64, u64)>) {
+    let new_netns = netns_id();
+    if new_netns.is_none() || new_netns == old_netns {
+        die(
+            "unshare() returned success, but the network namespace was not created.\n\
+             Your environment (seccomp filter, sandbox or LSM) may be blocking \
+             CLONE_NEWNET. Refusing to run with unfiltered host networking.",
         );
     }
 }
@@ -453,6 +535,12 @@ pub fn setup_and_exec(
             die_with_error("Can't unshare UTS namespace");
         }
 
+        // SB-11: the UTS namespace keeps a *copy* of the host hostname
+        // otherwise — mild fingerprinting (the command can read the
+        // operator's chosen hostname). Set a neutral one. Best effort:
+        // failure does not affect isolation.
+        set_neutral_hostname();
+
         // Set up the id mappings in the same order as bwrap: uid_map, then
         // setgroups deny, then gid_map. The setgroups deny is required before
         // gid_map unless the writer has CAP_SETGID in the parent namespace.
@@ -568,9 +656,13 @@ pub(crate) unsafe fn pidns_and_exec(
         // control only while the relay happens to idle.
         let use_pty = crate::pty::wanted(new_session);
         if use_pty && crate::control::listening() {
+            // SB-8: this fires when control *is* enabled (the default) —
+            // the remedy is to pass `--no-control`, not `--no-new-session`
+            // (the message said the opposite).
             die(
-                "--no-control cannot be combined with the terminal relay: run with a \
-                 non-terminal stdin/stdout or pass --no-new-session",
+                "--no-control is required with the terminal relay: the relay owns the \
+                 supervisor for the whole run, so runtime control cannot be served. \
+                 Re-run with --no-control (or use a non-terminal stdin/stdout).",
             );
         }
         let pty = if use_pty {
@@ -579,6 +671,17 @@ pub(crate) unsafe fn pidns_and_exec(
             None
         };
         let stderr_is_tty = libc::isatty(2) == 1;
+        // SB-9: pre-create the tmpfs root's backing directory in the
+        // launcher (hostfs-root mode needs none), so it can be removed
+        // again after the run — see `build_root`.
+        let root_backing = if crate::hostfs::root_mode() {
+            None
+        } else {
+            Some(mkdtemp_dir(
+                b"/tmp/ai-bubble.XXXXXX",
+                "Can't create temporary sandbox root",
+            ))
+        };
         let pid = libc::fork();
         if pid < 0 {
             die_with_error("Can't fork sandboxed command");
@@ -607,6 +710,7 @@ pub(crate) unsafe fn pidns_and_exec(
                 new_session,
                 pty.as_ref().map(|p| p.slave_path.as_str()),
                 seccomp,
+                root_backing.as_deref(),
             );
         }
 
@@ -633,11 +737,7 @@ pub(crate) unsafe fn pidns_and_exec(
         // fork, so `listening()` is false there.
         if crate::control::listening() {
             let status = {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap_or_else(|e| die_with_error(&format!("Can't start async runtime: {e}")));
-                rt.block_on(async {
+                block_on(async {
                     let hub = crate::audit::spawn_hub();
                     let replies = crate::control::Replies::from_peers(hub.replies);
                     let status = tokio::select! {
@@ -663,12 +763,21 @@ pub(crate) unsafe fn pidns_and_exec(
                     status
                 })
             };
+            // SB-9: remove the root's backing directory — in this (launcher's)
+            // view it is empty (the tmpfs mount lives only in the child's
+            // mount namespace).
+            if let Some(p) = &root_backing {
+                let _ = fs::remove_dir_all(p);
+            }
             exit_with_status(status);
         }
         let mut status: libc::c_int = 0;
         loop {
             let r = libc::waitpid(pid, &mut status, 0);
             if r == pid {
+                if let Some(p) = &root_backing {
+                    let _ = fs::remove_dir_all(p);
+                }
                 exit_with_status(status);
             }
             if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
@@ -759,6 +868,16 @@ pub(crate) unsafe fn drop_all_capabilities() {
 /// Mount a fresh tmpfs on `dest_abs` (a path inside the new sandbox root),
 /// like bwrap's `setup_op_tmpfs_mount`: `MS_NOSUID | MS_NODEV`, a `mode=`
 /// option and an optional `size=` (bytes; 0 means the kernel default).
+/// The default tmpfs size cap in bytes (SB-3): tmpfs pages are charged to
+/// the host's memory, and `RLIMIT_AS` does not cover tmpfs, so an
+/// uncapped tmpfs writable by the command is a host-memory DoS (fill it
+/// until the OOM killer fires). Without an explicit `size` option the
+/// kernel default is ≈ half of host RAM. 512 MiB is a generous default
+/// for build/tmp workloads; a spec can override it per mount with the
+/// tmpfs `size` option. The sandbox *root* tmpfs (which has no spec
+/// knob) always gets this default.
+pub(crate) const DEFAULT_TMPFS_SIZE: u64 = 512 * 1024 * 1024;
+
 pub(crate) unsafe fn mount_tmpfs(
     dest_abs: &Path,
     perms: TmpfsPerms,
@@ -766,13 +885,22 @@ pub(crate) unsafe fn mount_tmpfs(
     display: &Path,
 ) {
     let mut options = perms.mount_option();
-    if let Some(bytes) = size {
-        if bytes == 0 {
-            die("Invalid tmpfs size 0");
+    let bytes = match size {
+        Some(bytes) => {
+            if bytes == 0 {
+                die("Invalid tmpfs size 0");
+            }
+            bytes
         }
-        options.push_str(&format!(",size={bytes}"));
-    }
-    let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
+        // SB-3: an unspecified size used to mean "kernel default" (≈ half
+        // of host RAM, uncapped relative to the command's rlimits), a
+        // host-memory DoS from inside the sandbox. Default to the cap.
+        None => DEFAULT_TMPFS_SIZE,
+    };
+    options.push_str(&format!(",size={bytes}"));
+    // SB-10: a NUL byte in a spec tmpfs destination panics here without
+    // the clean `die()` every other path uses.
+    let dest_c = cstring(dest_abs.as_os_str());
     let options_c = CString::new(options).unwrap();
     if unsafe {
         libc::mount(
@@ -810,7 +938,12 @@ pub(crate) unsafe fn mount_tmpfs(
 /// provided too, because the command's controlling terminal is now the
 /// private pty, not the caller's. In plain new-session mode both stay
 /// out of the sandbox, exactly as before.
-unsafe fn build_root(ops: &[Op], new_session: bool, pty_slave_path: Option<&str>) -> PathBuf {
+unsafe fn build_root(
+    ops: &[Op],
+    new_session: bool,
+    pty_slave_path: Option<&str>,
+    pre_created_root: Option<&Path>,
+) -> PathBuf {
     unsafe {
         if libc::unshare(libc::CLONE_NEWNS) != 0 {
             die_with_error("Can't unshare mount namespace");
@@ -839,11 +972,20 @@ unsafe fn build_root(ops: &[Op], new_session: bool, pty_slave_path: Option<&str>
                 None => die("hostfs root requested but no host filesystem is mounted"),
             }
         } else {
-            // Create a fresh tmpfs to serve as the sandbox root.
-            let newroot = mkdtemp_dir(
-                b"/tmp/ai-bubble.XXXXXX",
-                "Can't create temporary sandbox root",
-            );
+            // Create a fresh tmpfs to serve as the sandbox root. SB-9: the
+            // backing directory `/tmp/ai-bubble.XXXXXX` is created by the
+            // launcher (before the fork) when possible, so it can remove
+            // it after the run — the mount itself lives only in this
+            // (child's) mount namespace, so in the launcher's view the
+            // directory is empty and plain `remove_dir_all` cleans it up;
+            // otherwise it leaks one directory per run.
+            let newroot = match pre_created_root {
+                Some(p) => p.to_path_buf(),
+                None => mkdtemp_dir(
+                    b"/tmp/ai-bubble.XXXXXX",
+                    "Can't create temporary sandbox root",
+                ),
+            };
 
             let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
             if libc::mount(
@@ -854,8 +996,12 @@ unsafe fn build_root(ops: &[Op], new_session: bool, pty_slave_path: Option<&str>
                 // attacker-writable inside the sandbox, so it must not honor
                 // set-id bits or device nodes (unreachable today —
                 // no_new_privs, no CAP_MKNOD — but the flags cost nothing).
+                // SB-3: the root tmpfs gets the default size cap — without
+                // it the kernel default is ≈ half of host RAM and the
+                // command can fill it until the OOM killer fires (no
+                // cgroup, and RLIMIT_AS does not cover tmpfs).
                 libc::MS_NOSUID | libc::MS_NODEV,
-                std::ptr::null(),
+                format!("size={}", DEFAULT_TMPFS_SIZE).as_ptr() as *const libc::c_void,
             ) != 0
             {
                 die_with_error("Can't mount tmpfs sandbox root");
@@ -909,7 +1055,17 @@ unsafe fn build_root(ops: &[Op], new_session: bool, pty_slave_path: Option<&str>
                     // the tmpfs root (bwrap does the same for its new root).
                     // In hostfs-root mode they must already exist in the
                     // mirror (the FUSE filesystem only exposes mirrored paths).
-                    ensure_dir(&newroot, dest);
+                    //
+                    // SB-5: a *file* source needs an empty destination
+                    // file, not a directory — bwrap behaves the same, and
+                    // mounting a file onto a directory fails with
+                    // ENOTDIR. The previously filled-but-unused `src_stat`
+                    // decides.
+                    if src_stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+                        ensure_file(&newroot, dest);
+                    } else {
+                        ensure_dir(&newroot, dest);
+                    }
                     refuse_symlink_dest(&newroot, dest);
                     let dest_c = cstring(dest_abs.as_os_str());
                     if libc::mount(
@@ -927,17 +1083,35 @@ unsafe fn build_root(ops: &[Op], new_session: bool, pty_slave_path: Option<&str>
                     // read-only flag is applied with a remount: MS_BIND
                     // mounts do not reliably pick up MS_RDONLY in the
                     // initial mount call.
-                    if !rw
-                        && libc::mount(
-                            std::ptr::null(),
-                            dest_c.as_ptr(),
-                            std::ptr::null(),
-                            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                            std::ptr::null(),
-                        ) != 0
+                    //
+                    // SB-4: every bind remount (ro *and* rw) also forces
+                    // MS_NOSUID|MS_NODEV, like bwrap: both would otherwise
+                    // inherit the source mount's flags, so device nodes
+                    // already present on a bound host tree (e.g. an ro bind
+                    // of `/`) would stay openable per host DAC, and set-id
+                    // binaries would keep their bit (mitigated by
+                    // no_new_privs, but the flags cost nothing).
+                    let harden = libc::MS_BIND
+                        | libc::MS_REMOUNT
+                        | libc::MS_NOSUID
+                        | libc::MS_NODEV
+                        | if !rw { libc::MS_RDONLY } else { 0 };
+                    if libc::mount(
+                        std::ptr::null(),
+                        dest_c.as_ptr(),
+                        std::ptr::null(),
+                        harden,
+                        std::ptr::null(),
+                    ) != 0
                     {
+                        if !rw {
+                            die_with_error(&format!(
+                                "Can't make bind mount {src} -> {} read-only",
+                                dest.display()
+                            ));
+                        }
                         die_with_error(&format!(
-                            "Can't make bind mount {src} -> {} read-only",
+                            "Can't harden bind mount {src} -> {} (NOSUID/NODEV)",
                             dest.display()
                         ));
                     }
@@ -958,6 +1132,15 @@ unsafe fn build_root(ops: &[Op], new_session: bool, pty_slave_path: Option<&str>
                     // sandbox's processes. (We are inside the new PID
                     // namespace here — pidns_and_exec forked before the setup
                     // — which is what binds the instance to it.)
+                    //
+                    // SB-12 residual: the fresh procfs is mounted whole —
+                    // no `subset=pid`, no `hidepid` — so `/proc/sys` and
+                    // `/proc/kallsyms` (a KASLR leak when
+                    // `kptr_restrict=0`) are visible to the command, like
+                    // on the host. bwrap uses `subset=pid` on modern
+                    // kernels; not done here because several real
+                    // workloads read top-level files (`/proc/cpuinfo`,
+                    // `/proc/meminfo`) that subset=pid hides.
                     if libc::mount(
                         CString::new("proc").unwrap().as_ptr(),
                         dest_c.as_ptr(),
@@ -1213,9 +1396,10 @@ pub(crate) unsafe fn mount_and_exec(
     new_session: bool,
     pty_slave_path: Option<&str>,
     seccomp: Option<&SeccompPolicy>,
+    pre_created_root: Option<&Path>,
 ) -> ! {
     unsafe {
-        let newroot = build_root(ops, new_session, pty_slave_path);
+        let newroot = build_root(ops, new_session, pty_slave_path, pre_created_root);
         // Enter the sandbox and run the command.
         let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
         if libc::chdir(newroot_c.as_ptr()) != 0 {
@@ -1330,6 +1514,49 @@ pub(crate) unsafe fn mount_and_exec(
         // the exec-failure message) is left to do. An allowlist that
         // omits `execve` denies exactly that exec, so the command cannot
         // start at all.
+        // Close every inherited fd above stderr (AUDIT.md L3): a caller-
+        // leaked host *directory* fd would let `fchdir` move the command's
+        // cwd outside the chroot — full host-fs access within this mount
+        // namespace. ai-bubble's own fds are all CLOEXEC; this closes fds
+        // the *caller* leaked into the run. `close_range` is one syscall
+        // and atomic; on older kernels fall back to a plain close sweep
+        // (a hole between the sweep's table read and exec is not a concern:
+        // the sweeper holds no racing threads).
+        //
+        // This must run *before* the seccomp filter is installed (SB-1):
+        // with an allowlist that omits `close_range`/`close`, the sweep
+        // below would fail with EPERM under the live filter and a
+        // silently-ignored fallback loop would leave leaked host fds open
+        // across exec — a chroot escape. Only fds 0/1/2 (plus the exec
+        // path itself) are needed after the sweep, so doing it first is
+        // always safe.
+        if libc::syscall(libc::SYS_close_range, 3u64, libc::c_uint::MAX, 0u64) != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ENOSYS) && e.raw_os_error() != Some(libc::EINVAL) {
+                die_with_error("Can't close inherited file descriptors");
+            }
+            for fd in 3..fd_sweep_limit() {
+                // Check for errors: under a seccomp allowlist (or with a
+                // bad fd) close() can fail, and an unchecked failure here
+                // would silently leave a leaked fd open across exec.
+                if { libc::close(fd as libc::c_int) } != 0
+                    && io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
+                {
+                    die_with_error("Can't close inherited file descriptor");
+                }
+            }
+        }
+
+        // The seccomp filter, installed last so that everything above
+        // (mounts, chroot, the uid change, the fd sweep) still uses the
+        // full syscall surface. `PR_SET_NO_NEW_PRIVS` is already set (it
+        // survives fork and exec and is required for an unprivileged
+        // filter load). Once the filter is live, only the allowed
+        // syscalls are available to the code below — which is why it is
+        // applied immediately before exec, when nothing but `execvp`
+        // itself (and the exec-failure message) is left to do. An
+        // allowlist that omits `execve` denies exactly that exec, so the
+        // command cannot start at all.
         if let Some(policy) = seccomp {
             apply_seccomp(policy);
         }
@@ -1344,24 +1571,6 @@ pub(crate) unsafe fn mount_and_exec(
         argv_ptrs.push(std::ptr::null());
 
         let _ = io::Write::flush(&mut io::stdout());
-
-        // Close every inherited fd above stderr (AUDIT.md L3): a caller-
-        // leaked host *directory* fd would let `fchdir` move the command's
-        // cwd outside the chroot — full host-fs access within this mount
-        // namespace. ai-bubble's own fds are all CLOEXEC; this closes fds
-        // the *caller* leaked into the run. `close_range` is one syscall
-        // and atomic; on older kernels fall back to a plain close sweep
-        // (a hole between the sweep's table read and exec is not a concern:
-        // the sweeper holds no racing threads).
-        if libc::syscall(libc::SYS_close_range, 3u64, libc::c_uint::MAX, 0u64) != 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::ENOSYS) && e.raw_os_error() != Some(libc::EINVAL) {
-                die_with_error("Can't close inherited file descriptors");
-            }
-            for fd in 3..fd_sweep_limit() {
-                libc::close(fd as libc::c_int);
-            }
-        }
 
         libc::execvp(argv[0].as_ptr(), argv_ptrs.as_ptr());
         die_with_error(&format!("Can't exec {}", command[0]));
@@ -1445,7 +1654,9 @@ fn apply_seccomp(policy: &SeccompPolicy) {
     // ambiguous); the gate is best-effort there. Host-network mode must
     // be treated as full local IPC for untrusted commands — see the
     // module docs in `spec/seccomp.rs` and the README's "Unix-domain
-    // sockets" section.
+    // sockets" section. The x32 ABI has the same shape (offset numbers
+    // pass the arch check); it is documented alongside the ia32 case
+    // there.
     let sockets = policy.sockets();
     let denied: Vec<(u64, &str)> = [
         (libc::AF_UNIX as u64, "unix_sockets", sockets.unix_sockets),

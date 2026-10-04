@@ -741,3 +741,26 @@ fn mappings_round_trip_through_the_control_serialization() {
         .is_err()
     );
 }
+
+/// The checked-in JSON schema must never drift from the generated one
+/// (SP-4): a stale schema rejects valid — security-relevant — spec
+/// fields (`rlimits`, new `net` variants, …) and editors flag them as
+/// invalid, so users end up stripping exactly the fields that protect
+/// them. Fails on drift; regenerate with
+/// `ai-bubble --print-schema > ai-bubble.spec.schema.json`.
+#[test]
+fn checked_in_schema_matches_the_generated_one() {
+    let generated = crate::spec_schema();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ai-bubble.spec.schema.json"
+    );
+    let checked_in = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!("can't read {path}: {e}");
+    });
+    assert_eq!(
+        checked_in, generated,
+        "ai-bubble.spec.schema.json is stale — regenerate with `ai-bubble \
+         --print-schema > ai-bubble.spec.schema.json`"
+    );
+}

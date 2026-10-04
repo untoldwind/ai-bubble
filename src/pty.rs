@@ -56,6 +56,13 @@
 //! runs with a tty on stdout alike). The TIOCSTI analysis above is
 //! unaffected.
 //!
+//! Accepted residual (SB-14, same class as `script(1)`): the relay's
+//! fds 0/1 are blocking, so a user pressing `^S` (flow stop) on the
+//! terminal blocks the relay — including the forwarding of fatal
+//! signals, which resumes when the terminal is unfrozen (`^Q`). The
+//! command sees the same behavior under `script(1)`; a non-blocking
+//! relay would instead need a write-buffer implementation.
+//!
 //! The relay is also transparent **towards the command**: it is a plain
 //! bidirectional byte pipe, so a command can issue terminal *queries*
 //! (DA, XTGETTCAP, palette/cursor reports) and **receive the real

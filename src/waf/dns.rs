@@ -149,6 +149,14 @@ async fn reply(sock: &Path, query: &[u8]) -> Vec<u8> {
     // reply needs before the packet is turned into a reply.
     let question = packet.questions[0].clone();
     let name = question.qname.to_string().to_ascii_lowercase();
+    // NET-5: the qname is interpolated verbatim into the host command
+    // line (`resolve-dns {name}`); validate it here, before sending —
+    // the waf frontends' `valid_name` rejects control bytes (a `\n` in a
+    // DNS label would otherwise ride on the one-line-per-connection
+    // invariant and could inject a second command).
+    if !super::host::valid_name(&name) {
+        return formerr(query);
+    }
     let (rcode, answer) = match resolve(sock, &name).await {
         Ok(true) => match question.qtype {
             QTYPE::TYPE(simple_dns::TYPE::A) => (RCODE::NoError, Some(redirect_addr())),

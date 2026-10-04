@@ -1010,9 +1010,18 @@ impl HostFsConfig {
     /// per path, in the listed order — exactly like separate mappings.
     ///
     /// Returns without changing anything when there are no cache mappings.
-    /// Called by `ai-bubble run` (never by `ls`, which only shows the
-    /// unresolved mappings).
-    pub fn prepare_caches(&mut self, spec_dir: &Path, session_root: Option<&Path>) {
+    /// Errors when a `session-cache` mapping exists but no session root
+    /// was provided — instead of the old `.expect` panic (SP-3): on the
+    /// `spec-reload` path (a run started without a `session-cache`
+    /// mapping that reloads into one) the control task must report the
+    /// failure cleanly, not panic in violation of the "report, don't
+    /// die" contract. Called by `ai-bubble run` (never by `ls`, which
+    /// only shows the unresolved mappings).
+    pub fn prepare_caches(
+        &mut self,
+        spec_dir: &Path,
+        session_root: Option<&Path>,
+    ) -> Result<(), String> {
         // The spec dir itself may be relative (e.g. the default
         // `.ai-bubble`): resolve it against the current directory first,
         // like `resolve_relative_sources` does.
@@ -1023,30 +1032,48 @@ impl HostFsConfig {
             Mapping(Mapping),
             Cache { dest: String, source: PathBuf },
         }
-        self.mappings = self
+        let resolved: Vec<Resolved> = self
             .mappings
             .iter()
-            .flat_map(|mapping| match mapping {
-                Mapping::SessionCache { path } => path
-                    .0
-                    .iter()
-                    .map(|p| Resolved::Cache {
-                        dest: p.clone(),
-                        source: session_root
-                            .expect("session root provided whenever session-cache mappings exist")
-                            .join(sub_path(p)),
-                    })
-                    .collect::<Vec<_>>(),
-                Mapping::ProjectCache { path } => path
-                    .0
-                    .iter()
-                    .map(|p| Resolved::Cache {
-                        dest: p.clone(),
-                        source: dir.join("cache").join(sub_path(p)),
-                    })
-                    .collect::<Vec<_>>(),
-                other => vec![Resolved::Mapping(other.clone())],
+            .map(|mapping| -> Result<Vec<Resolved>, String> {
+                Ok(match mapping {
+                    Mapping::SessionCache { path } => path
+                        .0
+                        .iter()
+                        .map(|p| -> Result<Resolved, String> {
+                            // SP-3: a run that started without a
+                            // `session-cache` mapping has no session root;
+                            // a `spec-reload` that adds one is a restart
+                            // requirement, not a panic.
+                            let root = session_root.ok_or_else(|| {
+                                "session-cache mapping but no session root: this run started \
+                                 without a session-cache mapping — restart to add \
+                                 session-cache mappings"
+                                    .to_string()
+                            })?;
+                            Ok(Resolved::Cache {
+                                dest: p.clone(),
+                                source: root.join(sub_path(p)),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Mapping::ProjectCache { path } => path
+                        .0
+                        .iter()
+                        .map(|p| Resolved::Cache {
+                            dest: p.clone(),
+                            source: dir.join("cache").join(sub_path(p)),
+                        })
+                        .collect::<Vec<_>>(),
+                    other => vec![Resolved::Mapping(other.clone())],
+                })
             })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        self.mappings = resolved
+            .into_iter()
             .map(|resolved| match resolved {
                 Resolved::Mapping(mapping) => mapping,
                 Resolved::Cache { dest, source } => {
@@ -1062,7 +1089,8 @@ impl HostFsConfig {
                     }
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        Ok(())
     }
 
     /// Whether any `session-cache` mapping needs a per-run tmp directory
@@ -1528,7 +1556,7 @@ mod tests {
         );
 
         let root = crate::hostfs::new_session_cache_dir();
-        spec.hostfs.prepare_caches(&dir, Some(&root));
+        spec.hostfs.prepare_caches(&dir, Some(&root)).unwrap();
         // Every cache mapping became a redirect-rw against its backing
         // directory, which was created (empty).
         let sources: Vec<_> = spec
@@ -1568,7 +1596,8 @@ mod tests {
             parse(r#"{ "hostfs": { "mappings": [ { "type": "rw", "glob": "/etc" } ] } }"#);
         assert!(!spec.hostfs.has_session_caches());
         spec.hostfs
-            .prepare_caches(Path::new("/nonexistent-ai-bubble-test"), None);
+            .prepare_caches(Path::new("/nonexistent-ai-bubble-test"), None)
+            .unwrap();
         assert_eq!(spec.hostfs.mappings.len(), 1);
     }
 

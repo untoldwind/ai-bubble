@@ -256,6 +256,7 @@ fn isolated_parent(
         // already-mapped ids. As in sandbox::setup_and_exec, the real uid/gid
         // is mapped onto SANDBOX_ID (not 0), so the command never runs as root.
         let old_userns = userns_id();
+        let old_netns = crate::sandbox::netns_id();
         // The cgroup namespace is unshared in the same call (like bwrap's
         // --unshare-all; it must be combined with CLONE_NEWUSER — see
         // sandbox::cgroup_ns_flags).
@@ -269,6 +270,10 @@ fn isolated_parent(
             die_with_error("Can't unshare user/network namespaces");
         }
         crate::sandbox::check_new_userns(old_userns);
+        crate::sandbox::check_new_netns(old_netns);
+        // SB-11: the unshare included CLONE_NEWUTS — replace the copied
+        // host hostname with a neutral one (best effort).
+        crate::sandbox::set_neutral_hostname_pub();
         write_id_map(
             "/proc/self/uid_map",
             &format!("{} {real_uid} 1\n", crate::sandbox::SANDBOX_ID),
@@ -311,6 +316,11 @@ fn isolated_parent(
                         ("all_proxy", PROXY_URL),
                         ("ALL_PROXY", PROXY_URL),
                         ("NO_PROXY", "localhost,127.0.0.1,::1"),
+                        // SB-7: some tools honor only the lowercase form;
+                        // without it they would route localhost traffic
+                        // through the proxy (breakage, and a
+                        // confused-deputy with a wildcard allow entry).
+                        ("no_proxy", "localhost,127.0.0.1,::1"),
                     ]
                     .into_iter()
                     .map(|(key, val)| (key.to_string(), val.to_string())),
@@ -494,11 +504,7 @@ fn block_on<F, T>(fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap_or_else(|e| die(&format!("Can't start async runtime: {e}")));
-    rt.block_on(fut)
+    crate::sandbox::block_on(fut)
 }
 
 /// Bring up the loopback interface in the current network namespace.

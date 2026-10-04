@@ -362,41 +362,6 @@ pub(crate) fn stat_entry(parent: &AnchoredParent) -> io::Result<libc::stat> {
 
 /// `readlinkat` on an already-pinned parent — the target of the symlink
 /// standing at `parent`'s final component.
-///
-/// Currently unused: `link` of a symlink is denied outright (AUDIT.md
-/// M5), so no operation needs to read a pinned symlink's target any more.
-/// Kept as the pinned-parent counterpart of [`read_link`] for future ops.
-#[allow(dead_code)]
-pub(crate) fn read_link_at(parent: &AnchoredParent) -> io::Result<std::ffi::OsString> {
-    let mut size = 4096usize;
-    loop {
-        let mut buf = vec![0u8; size];
-        // SAFETY: valid descriptor, NUL-terminated name, `buf` writable for
-        // `size` bytes.
-        let n = unsafe {
-            libc::readlinkat(
-                parent.dir().as_raw_fd(),
-                parent.name().as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_char,
-                size,
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let n = n as usize;
-        if n < size {
-            buf.truncate(n);
-            return Ok(OsStr::from_bytes(&buf).to_os_string());
-        }
-        // Truncated: retry with a larger buffer (a few rounds cover any
-        // real target; give up far beyond `PATH_MAX`).
-        if size >= 1 << 20 {
-            return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
-        }
-        size *= 2;
-    }
-}
 
 /// `readlinkat` on the anchored path, growing the buffer until the target
 /// fits — the anchored equivalent of `std::fs::read_link`.
