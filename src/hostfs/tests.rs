@@ -984,7 +984,7 @@ fn open_handles_are_capped() {
             } else {
                 "f0".to_string()
             });
-            match anchored::open_at(&f.root, &real, libc::O_RDONLY, 0) {
+            match f.root.open_at(&real, libc::O_RDONLY, 0) {
                 Ok(file) => match f.insert_handle(file, real.clone(), 1, false) {
                     Ok(fh) => fhs.push(fh),
                     Err(e) => {
@@ -999,7 +999,7 @@ fn open_handles_are_capped() {
         for fh in fhs {
             f.remove_handle(fh);
         }
-        let file = anchored::open_at(&f.root, &base.join("f0"), libc::O_RDONLY, 0).unwrap();
+        let file = f.root.open_at(&base.join("f0"), libc::O_RDONLY, 0).unwrap();
         assert!(f.insert_handle(file, base.join("f0"), 2, false).is_ok());
     });
 

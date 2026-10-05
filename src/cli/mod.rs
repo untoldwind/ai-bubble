@@ -329,10 +329,10 @@ mod tests {
     #[test]
     fn init_parses_and_takes_the_global_spec_dir() {
         let cli = parse(&["ai-bubble", "init"]);
-        assert_eq!(cli.command, Some(Command::Init(InitCommand::default())));
+        assert_eq!(cli.command, Some(Command::Init(InitCommand {})));
 
         let cli = parse(&["ai-bubble", "--spec-dir", "somedir", "init"]);
         assert_eq!(cli.spec.as_deref(), Some(std::path::Path::new("somedir")));
-        assert_eq!(cli.command, Some(Command::Init(InitCommand::default())));
+        assert_eq!(cli.command, Some(Command::Init(InitCommand {})));
     }
 }

@@ -295,7 +295,7 @@ impl Filesystem for HostFs {
         if self.patterns.load().is_empty(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        let target = anchored::read_link(&self.root, &self.patterns.load().redirect(&mirrored))?;
+        let target = self.root.read_link(&self.patterns.load().redirect(&mirrored))?;
         Ok(ReplyData::from(Bytes::copy_from_slice(
             target.as_os_str().as_encoded_bytes(),
         )))
@@ -456,7 +456,7 @@ impl Filesystem for HostFs {
         }
         // Anchored open relative to the pinned parent, final component
         // `O_NOFOLLOW` (see [`anchored`]).
-        let file = match anchored::open_at(&self.root, &real, oflags, 0) {
+        let file = match self.root.open_at(&real, oflags, 0) {
             Ok(f) => f,
             Err(e) => {
                 log_op_err("open", &mirrored, Some(&real), &e).await;
@@ -591,8 +591,7 @@ impl Filesystem for HostFs {
         // parent — never following symlinks (a host symlink is visible only
         // as a link, and its target may not be mirrored at all; and no
         // intermediate component is followed either).
-        let mut file = match anchored::open_at(
-            &self.root,
+        let mut file = match self.root.open_at(
             &self.patterns.load().redirect(&mirrored),
             libc::O_RDONLY,
             0,
@@ -774,7 +773,7 @@ impl Filesystem for HostFs {
         if append {
             oflags |= libc::O_APPEND;
         }
-        let mut file = match anchored::open_at(&self.root, &patterns.redirect(&mirrored), oflags, 0)
+        let mut file = match self.root.open_at(&patterns.redirect(&mirrored), oflags, 0)
         {
             Ok(f) => f,
             Err(e) => {
@@ -871,7 +870,7 @@ impl Filesystem for HostFs {
         // O_PATH works on any file type (including directories) and
         // O_NOFOLLOW keeps symlinked final components from being followed —
         // anchored, so intermediate components are not either.
-        let fd = match anchored::open_full(&self.root, &real, libc::O_PATH | libc::O_NOFOLLOW) {
+        let fd = match self.root.open_full(&real, libc::O_PATH | libc::O_NOFOLLOW) {
             Ok(fd) => fd,
             Err(e) => return Err(e.into()),
         };
@@ -1069,7 +1068,7 @@ impl Filesystem for HostFs {
             return Ok(());
         }
         let real = self.patterns.load().redirect(&mirrored);
-        let anchored = anchored::anchor_parent(&self.root, &real).map_err(|e| {
+        let anchored = self.root.anchor_parent(&real).map_err(|e| {
             // ENOENT mapping preserved from the old cpath construction.
             if e.raw_os_error() == Some(libc::EINVAL) {
                 return std::io::Error::from_raw_os_error(libc::ENOENT);
@@ -1096,14 +1095,14 @@ impl Filesystem for HostFs {
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
-                    if !Self::stat_is_symlink(&anchored::lstat(&self.root, &real)?) => {}
+                    if !Self::stat_is_symlink(&self.root.lstat(&real)?) => {}
                 _ => return Err(err.into()),
             }
-            let file = anchored::open_at(&self.root, &real, libc::O_RDONLY, 0)?;
+            let file = self.root.open_at(&real, libc::O_RDONLY, 0)?;
             if unsafe {
                 libc::faccessat(
                     file.as_raw_fd(),
-                    b"\0".as_ptr().cast(),
+                    c"".as_ptr(),
                     non_write as libc::c_int,
                     libc::AT_EMPTY_PATH,
                 )
@@ -1147,7 +1146,7 @@ impl Filesystem for HostFs {
         // syscall relative to the pinned parent descriptor, so no component
         // of the path can resolve through a host symlink (final-component
         // no-follow semantics are kept per operation, as before).
-        let anchored = anchored::anchor_parent(&self.root, &real)?;
+        let anchored = self.root.anchor_parent(&real)?;
         let dirfd = anchored.dir().as_raw_fd();
         let name = anchored.name().as_ptr();
         if let Some(size) = set_attr.size {
@@ -1304,7 +1303,7 @@ impl Filesystem for HostFs {
             return Err(libc::EEXIST.into());
         }
         let real = self.patterns.load().redirect(&mirrored);
-        let anchored = anchored::anchor_parent(&self.root, &real).map_err(|e| {
+        let anchored = self.root.anchor_parent(&real).map_err(|e| {
             if e.raw_os_error() == Some(libc::EINVAL) {
                 return std::io::Error::from_raw_os_error(libc::ENOENT);
             }
@@ -1380,7 +1379,7 @@ impl Filesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         let anchored =
-            anchored::anchor_parent(&self.root, &self.patterns.load().redirect(&mirrored))?;
+            self.root.anchor_parent(&self.patterns.load().redirect(&mirrored))?;
         if unsafe { libc::unlinkat(anchored.dir().as_raw_fd(), anchored.name().as_ptr(), 0) } != 0 {
             let e = std::io::Error::last_os_error();
             log_op_err(
@@ -1445,7 +1444,7 @@ impl Filesystem for HostFs {
             return Err(libc::EACCES.into());
         }
         let anchored =
-            anchored::anchor_parent(&self.root, &self.patterns.load().redirect(&mirrored))?;
+            self.root.anchor_parent(&self.patterns.load().redirect(&mirrored))?;
         if unsafe {
             libc::unlinkat(
                 anchored.dir().as_raw_fd(),
@@ -1555,8 +1554,8 @@ impl Filesystem for HostFs {
         // them: no component of either path can resolve through a host
         // symlink, and a swap between the two resolutions cannot re-point
         // either name (the operation acts *inside* the pinned directories).
-        let old_anchored = anchored::anchor_parent(&self.root, &old_real)?;
-        let new_anchored = anchored::anchor_parent(&self.root, &new_real)?;
+        let old_anchored = self.root.anchor_parent(&old_real)?;
+        let new_anchored = self.root.anchor_parent(&new_real)?;
         // HF-1: the `is_host_dir` checks above are a *separate* syscall
         // from the `renameat` below. If the source is a file at check time
         // but a directory at rename time (swapped via an out-of-band
@@ -1569,8 +1568,8 @@ impl Filesystem for HostFs {
         // the *fresh* verdict — directories always require it. The stats
         // and the rename run in one await-free block, so on the
         // single-threaded runtime nothing can swap the entry in between.
-        let old_stat = anchored::stat_entry(&old_anchored)?;
-        let new_stat = anchored::stat_entry(&new_anchored)?;
+        let old_stat = old_anchored.stat_entry()?;
+        let new_stat = new_anchored.stat_entry()?;
         let dir_rename = Self::stat_is_dir(&old_stat) || Self::stat_is_dir(&new_stat);
         if dir_rename
             && (self.patterns.load().subtree_restricted(&old)
@@ -1731,10 +1730,10 @@ impl Filesystem for HostFs {
         // syscall below run in one await-free block — on the
         // single-threaded runtime nothing can swap the entry in between.
         let old_anchored =
-            anchored::anchor_parent(&self.root, &self.patterns.load().redirect(&old))?;
+            self.root.anchor_parent(&self.patterns.load().redirect(&old))?;
         let new_anchored =
-            anchored::anchor_parent(&self.root, &self.patterns.load().redirect(&new))?;
-        let source_stat = anchored::stat_entry(&old_anchored)?;
+            self.root.anchor_parent(&self.patterns.load().redirect(&new))?;
+        let source_stat = old_anchored.stat_entry()?;
         if Self::stat_is_symlink(&source_stat) {
             // AUDIT.md M5: linking a host symlink used to re-create it on
             // the host (`symlinkat` with the server's credentials) — a
@@ -1813,11 +1812,11 @@ impl Filesystem for HostFs {
         // a host symlink standing at the target is never followed — neither
         // by the check nor by the open below.
         let real = self.patterns.load().redirect(&mirrored);
-        let anchored = anchored::anchor_parent(&self.root, &real)?;
+        let anchored = self.root.anchor_parent(&real)?;
         let excl = flags & libc::O_EXCL as u32 != 0;
         let truncate = flags & libc::O_TRUNC as u32 != 0;
         let append = flags & libc::O_APPEND as u32 != 0;
-        let existing = anchored::stat_entry(&anchored).ok();
+        let existing = anchored.stat_entry().ok();
         if let Some(st) = existing {
             if Self::stat_is_symlink(&st) {
                 log_op_err(
@@ -1867,7 +1866,7 @@ impl Filesystem for HostFs {
             if append {
                 oflags |= libc::O_APPEND;
             }
-            let file = match anchored::open_at(&self.root, &real, oflags, 0) {
+            let file = match self.root.open_at(&real, oflags, 0) {
                 Ok(f) => f,
                 Err(e) => {
                     log_op_err("create", &mirrored, Some(&real), &e).await;
@@ -1934,8 +1933,7 @@ impl Filesystem for HostFs {
         if append {
             oflags |= libc::O_APPEND;
         }
-        let file = match anchored::open_at(
-            &self.root,
+        let file = match self.root.open_at(
             &real,
             oflags,
             (mode & SAFE_MODE) as libc::mode_t,

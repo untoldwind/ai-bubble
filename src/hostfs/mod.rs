@@ -620,7 +620,7 @@ impl HostFs {
     /// Anchored `lstat` of a real host path: every component no-follow
     /// (the anchored `symlink_metadata`).
     fn real_lstat(&self, real: &Path) -> std::io::Result<libc::stat> {
-        anchored::lstat(&self.root, real)
+        self.root.lstat(real)
     }
 
     /// Whether the real host path exists at all (anchored `lstat` succeeds).
@@ -711,7 +711,7 @@ impl HostFs {
         let unfiltered = patterns.matches(mirrored);
         let base_real = patterns.redirect(mirrored);
         let mut dir: Option<std::os::fd::OwnedFd> = None;
-        let names: Vec<std::ffi::OsString> = match anchored::open_dir(&self.root, &base_real) {
+        let names: Vec<std::ffi::OsString> = match self.root.open_dir(&base_real) {
             Ok(opened) => {
                 // `readdir_names` consumes its descriptor (fdopendir/closedir
                 // owns it), so it lists a *duplicate*; the original stays

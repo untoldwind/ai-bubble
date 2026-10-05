@@ -1717,6 +1717,7 @@ mod tests {
     /// default current-thread one — blocking reads directly on it would
     /// stall the very runtime the spawned server tasks need (a deadlock).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the test lock must span the blocking client's await
     async fn control_server_end_to_end() {
         use std::io::Read as _;
         use std::os::unix::net::UnixStream as StdUnixStream;
@@ -1724,7 +1725,7 @@ mod tests {
         let _guard = lock();
         let dir = std::env::temp_dir().join(format!("ai-bubble-ctl-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir.join("spec")).unwrap();
+        std::fs::create_dir_all(dir.join("spec")).unwrap();
 
         crate::control::record_initial(crate::control::Start {
             fs_initial: Some(vec![serde_json::json!({"type": "ro", "glob": "/etc"})]),
@@ -1761,7 +1762,7 @@ mod tests {
         // runtime's only thread (see the test's doc comment).
         let client_spec_dir = spec_dir.clone();
         let client_shared = std::sync::Arc::clone(&shared);
-        let client = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let spec_dir = client_spec_dir;
             let shared = client_shared;
             let connect = || {
@@ -1818,7 +1819,6 @@ mod tests {
         .await
         .expect("the blocking client task must not fail");
 
-        let _ = client;
         crate::control::cleanup();
         assert!(!crate::control::running());
         assert!(!crate::control::token_path_for(&spec_dir).exists());

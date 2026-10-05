@@ -86,7 +86,7 @@ pub(crate) fn validate_entry(entry: &str) -> Result<(), String> {
         } else if !after.is_empty() {
             return Err(invalid("trailing garbage after the IPv6 literal"));
         }
-        if &entry[1..end] == "" {
+        if entry[1..end].is_empty() {
             return Err(invalid("empty host"));
         }
         return Ok(());

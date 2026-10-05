@@ -230,10 +230,10 @@ fn ensure_file(newroot: &Path, dest: &Path) {
         if let Some(parent) = full.parent() {
             mkdir_p(newroot, parent.strip_prefix(newroot).unwrap_or(parent));
         }
-        if fs::metadata(&full).is_err() {
-            if let Err(e) = fs::File::create(&full) {
-                die_with_error(&format!("Can't create bind target {}: {e}", dest.display()));
-            }
+        if fs::metadata(&full).is_err()
+            && let Err(e) = fs::File::create(&full)
+        {
+            die_with_error(&format!("Can't create bind target {}: {e}", dest.display()));
         }
     } else {
         // hostfs-root: only the existence check applies (the mirror
@@ -1389,6 +1389,7 @@ unsafe fn build_root(
 /// provided too, because the command's controlling terminal is now the
 /// private pty, not the caller's. In plain new-session mode both stay
 /// out of the sandbox, exactly as before.
+#[allow(clippy::too_many_arguments)] // all eight describe distinct mount/exec inputs
 pub(crate) unsafe fn mount_and_exec(
     ops: &[Op],
     command: &[String],
