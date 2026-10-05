@@ -1568,9 +1568,21 @@ impl Filesystem for HostFs {
         // the *fresh* verdict — directories always require it. The stats
         // and the rename run in one await-free block, so on the
         // single-threaded runtime nothing can swap the entry in between.
-        let old_stat = old_anchored.stat_entry()?;
-        let new_stat = new_anchored.stat_entry()?;
-        let dir_rename = Self::stat_is_dir(&old_stat) || Self::stat_is_dir(&new_stat);
+        //
+        // A stat *failure* is the same "not a directory" verdict
+        // `is_host_dir` above already rendered for a missing entry — it
+        // must not abort the op: renaming to a **fresh destination** is
+        // the common case (cargo's atomic target-directory creation
+        // renames `targetXXXXXX` → `target`; atomic writes rename
+        // `file.tmp` → `file`), and the destination's ENOENT used to fail
+        // the whole rename — unlogged, before `renameat` was even
+        // attempted. `renameat` stays the authoritative existence check
+        // for either side: a vanished source fails with ENOENT, exactly
+        // as the old path-based code reported it.
+        let old_stat = old_anchored.stat_entry().ok();
+        let new_stat = new_anchored.stat_entry().ok();
+        let dir_rename = old_stat.is_some_and(|st| Self::stat_is_dir(&st))
+            || new_stat.is_some_and(|st| Self::stat_is_dir(&st));
         if dir_rename
             && (self.patterns.load().subtree_restricted(&old)
                 || self.patterns.load().subtree_restricted(&new))

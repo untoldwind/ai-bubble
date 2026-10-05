@@ -667,6 +667,79 @@ fn link_of_a_symlink_is_denied() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
+/// Renaming to a **fresh destination** must work: the destination does not
+/// exist yet, and the HF-1 re-stat through the pinned parents must not turn
+/// the destination's ENOENT into an op failure before `renameat` (the
+/// syscall itself is the authoritative existence check for both sides).
+/// Cargo's atomic target-directory creation — tempdir `targetXXXXXX` plus a
+/// `CACHEDIR.TAG`, then rename to `target` — and atomic file writes
+/// (`file.tmp` → `file`) are exactly this pattern; with the re-stat
+/// propagating ENOENT, `cargo build` could not create its target directory
+/// at all (the failure was invisible in the op log, too).
+#[test]
+fn rename_to_a_fresh_destination_creates_the_new_name() {
+    let base = std::env::temp_dir().join(format!("ai-bubble-hostfs-rename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("targetXXXXXX")).unwrap();
+    std::fs::write(base.join("targetXXXXXX/CACHEDIR.TAG"), b"tag").unwrap();
+    std::fs::write(base.join("file.tmp"), b"content").unwrap();
+
+    let f = fs(&[(base.to_str().unwrap(), Permission::Rw)]);
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+
+    block(async {
+        // Directory rename to a name that does not exist yet — cargo's
+        // atomic target-directory creation.
+        f.rename(
+            Request::default(),
+            base_ino,
+            OsStr::new("targetXXXXXX"),
+            base_ino,
+            OsStr::new("target"),
+        )
+        .await
+        .expect("directory rename to a fresh destination");
+        // File rename to a fresh name — the atomic-write pattern.
+        f.rename(
+            Request::default(),
+            base_ino,
+            OsStr::new("file.tmp"),
+            base_ino,
+            OsStr::new("file"),
+        )
+        .await
+        .expect("file rename to a fresh destination");
+    });
+
+    assert!(
+        base.join("target").is_dir(),
+        "directory moved to fresh name"
+    );
+    assert_eq!(
+        std::fs::read(base.join("target/CACHEDIR.TAG")).unwrap(),
+        b"tag"
+    );
+    assert_eq!(
+        std::fs::read(base.join("file")).unwrap(),
+        b"content",
+        "file moved to fresh name"
+    );
+    assert!(
+        std::fs::symlink_metadata(base.join("targetXXXXXX")).is_err(),
+        "the source name is gone"
+    );
+    assert!(
+        std::fs::symlink_metadata(base.join("file.tmp")).is_err(),
+        "the source name is gone"
+    );
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
 /// The audit's H1 finding, exercised through the FUSE handlers: an `empty`
 /// mapping that names a *real existing host file* must blank the file out
 /// even for `open()`. Before the fix, `open(O_RDONLY)` lstat'ed and opened
