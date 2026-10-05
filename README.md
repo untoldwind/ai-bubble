@@ -120,8 +120,9 @@ Notes:
   `/lib64` and `/usr` read-only plus fresh `/dev`, `/tmp` and `/proc`, and
   passes the host's `PATH`/`HOME` through. It pins the project directory by
   its absolute path (rather than `${PWD}`); when the current directory is a
-  git repository, the spec directory is also added to its `.gitignore`
-  (created if missing, extended otherwise).
+  git repository, a `.gitignore` containing a single `*` entry is created
+  inside the spec directory, so its contents stay out of version control
+  (the project's own `.gitignore` is left untouched).
 * A missing `.ai-bubble/spec.json` is fine: an **empty spec** is used (empty
   tmpfs root, no mounts, host network). An *explicit* `--spec-dir` that
   cannot be read is a hard error. When a policy is mandatory, pass

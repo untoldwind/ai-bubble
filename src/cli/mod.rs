@@ -77,9 +77,9 @@ pub enum Command {
     /// Bootstrap the spec directory (`.ai-bubble`, or `--spec-dir DIR`) if
     /// it does not exist yet: creates it and writes a starter `spec.json`
     /// (pinning the project directory by absolute path) plus the JSON
-    /// Schema for it. When the current directory is a git repository, the
-    /// spec directory is also added to its `.gitignore`. An existing
-    /// directory is left untouched.
+    /// Schema for it. When the current directory is a git repository, a
+    /// `.gitignore` (ignoring everything) is created inside the spec
+    /// directory. An existing directory is left untouched.
     Init(InitCommand),
 
     /// Talk to a running instance's control socket (the run must have
