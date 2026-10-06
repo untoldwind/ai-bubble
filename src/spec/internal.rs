@@ -307,7 +307,7 @@ impl SandboxConfig {
     /// The fallible [`SandboxConfig::compile`]: every hard error (a bad
     /// `${VAR}` in `env`/`cwd`, an invalid glob, an unknown syscall
     /// name) is returned instead of killing the process. Used by
-    /// `spec-reload` (see [`crate::control`]): a spec that cannot be
+    /// `spec-reload` (see [`crate::cli::control`]): a spec that cannot be
     /// compiled mid-run must be an error reply to the control client,
     /// not the end of the launcher. Unlike `compile` it does not
     /// register the rlimits (see `compile`'s comment).

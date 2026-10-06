@@ -150,7 +150,7 @@ pub fn start_host_fs(patterns: &SharedPatterns) {
         // the inherited control listener: this child never serves
         // control, and a lingering copy would keep the abstract socket
         // name bound after the launcher exits.
-        crate::control::close_inherited_listener();
+        crate::cli::control::close_inherited_listener();
         if let Some(sv) = audit_pair {
             unsafe { libc::close(sv[0]) };
             crate::audit::set_channel(unsafe { OwnedFd::from_raw_fd(sv[1]) });
@@ -220,7 +220,7 @@ fn serve(policy: SharedPatterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> 
             // backstop in favor of the per-operation pattern checks (the
             // accepted, opt-in trade-off of the runtime-control plan).
             let initial = policy.load();
-            let read_only = !crate::control::running() && !initial.any_writable();
+            let read_only = !crate::cli::control::running() && !initial.any_writable();
             let handle = match mount_with_fallback(&mp, uid, gid, &policy, read_only).await {
                 Ok(handle) => handle,
                 Err(e) => return Err(e),
@@ -250,7 +250,7 @@ fn serve(policy: SharedPatterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> 
             //    anyway; the poll is redundant but harmless) and for
             //    channel-less runs.
             let mut child_loop = match (control_read, control_reply) {
-                (Some(read), Some(reply)) => Some(tokio::spawn(crate::control::fs_child_loop(
+                (Some(read), Some(reply)) => Some(tokio::spawn(crate::cli::control::fs_child_loop(
                     read,
                     reply,
                     policy.clone(),

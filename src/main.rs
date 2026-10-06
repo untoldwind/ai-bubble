@@ -34,7 +34,6 @@ use clap::Parser;
 mod audit;
 mod cli;
 mod connlimit;
-mod control;
 mod hostfs;
 mod line;
 mod proxy;

@@ -4,7 +4,7 @@
 use clap::Args;
 use std::path::Path;
 
-use crate::{audit, control, hostfs, sandbox, spec, waf};
+use crate::{audit, cli::control, hostfs, sandbox, spec, waf};
 use crate::sandbox::netns;
 
 /// Run COMMAND inside a fresh sandbox (new user + mount namespace, empty
@@ -93,7 +93,7 @@ pub struct RunCommand {
 
 /// The preprocessing `ai-bubble run` applies to the freshly loaded spec
 /// before compiling it — replayed **idempotently** by `spec-reload` (see
-/// `crate::control`), so the reload diffs the same preprocessed spec the
+/// `crate::cli::control`), so the reload diffs the same preprocessed spec the
 /// run was built from:
 ///
 /// * in waf mode, the injected `/etc/resolv.conf` (pointing at the
@@ -200,7 +200,7 @@ impl RunCommand {
 
         // The run's preprocessing (waf injections, cache-mapping
         // resolution) — factored out because `spec-reload` must replay it
-        // identically (see `crate::control::spec_reload_inner`).
+        // identically (see `crate::cli::control::spec_reload_inner`).
         // The session-cache tmp directory is created here and wiped once
         // ai-bubble terminates (the mirrored-fs server inherits the wipe).
         let spec_dir = spec_dir.unwrap_or(Path::new(spec::file::DEFAULT_SPEC_DIR));

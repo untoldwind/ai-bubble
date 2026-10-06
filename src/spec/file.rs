@@ -199,7 +199,7 @@ impl Spec {
     /// The fallible [`Spec::load`]: every hard error (unreadable file,
     /// invalid JSON, failed source validation) is reported to the caller
     /// instead of killing the process. Used by `spec-reload` (see
-    /// [`crate::control`]): a broken spec file mid-run must be an error
+    /// [`crate::cli::control`]): a broken spec file mid-run must be an error
     /// reply to the control client, not the end of the launcher — which
     /// is supervising a live sandbox at that point.
     pub fn try_load(explicit: Option<&Path>) -> Result<Spec, String> {

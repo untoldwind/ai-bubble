@@ -5,14 +5,14 @@
 //! the directory first, so relative and absolute spellings agree), the
 //! token is read from `<spec-dir>/run/control-token`, and one command is
 //! sent over the token-preamble + JSON-line protocol with exactly one
-//! reply — see [`crate::control`] for the protocol and its security
+//! reply — see [`crate::cli::control`] for the protocol and its security
 //! properties.
 
 use clap::Args;
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 
-use crate::{control, sandbox};
+use crate::{cli::control, sandbox};
 
 /// Talk to a running instance's control socket (see the CLI docs for the
 /// full behaviour and the four actions).

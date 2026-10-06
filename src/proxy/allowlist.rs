@@ -21,7 +21,7 @@
 /// its whole lifetime: a swap affects *new* connections only, never
 /// already-established ones or the raw pipes behind them. This is the
 /// shape `PLAN.md` records ("clone the allow-list per accepted
-/// connection") and the one `crate::control` already codes against.
+/// connection") and the one `crate::cli::control` already codes against.
 pub type SharedAllow = std::sync::Arc<std::sync::RwLock<Vec<String>>>;
 
 /// Wrap the compiled allow-list in a shared handle (see [`SharedAllow`]).

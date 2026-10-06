@@ -39,7 +39,7 @@ pub async fn serve_connector(
                 };
                 // Snapshot at accept time: this connection checks against
                 // these rules for its whole lifetime, so a runtime swap
-                // (crate::control's `net-set`) affects new connections only.
+                // (crate::cli::control's `net-set`) affects new connections only.
                 let allow = super::allowlist::load(&allow);
                 tokio::spawn(async move {
                     let _guard = guard;

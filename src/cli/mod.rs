@@ -13,6 +13,7 @@
 //! `init`); this module holds only the argument parsing.
 
 mod audit_cli;
+pub(crate) mod control;
 mod control_cli;
 mod init;
 mod ls;

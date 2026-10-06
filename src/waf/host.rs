@@ -70,7 +70,7 @@ pub async fn serve_host(
                 };
                 // Snapshot at accept time: this command connection checks
                 // against these rules for its whole lifetime, so a runtime
-                // swap (crate::control's `net-set`) affects new
+                // swap (crate::cli::control's `net-set`) affects new
                 // connections only.
                 let allow = crate::proxy::allowlist::load(&allow);
                 tokio::spawn(async move {

@@ -16,7 +16,7 @@
 //! runtime yet unless runtime control is enabled, so the FUSE server
 //! there otherwise keeps its own file writer.
 //!
-//! The same pairs carry the runtime-control plane (`crate::control`)
+//! The same pairs carry the runtime-control plane (`crate::cli::control`)
 //! bidirectionally: the launcher pushes `{"upd": ...}` frames down, the
 //! child answers `{"ack":true}`/`{"err":...}` up, and the hub reader
 //! demultiplexes replies from audit events (see [`UpdReply`]). Upstream
@@ -157,7 +157,7 @@ pub fn set_ipc_enabled(enabled: bool) {
 /// log to feed, or the control plane (whose update frames and replies
 /// need the channel even without a log).
 pub fn ipc_channel_wanted() -> bool {
-    ipc_enabled() && (super::writer::configured() || crate::control::running())
+    ipc_enabled() && (super::writer::configured() || crate::cli::control::running())
 }
 
 /// Register this process's upstream channel (the child end of a pre-fork

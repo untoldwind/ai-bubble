@@ -92,7 +92,7 @@ pub fn run(
         // both ends — the exec'd sandboxed command never sees either
         // side. `sv[0]` stays with the connector (its hub reads it),
         // `sv[1]` goes to P. The same pair carries the control plane's
-        // downstream `net-set` updates and P's acks (see `crate::control`).
+        // downstream `net-set` updates and P's acks (see `crate::cli::control`).
         let mut audit_pair: Option<[libc::c_int; 2]> = None;
         if crate::audit::ipc_channel_wanted() {
             let mut sv: [libc::c_int; 2] = [0; 2];
@@ -124,7 +124,7 @@ pub fn run(
             // listener: it must never serve control (its network
             // namespace would not even see the abstract name).
             crate::audit::close_inherited();
-            crate::control::close_inherited_listener();
+            crate::cli::control::close_inherited_listener();
             if let Some(sv) = audit_pair {
                 libc::close(sv[0]);
                 crate::audit::set_channel(OwnedFd::from_raw_fd(sv[1]));
@@ -161,7 +161,7 @@ pub fn run(
         // snapshots the list (see `proxy::allowlist::SharedAllow`).
         let allow = crate::proxy::allowlist::shared(net.allow.clone());
         // Hand the authoritative copy to the control plane.
-        crate::control::set_allow(std::sync::Arc::clone(&allow));
+        crate::cli::control::set_allow(std::sync::Arc::clone(&allow));
         let allow_private = net.allow_private;
         let status = block_on(async move {
             let _ = listener.set_nonblocking(true);
@@ -172,7 +172,7 @@ pub fn run(
             // file writer below is the run's only audit writer. The hub
             // also demultiplexes the children's control replies.
             let hub = crate::audit::spawn_hub();
-            let replies = crate::control::Replies::from_peers(hub.replies);
+            let replies = crate::cli::control::Replies::from_peers(hub.replies);
             let status = tokio::select! {
                 _ = async {
                     match net.mode {
@@ -187,12 +187,12 @@ pub fn run(
                 // The control server: pending forever when control is
                 // off (a `--no-control` run never wakes this
                 // arm), the accept loop otherwise.
-                _ = crate::control::serve_task(replies) => {
+                _ = crate::cli::control::serve_task(replies) => {
                     unreachable!("control accept loop never ends")
                 }
                 // The SIGHUP reload shim (sugar over `spec-reload`):
                 // pending forever when control is off.
-                _ = crate::control::reload_task() => {
+                _ = crate::cli::control::reload_task() => {
                     unreachable!("SIGHUP reload loop never ends")
                 }
                 st = wait_status(pid) => st,
@@ -399,7 +399,7 @@ fn isolated_parent(
                 crate::audit::reply_writer(),
             ) {
                 (NetMode::Proxy, Some(read), Some(reply)) => Some(tokio::spawn(
-                    crate::control::net_child_loop(read, reply, std::sync::Arc::clone(&allow)),
+                    crate::cli::control::net_child_loop(read, reply, std::sync::Arc::clone(&allow)),
                 )),
                 _ => None,
             };

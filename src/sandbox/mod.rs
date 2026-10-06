@@ -659,7 +659,7 @@ pub(crate) unsafe fn pidns_and_exec(
         // (below). Refuse the combination instead of silently serving
         // control only while the relay happens to idle.
         let use_pty = crate::sandbox::pty::wanted(new_session);
-        if use_pty && crate::control::listening() {
+        if use_pty && crate::cli::control::listening() {
             // SB-8: this fires when control *is* enabled (the default) —
             // the remedy is to pass `--no-control`, not `--no-new-session`
             // (the message said the opposite).
@@ -739,19 +739,19 @@ pub(crate) unsafe fn pidns_and_exec(
         // this function (the isolated path) never takes the branch:
         // P closed the inherited control listener right after its
         // fork, so `listening()` is false there.
-        if crate::control::listening() {
+        if crate::cli::control::listening() {
             let status = {
                 block_on(async {
                     let hub = crate::audit::spawn_hub();
-                    let replies = crate::control::Replies::from_peers(hub.replies);
+                    let replies = crate::cli::control::Replies::from_peers(hub.replies);
                     let status = tokio::select! {
-                        _ = crate::control::serve_task(replies) => {
+                        _ = crate::cli::control::serve_task(replies) => {
                             unreachable!("control accept loop never ends")
                         }
                         // The SIGHUP reload shim (sugar over
                         // `spec-reload`): pending forever when control
                         // is off.
-                        _ = crate::control::reload_task() => {
+                        _ = crate::cli::control::reload_task() => {
                             unreachable!("SIGHUP reload loop never ends")
                         }
                         st = crate::sandbox::netns::wait_status(pid) => st,

@@ -1518,9 +1518,9 @@ mod tests {
         // `NET_ALLOW` is a process-global OnceLock; if another test in
         // this process (e.g. the end-to-end one) already set it, reuse
         // that instance and reset its contents.
-        let shared = crate::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
+        let shared = crate::cli::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
             let shared = Arc::new(std::sync::RwLock::new(Vec::new()));
-            let _ = crate::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
+            let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
             shared
         });
         *shared.write().unwrap() = vec!["initial.example:443".to_string()];
@@ -1594,11 +1594,11 @@ mod tests {
         let _ = launcher_std.set_nonblocking(true);
         let mut launcher = tokio::net::UnixStream::from_std(launcher_std).unwrap();
         let child = tokio::net::UnixStream::from_std(child_read).unwrap();
-        let reply: crate::control::SharedWrite = Arc::new(tokio::sync::Mutex::new(
+        let reply: crate::cli::control::SharedWrite = Arc::new(tokio::sync::Mutex::new(
             tokio::net::UnixStream::from_std(child_std).unwrap(),
         ));
         let shared = Arc::new(std::sync::RwLock::new(Vec::new()));
-        let loop_task = tokio::spawn(crate::control::net_child_loop(
+        let loop_task = tokio::spawn(crate::cli::control::net_child_loop(
             child,
             reply,
             std::sync::Arc::clone(&shared),
@@ -1641,14 +1641,14 @@ mod tests {
         let _ = launcher_std.set_nonblocking(true);
         let mut launcher = tokio::net::UnixStream::from_std(launcher_std).unwrap();
         let child = tokio::net::UnixStream::from_std(child_read).unwrap();
-        let reply: crate::control::SharedWrite = Arc::new(tokio::sync::Mutex::new(
+        let reply: crate::cli::control::SharedWrite = Arc::new(tokio::sync::Mutex::new(
             tokio::net::UnixStream::from_std(child_std).unwrap(),
         ));
         let policy = Arc::new(crate::hostfs::SharedPatterns::new(
             crate::hostfs::patterns::Patterns::new(vec![("/etc".to_string(), Permission::Ro)]),
         ));
         let gen0 = policy.generation();
-        let loop_task = tokio::spawn(crate::control::fs_child_loop(
+        let loop_task = tokio::spawn(crate::cli::control::fs_child_loop(
             child,
             reply,
             (*policy).clone(),
@@ -1727,7 +1727,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("spec")).unwrap();
 
-        crate::control::record_initial(crate::control::Start {
+        crate::cli::control::record_initial(crate::cli::control::Start {
             fs_initial: Some(vec![serde_json::json!({"type": "ro", "glob": "/etc"})]),
             net_applicable: true,
             net_proxy: false,
@@ -1743,17 +1743,17 @@ mod tests {
         // authoritative list is whatever it holds — reuse *that* Arc
         // (the server swaps what `NET_ALLOW` holds, so asserting on a
         // fresh Arc here would race the setter) and reset the contents.
-        let shared = crate::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
+        let shared = crate::cli::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
             let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
-            let _ = crate::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
+            let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
             shared
         });
         *shared.write().unwrap() = vec!["example.com:443".to_string()];
-        crate::control::start(&dir.join("spec"));
-        assert!(crate::control::running());
+        crate::cli::control::start(&dir.join("spec"));
+        assert!(crate::cli::control::running());
 
         let spec_dir = dir.join("spec");
-        let _server = tokio::spawn(crate::control::serve(crate::control::Replies {
+        let _server = tokio::spawn(crate::cli::control::serve(crate::cli::control::Replies {
             fs: None,
             net: None,
         }));
@@ -1766,7 +1766,7 @@ mod tests {
             let spec_dir = client_spec_dir;
             let shared = client_shared;
             let connect = || {
-                let name = crate::control::socket_name(&spec_dir);
+                let name = crate::cli::control::socket_name(&spec_dir);
                 use std::os::linux::net::SocketAddrExt as _;
                 let addr =
                     std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
@@ -1780,7 +1780,7 @@ mod tests {
             assert_eq!(bad.read(&mut [0u8; 1]).unwrap_or(0), 0, "no reply expected");
 
             // With the token: the protocol works.
-            let token = std::fs::read_to_string(crate::control::token_path_for(&spec_dir))
+            let token = std::fs::read_to_string(crate::cli::control::token_path_for(&spec_dir))
                 .unwrap()
                 .trim()
                 .to_string();
@@ -1819,9 +1819,9 @@ mod tests {
         .await
         .expect("the blocking client task must not fail");
 
-        crate::control::cleanup();
-        assert!(!crate::control::running());
-        assert!(!crate::control::token_path_for(&spec_dir).exists());
+        crate::cli::control::cleanup();
+        assert!(!crate::cli::control::running());
+        assert!(!crate::cli::control::token_path_for(&spec_dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1869,7 +1869,7 @@ mod tests {
             .cloned()
             .unwrap();
 
-        crate::control::record_initial(crate::control::Start {
+        crate::cli::control::record_initial(crate::cli::control::Start {
             fs_initial: Some(mappings),
             net_applicable: true,
             net_proxy: true,
@@ -1880,9 +1880,9 @@ mod tests {
         FS_AVAILABLE.store(true, Ordering::Relaxed);
         // `NET_ALLOW` is a OnceLock: reuse the authoritative Arc (the
         // server swaps what `NET_ALLOW` holds) and reset the contents.
-        let shared = crate::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
+        let shared = crate::cli::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
             let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
-            let _ = crate::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
+            let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
             shared
         });
         *shared.write().unwrap() = vec!["example.com:443".to_string()];
