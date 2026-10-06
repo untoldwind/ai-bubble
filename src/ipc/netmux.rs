@@ -582,10 +582,11 @@ fn peer_credentials_ok(cred: &libc::ucred) -> bool {
 /// Must run inside a runtime (spawns tasks).
 ///
 /// Before the first frame is read, the peer's `SO_PEERCRED` credentials
-/// are verified (see [`check_peer`]); a mismatch cuts the connection and
-/// audit-records the attempt, and this function parks forever instead of
-/// returning — the serve loops' callers treat a serve end as a bug, and
-/// the connector must stay alive to watch P's exit status.
+/// are verified (see [`check_peer`]); a mismatch closes the connection
+/// and audit-records the attempt, ending the serve loop the same way a
+/// protocol violation does — the connector-side callers then simply keep
+/// waiting for P's exit status, so the run never depends on the mux
+/// surviving.
 ///
 /// The handler owns the stream for its whole lifetime: it relays through
 /// it ([`copy_bidirectional`]) and should [`MuxStream::close`] it when
@@ -606,13 +607,12 @@ where
             Some(format!("peer credential check failed: {e}")),
         )
         .await;
-        // Close the pair (dropping both halves) and park: the caller's
-        // select treats a serve end as a bug, and this process must stay
-        // alive to reap P and finish the run.
+        // Dropping the pair closes both halves: the serve loop ends
+        // here (like any other read-side end) and the caller falls
+        // back to its lifecycle role — waiting for P's exit status.
+        // P's frontends see the closed channel and fail their opens.
         drop(pair);
-        loop {
-            std::future::pending::<()>().await;
-        }
+        return;
     }
     let (read, write) = pair.into_split();
     let core = core_from_write(write);

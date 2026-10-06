@@ -172,9 +172,26 @@ pub fn run(
         let allow_private = net.allow_private;
         let status = block_on(async move {
             // Serve the mux pair (PLAN.md Phase 2): the connector end,
-            // wrapped from the inherited raw fd. The accept loops never
-            // end; the serve side of the old Unix listener is gone.
+            // wrapped from the inherited raw fd. Unlike the old
+            // Unix-listener accept loop, this serve loop *does* end —
+            // at the pair's EOF, i.e. P closing its end as it exits (a
+            // frame-protocol violation ends it too, which costs the
+            // sandbox its networking but not the run). It is therefore
+            // a background task that nothing waits on: P's exit, reaped
+            // by the select below, drives the shutdown, and a serve end
+            // racing `wait_status` is harmless instead of a panic (the
+            // io driver sees the mux EOF before the blocking waitpid's
+            // result makes it back here).
+            let mode = net.mode;
             let pair = crate::ipc::netmux::stream_from_raw_fd(net_sv[0]);
+            let serve = tokio::spawn(async move {
+                match mode {
+                    NetMode::Proxy => {
+                        crate::proxy::serve_connector(pair, allow, allow_private).await
+                    }
+                    NetMode::Waf => waf::host::serve_host(pair, allow, allow_private).await,
+                }
+            });
             // The audit hub: one reader per child channel (FS and P),
             // each forwarding into this process's own event queue — the
             // file writer below is the run's only audit writer. The hub
@@ -182,16 +199,9 @@ pub fn run(
             let hub = crate::audit::spawn_hub();
             let replies = crate::cli::control::Replies::from_peers(hub.replies);
             let status = tokio::select! {
-                _ = async {
-                    match net.mode {
-                        NetMode::Proxy => {
-                            crate::proxy::serve_connector(pair, allow, allow_private).await
-                        }
-                        NetMode::Waf => waf::host::serve_host(pair, allow, allow_private).await,
-                    }
-                } => {
-                    unreachable!("connector serve loop never ends")
-                }
+                // P's exit is the run's shutdown trigger: reap it and
+                // report its status.
+                st = wait_status(pid) => st,
                 // The control server: pending forever when control is
                 // off (a `--no-control` run never wakes this
                 // arm), the accept loop otherwise.
@@ -203,8 +213,11 @@ pub fn run(
                 _ = crate::cli::control::reload_task() => {
                     unreachable!("SIGHUP reload loop never ends")
                 }
-                st = wait_status(pid) => st,
             };
+            // Stop serving the mux: P's end closed with it (abort is a
+            // no-op if the serve loop already saw the EOF), so nothing
+            // records past the audit drain below.
+            serve.abort();
             // P is gone (its status was just reaped; its channel end
             // closed with it). Tell FS the run is ending: half-close
             // the hub peers' write side, so FS's read side EOFs and it
