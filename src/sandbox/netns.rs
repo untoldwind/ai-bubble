@@ -20,16 +20,17 @@
 //! frontends transparently at 127.0.0.2, while it stays fully isolated
 //! from the host network (the namespace has no interfaces besides
 //! loopback). P's outbound connections to real targets are made by the
-//! original process over Unix-domain sockets, which cross network
-//! namespaces via the filesystem — but the socket directory is *not*
-//! mounted into the sandbox (an earlier `/net` bind mount was never
-//! implemented; see the note on `create_socket_dir`). By default the
-//! command cannot reach the connector socket at all — but only because
-//! the mount table never exposes it: a spec bind-mounting the host `/tmp`
-//! would give the command direct socket access (AUDIT.md L6). Every
-//! protocol command is re-authorized host-side, so nothing new becomes
-//! reachable; if the mount is ever added, it must come with a
-//! `SO_PEERCRED` check that the peer is P.
+//! original process over a pre-fork socketpair (the net mux channel, see
+//! `crate::ipc::netmux`): the connector keeps `sv[0]`, P inherits
+//! `sv[1]`. The pair has no filesystem name at all — it exists only as
+//! fds in the two processes — so there is nothing to mount and nothing
+//! the sandboxed command could reach, by construction (this retires the
+//! AUDIT.md L6 caveat about a host `/tmp` bind mount exposing the old
+//! socket directory). Every protocol request is still re-authorized
+//! host-side. `SOCK_CLOEXEC` on both ends: the exec'd command never
+//! sees either side, and the forks drop the end they do not use (P
+//! closes the connector's `sv[0]` before running; the connector closes
+//! P's `sv[1]`).
 //!
 //! Tokio runtimes are created strictly *after* every fork, in the process
 //! that actually runs async code — a forked child must never share a
@@ -38,8 +39,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixListener as StdUnixListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::proxy::{PROXY_ADDR, PROXY_URL};
 use crate::sandbox::{
@@ -49,15 +49,8 @@ use crate::sandbox::{
 use crate::spec::internal::{Net, NetMode, Op, SeccompPolicy};
 use crate::waf;
 
-/// Temporary host directory holding the proxy socket. It is *not* mounted
-/// into the sandbox: a `/net` bind mount was considered but never
-/// implemented (stale comments used to claim otherwise), so the command
-/// cannot reach the connector at all — a guarantee that rests on the
-/// mount table, not on enforcement (AUDIT.md L6: a host `/tmp` bind
-/// mount would expose the socket directory to the command; every protocol
-/// command is re-authorized host-side, so nothing new becomes reachable).
-/// If the mount is ever added, verify with `SO_PEERCRED` that the peer is
-/// P before serving it.
+/// Run one isolated-network sandbox. `net` carries the mode (HTTP
+/// CONNECT proxy or waf), its allow-list and the `allow_private` opt-out.
 ///
 /// `env` is the sandbox's isolated environment (the spec's `env` section);
 /// the proxy variables are merged into it below. `cwd` is the command's
@@ -79,13 +72,23 @@ pub fn run(
         // PDEATHSIG after the forks below.
         handle_die_with_parent(die_with_parent);
 
-        let netdir = create_socket_dir();
-        let listener = match StdUnixListener::bind(netdir.join("sock")) {
-            Ok(l) => l,
-            Err(e) => die(&format!("Can't create proxy socket: {e}")),
-        };
-        // The command must not inherit the listening socket.
-        let _ = libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        // The net mux channel (PLAN.md Phases 2-3): one pre-fork
+        // socketpair carries every proxy/waf logical connection as a
+        // numbered stream — no filesystem name, nothing to bind-mount,
+        // nothing the sandboxed command can reach. `SOCK_CLOEXEC` on
+        // both ends; the forks below close the end they do not use.
+        // `sv[0]` stays with the connector (it serves the mux), `sv[1]`
+        // goes to P.
+        let mut net_sv: [libc::c_int; 2] = [0; 2];
+        if libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            net_sv.as_mut_ptr(),
+        ) != 0
+        {
+            die_with_error("Can't create the net mux channel");
+        }
 
         // Audit channel (single-writer refactor): P's events go to the
         // connector over this pre-fork socketpair. `SOCK_CLOEXEC` on
@@ -114,7 +117,10 @@ pub fn run(
             die_with_error("Can't fork");
         }
         if pid == 0 {
-            drop(listener);
+            // P must not hold the connector's mux end (a lingering copy
+            // would keep the connector's reader from ever seeing EOF —
+            // same reasoning as the audit pair below).
+            libc::close(net_sv[0]);
             // Audit first, before any other work: P inherited the
             // connector's A↔FS hub peer across this fork and must not
             // hold it (a lingering copy would keep the FS hub reader
@@ -135,7 +141,7 @@ pub fn run(
             // here (AUDIT.md, TLS MITM key hygiene).
             waf::host::wipe_after_fork();
             isolated_parent(
-                &netdir,
+                net_sv[1],
                 net,
                 ops,
                 command,
@@ -147,9 +153,10 @@ pub fn run(
             );
         }
 
-        // Connector: register our end of the audit channel for the hub, then
-        // serve proxy/waf requests from the host side and watch for P's
-        // exit.
+        // Connector: close P's mux end, register our end of the audit
+        // channel for the hub, then serve proxy/waf requests from the
+        // host side and watch for P's exit.
+        libc::close(net_sv[1]);
         if let Some(sv) = audit_pair {
             libc::close(sv[1]);
             crate::audit::add_peer(crate::audit::PeerRole::Network, OwnedFd::from_raw_fd(sv[0]));
@@ -164,9 +171,10 @@ pub fn run(
         crate::cli::control::set_allow(std::sync::Arc::clone(&allow));
         let allow_private = net.allow_private;
         let status = block_on(async move {
-            let _ = listener.set_nonblocking(true);
-            let l = tokio::net::UnixListener::from_std(listener)
-                .unwrap_or_else(|e| die(&format!("Can't register proxy socket: {e}")));
+            // Serve the mux pair (PLAN.md Phase 2): the connector end,
+            // wrapped from the inherited raw fd. The accept loops never
+            // end; the serve side of the old Unix listener is gone.
+            let pair = crate::ipc::netmux::stream_from_raw_fd(net_sv[0]);
             // The audit hub: one reader per child channel (FS and P),
             // each forwarding into this process's own event queue — the
             // file writer below is the run's only audit writer. The hub
@@ -177,12 +185,12 @@ pub fn run(
                 _ = async {
                     match net.mode {
                         NetMode::Proxy => {
-                            crate::proxy::serve_connector(l, allow, allow_private).await
+                            crate::proxy::serve_connector(pair, allow, allow_private).await
                         }
-                        NetMode::Waf => waf::host::serve_host(l, allow, allow_private).await,
+                        NetMode::Waf => waf::host::serve_host(pair, allow, allow_private).await,
                     }
                 } => {
-                    unreachable!("connector accept loop never ends")
+                    unreachable!("connector serve loop never ends")
                 }
                 // The control server: pending forever when control is
                 // off (a `--no-control` run never wakes this
@@ -213,20 +221,23 @@ pub fn run(
             status
         });
 
-        let _ = std::fs::remove_dir_all(&netdir);
         exit_with_status(status);
     }
 }
 
-/// P: owns the sandbox network namespace and runs the HTTP CONNECT proxy on
-/// 127.0.0.2. Forks C for the filesystem sandbox and exec, then reports C's
-/// exit status.
+/// P: owns the sandbox network namespace and runs the mode's in-sandbox
+/// frontends on 127.0.0.2 (HTTP CONNECT proxy, or the waf triple). Forks
+/// C for the filesystem sandbox and exec, then reports C's exit status.
+///
+/// `net_fd` is P's end of the net mux socketpair (raw fd, already
+/// `SOCK_CLOEXEC`); it is wrapped into a tokio stream inside P's runtime
+/// and handed to the frontends as the mux client handle.
 // The parameter list mirrors the sandbox setup pipeline (each function
 // forwards everything to the next one); one more parameter than clippy's
 // default limit is fine here.
 #[allow(clippy::too_many_arguments)]
 fn isolated_parent(
-    netdir: &Path,
+    net_fd: libc::c_int,
     net: &Net,
     ops: &[Op],
     command: &[String],
@@ -384,8 +395,11 @@ fn isolated_parent(
         // updates by swapping this handle. Swaps affect new connections
         // only — every accepted connection snapshots the list.
         let allow = crate::proxy::allowlist::shared(net.allow.clone());
-        let sock = netdir.join("sock");
         let status = block_on(async move {
+            // The P end of the net mux channel (PLAN.md Phase 2): the
+            // frontends open their host-side requests as mux streams on
+            // it. Wrapped inside the runtime, like the audit channel.
+            let net_pair = crate::ipc::netmux::stream_from_raw_fd(net_fd);
             // Proxy mode: register P's control loop on the inherited
             // channel — the launcher's `net-set` arrives here as an
             // `upd` frame and swaps the allow-list (affecting new
@@ -408,6 +422,8 @@ fn isolated_parent(
                     let _ = listener.set_nonblocking(true);
                     let l = tokio::net::TcpListener::from_std(listener)
                         .unwrap_or_else(|e| die(&format!("Can't register proxy listener: {e}")));
+                    let mux =
+                        crate::ipc::netmux::MuxHandle::<crate::proxy::ProxySpec>::client(net_pair);
                     tokio::select! {
                         st = wait_status(child_pid) => st,
                         // The proxy accept loop never ends; the control loop
@@ -417,7 +433,7 @@ fn isolated_parent(
                         // proxy arm does.
                         _ = async {
                             tokio::select! {
-                                _ = crate::proxy::serve_sandbox_proxy(l, sock, allow) => {
+                                _ = crate::proxy::serve_sandbox_proxy(l, mux, allow) => {
                                     unreachable!("proxy accept loop never ends")
                                 }
                                 _ = async {
@@ -443,13 +459,14 @@ fn isolated_parent(
                         .unwrap_or_else(|e| die(&format!("Can't register HTTPS listener: {e}")));
                     let udp53 = tokio::net::UdpSocket::from_std(udp53)
                         .unwrap_or_else(|e| die(&format!("Can't register DNS UDP socket: {e}")));
-                    tokio::spawn(waf::dns::serve_tcp(tcp53, sock.clone()));
-                    tokio::spawn(waf::http::serve_http(tcp80, sock.clone()));
-                    tokio::spawn(waf::https::serve_https(tcp443, sock.clone()));
+                    let mux = crate::ipc::netmux::MuxHandle::<crate::waf::WafSpec>::client(net_pair);
+                    tokio::spawn(waf::dns::serve_tcp(tcp53, mux.clone()));
+                    tokio::spawn(waf::http::serve_http(tcp80, mux.clone()));
+                    tokio::spawn(waf::https::serve_https(tcp443, mux.clone()));
                     tokio::select! {
                         // The UDP DNS loop never ends; it keeps the runtime
                         // busy while wait_status delivers the exit status.
-                        _ = waf::dns::serve_udp(udp53, sock) => {
+                        _ = waf::dns::serve_udp(udp53, mux) => {
                             unreachable!("DNS accept loop never ends")
                         }
                         st = wait_status(child_pid) => st,
@@ -467,14 +484,6 @@ fn isolated_parent(
 
         exit_with_status(status);
     }
-}
-
-/// Create the temporary host directory for the proxy socket via mkdtemp(3).
-fn create_socket_dir() -> PathBuf {
-    crate::sandbox::mkdtemp_dir(
-        b"/tmp/ai-bubble-net.XXXXXX",
-        "Can't create proxy socket directory",
-    )
 }
 
 /// Wait for `pid` on a blocking thread and return its raw waitpid status,

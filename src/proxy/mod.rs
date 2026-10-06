@@ -3,14 +3,18 @@
 //! Two independent servers live here, one per network namespace side:
 //!
 //! * `connector` runs in the *host* network namespace (the original
-//!   ai-bubble process). It listens on a Unix-domain socket mounted into
-//!   the sandbox and turns `host:port` requests into real TCP connections.
+//!   ai-bubble process). It serves the pre-fork net socketpair
+//!   ([`crate::ipc::netmux`]) and turns `host:port` requests into real
+//!   TCP connections.
 //!
 //! * `sandbox` runs *inside* the sandbox network namespace (process P). It
 //!   is a minimal HTTP CONNECT proxy on 127.0.0.2:3128 that forwards every
-//!   connection over the Unix socket to the connector.
+//!   connection as a stream over the mux socketpair to the connector.
 //!
-//! The allow-list check is shared by both sides (see `allowlist`).
+//! The allow-list check is shared by both sides (see `allowlist`). The
+//! mode's mux vocabulary (`ProxySpec`) lives here: both ends decode the
+//! same `deny_unknown_fields` types, so a foreign frame cannot even be
+//! decoded (the confused-deputy containment of PLAN.md Phase 1).
 
 pub mod allowlist;
 pub mod connector;
@@ -19,6 +23,32 @@ pub mod sandbox;
 
 pub use self::connector::serve_connector;
 pub use self::sandbox::serve_sandbox_proxy;
+
+use crate::ipc::netmux::NetSpec;
+use serde::{Deserialize, Serialize};
+
+/// The proxy mode's mux request: the CONNECT target. One `OPEN` frame per
+/// tunneled connection (the old `host:port\n` line, now shape-checked).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProxyReq {
+    pub(crate) target: String,
+}
+
+/// The proxy mode's successful reply: "connected, the stream is now a raw
+/// pipe". Refusals arrive as `ERR` frames instead (the connector has no
+/// rich reply vocabulary in this mode).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProxyReply {}
+
+/// The proxy mode's mux vocabulary.
+pub(crate) struct ProxySpec;
+
+impl NetSpec for ProxySpec {
+    type Req = ProxyReq;
+    type Reply = ProxyReply;
+}
 
 /// Render a sandbox-controlled target for the operator's stderr: the
 /// target line is only NUL/length-checked at the protocol level, so it may
@@ -55,10 +85,10 @@ mod tests {
     }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream, UnixListener};
+    use tokio::net::{TcpListener, TcpStream};
 
     /// Full pipeline without namespaces: client -> sandbox CONNECT proxy ->
-    /// Unix socket -> connector -> TCP echo server.
+    /// netmux stream -> connector -> TCP echo server.
     #[tokio::test]
     async fn end_to_end_proxy_pipeline() {
         // Echo server on the "host".
@@ -78,26 +108,20 @@ mod tests {
             }
         });
 
-        // Connector on a temporary Unix socket.
-        let dir = std::env::temp_dir().join(format!("ai-bubble-proxy-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock_path = dir.join("sock");
-        let std_listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
-        let _ = std_listener.set_nonblocking(true);
-        let unix = UnixListener::from_std(std_listener).unwrap();
+        // Connector on one end of a netmux pair.
+        let (a, b) = crate::ipc::netmux::pair().unwrap();
         tokio::spawn(serve_connector(
-            unix,
+            a,
             crate::proxy::allowlist::shared(vec![format!("127.0.0.1:{}", echo_addr.port())]),
             true,
         ));
 
-        // Sandbox-side CONNECT proxy.
+        // Sandbox-side CONNECT proxy on the other end.
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(serve_sandbox_proxy(
             proxy,
-            sock_path.clone(),
+            crate::ipc::netmux::MuxHandle::<ProxySpec>::client(b),
             crate::proxy::allowlist::shared(vec![format!("127.0.0.1:{}", echo_addr.port())]),
         ));
 
@@ -121,7 +145,5 @@ mod tests {
         let mut got = [0u8; 4];
         c.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"ping");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

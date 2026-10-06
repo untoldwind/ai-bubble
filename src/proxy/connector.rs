@@ -1,81 +1,75 @@
 //! The connector: the *host*-side proxy server.
 //!
 //! This code runs in the original ai-bubble process, i.e. in the host
-//! network namespace. It listens on a Unix-domain socket mounted into the
-//! sandbox and turns `host:port` requests into real TCP connections on the
-//! host network.
+//! network namespace. It serves the pre-fork net socketpair
+//! ([`crate::ipc::netmux`]) and turns `host:port` stream-open requests
+//! into real TCP connections on the host network. The pair has no
+//! filesystem name — the sandboxed command cannot reach it by
+//! construction (PLAN.md Phase 2; the AUDIT.md L6 caveat about a host
+//! `/tmp` bind mount is moot).
 
-use tokio::io::{AsyncWriteExt, copy_bidirectional};
-use tokio::net::{UnixListener, UnixStream};
+use std::io;
 
-use super::allowlist::target_allowed;
+use tokio::net::TcpStream;
+use tokio::net::UnixStream;
+
+use super::allowlist::{target_allowed, SharedAllow};
 use super::ipfilter::connect_checked;
-use crate::connlimit::ConnLimit;
+use super::{ProxyReply, ProxyReq, ProxySpec};
+use crate::ipc::netmux::{self, MuxStream};
 
-/// How long the sandbox-side client may take to send its `host:port`
-/// target line. A command that opens many connections to the proxy
-/// socket but never sends must not hold a task (and, worse, a file
-/// descriptor of *this host-side process*) forever — the idle-connection
-/// half of AUDIT.md M4's resource-isolation concern.
-const TARGET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Accept loop on the host side: every connection becomes a raw pipe to the
-/// requested TCP target (or an error byte if denied/failed). Concurrent
-/// connections are capped (see [`crate::connlimit`]): each accepted
-/// connection holds a file descriptor of the supervisor, so an unbounded
-/// number of idle connections would exhaust them. At capacity the new
-/// connection is dropped immediately.
-pub async fn serve_connector(
-    listener: UnixListener,
-    allow: super::allowlist::SharedAllow,
-    allow_private: bool,
-) {
-    let limit = ConnLimit::new();
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let Some(guard) = limit.try_acquire() else {
-                    continue; // at capacity: drop the connection
-                };
-                // Snapshot at accept time: this connection checks against
-                // these rules for its whole lifetime, so a runtime swap
-                // (crate::cli::control's `net-set`) affects new connections only.
-                let allow = super::allowlist::load(&allow);
-                tokio::spawn(async move {
-                    let _guard = guard;
-                    handle_connector_conn(stream, &allow, allow_private).await;
-                });
-            }
-            Err(_) => return,
+/// Serve the connector end of the net mux pair: every `OPEN` stream
+/// becomes a raw pipe to the requested TCP target (or an `ERR` frame if
+/// denied/failed). Concurrent streams are capped (see
+/// [`crate::connlimit`] via [`netmux::StreamLimit`]): one stream ≙ one old
+/// filesystem-socket connection, so the cap, its guard and its semantics
+/// carry over unchanged. At capacity the open is refused with `ERR`.
+///
+/// The allow-list snapshot is taken per stream at `OPEN` time (the old
+/// accept-time snapshot), so a runtime swap (`crate::cli::control`'s
+/// `net-set`) affects new streams only.
+///
+/// The old `TARGET_TIMEOUT` (bounding the client's `host:port` line) is
+/// gone with the line protocol: the target arrives as the `OPEN` frame's
+/// payload, so there is no idle first-read to bound.
+pub async fn serve_connector(pair: UnixStream, allow: SharedAllow, allow_private: bool) {
+    netmux::serve_pair::<ProxySpec, _, _>(pair, netmux::StreamLimit::new(), move |req, mut stream| {
+        let allow = allow.clone();
+        async move {
+            handle_connector_conn(req, &super::allowlist::load(&allow), allow_private, &mut stream)
+                .await
         }
-    }
+    })
+    .await;
 }
 
-/// One proxy connection from the sandbox: the client sends `host:port\n`,
-/// we reply with a single status byte (`K` = connected, `E` =
-/// failed/denied) and then the connection becomes a raw bidirectional pipe
-/// to the real TCP target on the host side.
-async fn handle_connector_conn(mut stream: UnixStream, allow: &[String], allow_private: bool) {
-    // The target line must arrive within TARGET_TIMEOUT (see the
-    // constant's doc): the timeout guards only this first read, not the
-    // piped traffic that follows a successful connect.
-    let target = match tokio::time::timeout(TARGET_TIMEOUT, read_line_target(&mut stream)).await {
-        Ok(Some(target)) => target,
-        _ => return,
-    };
+/// One proxy stream from the sandbox: the `OPEN` carries the target; on
+/// success the connector acks (the old `K` status byte) and the stream
+/// becomes a raw bidirectional pipe to the real TCP target. A denial or
+/// dial failure returns `Err`, which the mux delivers to the client as an
+/// `ERR` frame carrying this reason (the old `E` status byte).
+async fn handle_connector_conn(
+    req: ProxyReq,
+    allow: &[String],
+    allow_private: bool,
+    stream: &mut MuxStream,
+) -> io::Result<()> {
+    let target = req.target;
     if !target_allowed(&target, allow) {
         eprintln!(
             "ai-bubble proxy: connection to {} denied",
             super::log_target(&target)
         );
         crate::audit::record("proxy", "connect", Some(&target), Some("denied"), None).await;
-        let _ = stream.write_all(b"E").await;
-        return;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "target not on the allow list",
+        ));
     }
     // Resolve the name here and refuse private/loopback/link-local ranges
     // (SSRF via DNS rebinding, AUDIT.md H3): the dial goes to the validated
     // IP directly.
-    let mut tcp = match connect_checked(&target, allow_private).await {
+    let mut tcp: TcpStream = match connect_checked(&target, allow_private).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!(
@@ -90,18 +84,14 @@ async fn handle_connector_conn(mut stream: UnixStream, allow: &[String], allow_p
                 Some(format!("{e}")),
             )
             .await;
-            let _ = stream.write_all(b"E").await;
-            return;
+            return Err(io::Error::other(format!("can't connect: {e}")));
         }
     };
     crate::audit::record("proxy", "connect", Some(&target), Some("ok"), None).await;
-    if stream.write_all(b"K").await.is_err() {
-        return;
-    }
-    let _ = copy_bidirectional(&mut stream, &mut tcp).await;
-}
-
-/// Read one line (the proxy target) from the connection.
-async fn read_line_target(stream: &mut UnixStream) -> Option<String> {
-    crate::line::read_line_limited(stream, 512).await.ok()?
+    // The old flow's status byte: the ack tells the client the pipe is
+    // live, then the tunnel carries its payload.
+    stream.ack(&ProxyReply {}).await?;
+    let _ = netmux::copy_bidirectional(stream, &mut tcp).await;
+    let _ = stream.close().await;
+    Ok(())
 }

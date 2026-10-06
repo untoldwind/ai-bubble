@@ -1,14 +1,13 @@
 //! The host side of the waf command protocol.
 //!
 //! This code runs in the original ai-bubble process, i.e. in the host
-//! network namespace. It listens on a Unix-domain socket that is *not*
-//! mounted into the sandbox (the command cannot reach it directly; see
-//! `netns.rs` — a `/net` mount was never implemented) and executes the
-//! simple command protocol of
-//! [`super`](crate::waf): `resolve-dns <name>`, `connect <host>:<port>`,
-//! `tls-cert <name>` and `tls-connect <host>:<port>`. Every request is
-//! checked against the allow-list here — the single enforcement point of
-//! this mode.
+//! network namespace. It serves the pre-fork net mux socketpair
+//! ([`crate::ipc::netmux`]) — which the command cannot reach at all: the
+//! pair has no filesystem name and lives only as fds in P and this
+//! process (see `netns.rs`) — and executes the command vocabulary of
+//! [`super`](crate::waf): `resolve-dns`, `connect`, `tls-cert` and
+//! `tls-connect`. Every request is checked against the allow-list here —
+//! the single enforcement point of this mode.
 //!
 //! For HTTPS the host also owns the fake PKI: it generates a self-signed
 //! CA (see [`ca_certificate_pem`], injected into the sandbox as its trust
@@ -32,271 +31,273 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncWriteExt, copy_bidirectional};
-use tokio::net::{TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpStream, UnixStream};
 
-use crate::connlimit::ConnLimit;
-use crate::proxy::allowlist::{host_allowed, target_allowed};
+use crate::connlimit::ConnLimit as StreamLimit;
+use crate::ipc::netmux::{self, MuxStream};
+use crate::proxy::allowlist::{host_allowed, target_allowed, SharedAllow};
 use crate::proxy::ipfilter::connect_checked;
+use crate::waf::{WafReply, WafReq, WafSpec};
 
 /// The address the in-sandbox servers redirect to (their own listener
 /// address, inside the sandbox network namespace).
 pub const REDIRECT_ADDR: &str = "127.0.0.2";
 
-/// How long a sandbox-side client may take to send its one command line.
-/// A command that opens command connections but never sends must not
-/// hold a task (and a supervisor file descriptor) forever — part of
-/// AUDIT.md, resource limits on the frontends). The timeout guards only the command line; a piped
-/// connection after a successful `connect`/`tls-connect` is never
-/// timed out.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Accept loop on the host side: one command per connection.
-/// Concurrent connections are capped (see [`crate::connlimit`]): each
-/// accepted connection holds a file descriptor of the supervisor, so an
-/// unbounded number of idle connections would exhaust them. At capacity
-/// the new connection is dropped immediately.
-pub async fn serve_host(
-    listener: UnixListener,
-    allow: crate::proxy::allowlist::SharedAllow,
-    allow_private: bool,
-) {
-    let limit = ConnLimit::new();
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let Some(guard) = limit.try_acquire() else {
-                    continue; // at capacity: drop the connection
-                };
-                // Snapshot at accept time: this command connection checks
-                // against these rules for its whole lifetime, so a runtime
-                // swap (crate::cli::control's `net-set`) affects new
-                // connections only.
-                let allow = crate::proxy::allowlist::load(&allow);
-                tokio::spawn(async move {
-                    let _guard = guard;
-                    handle_host_conn(stream, &allow, allow_private).await;
-                });
-            }
-            Err(_) => return,
+/// Serve the host end of the net mux pair: one command per stream.
+/// Concurrent streams are capped (see [`crate::connlimit`]): one stream
+/// ≙ one old filesystem-socket connection, so the cap and its semantics
+/// carry over unchanged. At capacity the open is refused with `ERR`.
+///
+/// The allow-list snapshot is taken per stream at `OPEN` time (the old
+/// accept-time snapshot), so a runtime swap (`crate::cli::control`'s
+/// `net-set`) affects new streams only. The old `COMMAND_TIMEOUT`
+/// (bounding the sandbox-side client's command line) is gone with the
+/// line protocol: the command arrives as the `OPEN` frame's payload, so
+/// there is no idle first-read to bound.
+pub async fn serve_host(pair: UnixStream, allow: SharedAllow, allow_private: bool) {
+    netmux::serve_pair::<WafSpec, _, _>(pair, StreamLimit::new(), move |req, mut stream| {
+        let allow = allow.clone();
+        async move {
+            handle_host_req(req, &crate::proxy::allowlist::load(&allow), allow_private, &mut stream)
+                .await
         }
-    }
+    })
+    .await;
 }
 
-/// One command connection from the sandbox: a single line, answered with
-/// a single reply line (`OK ...` / `ERR <reason>`). A `connect` command
-/// turns the connection into a raw bidirectional pipe after `OK`.
-async fn handle_host_conn(mut stream: UnixStream, allow: &[String], allow_private: bool) {
-    // The command line must arrive within COMMAND_TIMEOUT (see the
-    // constant's doc); a timed-out read is handled like a closed one.
-    let cmd = match tokio::time::timeout(COMMAND_TIMEOUT, read_line(&mut stream)).await {
-        Ok(cmd) => cmd,
-        Err(_) => return,
-    };
-    let Some(cmd) = cmd else {
-        return;
-    };
-    let cmd = cmd.trim();
-    if let Some(name) = cmd.strip_prefix("resolve-dns ") {
-        if !valid_name(name) || !host_allowed(name, allow) {
-            eprintln!("ai-bubble waf: DNS lookup of {name} denied");
-            crate::audit::record("waf", "resolve-dns", Some(name), Some("denied"), None).await;
-            let _ = stream.write_all(b"ERR name not on the allow list\n").await;
-            return;
-        }
-        crate::audit::record("waf", "resolve-dns", Some(name), Some("ok"), None).await;
-        let _ = stream
-            .write_all(format!("OK {REDIRECT_ADDR}\n").as_bytes())
-            .await;
-    } else if let Some(target) = cmd.strip_prefix("connect ") {
-        if !valid_target(target) || !target_allowed(target, allow) {
-            eprintln!("ai-bubble waf: connection to {target} denied");
-            crate::audit::record("waf", "connect", Some(target), Some("denied"), None).await;
-            let _ = stream
-                .write_all(b"ERR target not on the allow list\n")
-                .await;
-            return;
-        }
-        // Resolve the name here and refuse private/loopback/link-local
-        // ranges (SSRF via DNS rebinding, AUDIT.md H3): the dial goes to
-        // the validated IP directly.
-        let mut tcp = match connect_checked(target, allow_private).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("ai-bubble waf: can't connect to {target}: {e}");
-                crate::audit::record(
-                    "waf",
-                    "connect",
-                    Some(target),
-                    Some("err"),
-                    Some(format!("{e}")),
-                )
-                .await;
-                let _ = stream
-                    .write_all(format!("ERR can't connect: {e}\n").as_bytes())
+/// One command stream from the sandbox: an `OPEN` frame carrying a
+/// [`WafReq`], answered with a typed [`WafReply`] (sent via
+/// [`MuxStream::ack`]) or, for pipe kinds, followed by a raw
+/// bidirectional data stream. Refusals are *replies* (`denied`/`failed`),
+/// not `ERR` frames: the P side maps them to `PermissionDenied` and
+/// plain errors exactly as the line protocol's `ERR` lines mapped.
+async fn handle_host_req(
+    req: WafReq,
+    allow: &[String],
+    allow_private: bool,
+    stream: &mut MuxStream,
+) -> io::Result<()> {
+    match req {
+        WafReq::ResolveDns { name } => {
+            if !valid_name(&name) || !host_allowed(&name, allow) {
+                eprintln!("ai-bubble waf: DNS lookup of {name} denied");
+                crate::audit::record("waf", "resolve-dns", Some(&name), Some("denied"), None)
                     .await;
-                return;
+                return stream
+                    .ack(&WafReply::Denied {
+                        reason: "name not on the allow list".to_string(),
+                    })
+                    .await;
             }
-        };
-        crate::audit::record("waf", "connect", Some(target), Some("ok"), None).await;
-        if stream.write_all(b"OK\n").await.is_err() {
-            return;
+            crate::audit::record("waf", "resolve-dns", Some(&name), Some("ok"), None).await;
+            stream
+                .ack(&WafReply::Dns {
+                    addr: REDIRECT_ADDR.to_string(),
+                })
+                .await
         }
-        let _ = copy_bidirectional(&mut stream, &mut tcp).await;
-    } else if let Some(name) = cmd.strip_prefix("tls-cert ") {
-        // Hand out a leaf certificate for the HTTPS MITM: signed by the
-        // waf CA, valid for exactly the SNI the client connected to.
-        if !valid_name(name) || !host_allowed(name, allow) {
-            eprintln!("ai-bubble waf: TLS certificate for {name} denied");
-            crate::audit::record("waf", "tls-cert", Some(name), Some("denied"), None).await;
-            let _ = stream.write_all(b"ERR name not on the allow list\n").await;
-            return;
-        }
-        // A certificate is generated once per domain and then cached (see
-        // [`CERT_CACHE`]), so the normal flow — a browser hitting the same
-        // handful of hosts repeatedly — never touches the keygen throttle.
-        // Only *fresh* keygens (new domains, cache misses) are rate-limited:
-        // keygen costs real host CPU (a fresh key pair plus a signature),
-        // and the rate limit stops the sandbox from burning the
-        // supervisor's CPU by requesting certificates for endlessly
-        // different names in a loop (AUDIT.md, resource limits on the
-        // frontends). Excess requests get an ERR, which the in-sandbox
-        // HTTPS server already handles as a failed MITM.
-        let (cert, key) = if let Some(pair) = cached_cert(name) {
-            pair
-        } else {
-            if !take_keygen_token().await {
-                eprintln!("ai-bubble waf: tls-cert for {name} rate-limited");
-                crate::audit::record("waf", "tls-cert", Some(name), Some("rate-limited"), None)
+        WafReq::Connect { target } => {
+            if !valid_target(&target) || !target_allowed(&target, allow) {
+                eprintln!("ai-bubble waf: connection to {target} denied");
+                crate::audit::record("waf", "connect", Some(&target), Some("denied"), None).await;
+                return stream
+                    .ack(&WafReply::Denied {
+                        reason: "target not on the allow list".to_string(),
+                    })
                     .await;
-                let _ = stream
-                    .write_all(b"ERR too many certificate requests\n")
-                    .await;
-                return;
             }
-            let pair = match sign_leaf(name) {
-                Ok(pair) => pair,
+            // Resolve the name here and refuse private/loopback/link-local
+            // ranges (SSRF via DNS rebinding, AUDIT.md H3): the dial goes to
+            // the validated IP directly.
+            let mut tcp = match connect_checked(&target, allow_private).await {
+                Ok(t) => t,
                 Err(e) => {
-                    eprintln!("ai-bubble waf: can't sign a certificate for {name}: {e}");
+                    eprintln!("ai-bubble waf: can't connect to {target}: {e}");
                     crate::audit::record(
                         "waf",
-                        "tls-cert",
-                        Some(name),
+                        "connect",
+                        Some(&target),
                         Some("err"),
                         Some(format!("{e}")),
                     )
                     .await;
-                    let _ = stream.write_all(b"ERR can't sign certificate\n").await;
-                    return;
+                    return stream
+                        .ack(&WafReply::Failed {
+                            reason: format!("can't connect: {e}"),
+                        })
+                        .await;
                 }
             };
-            cached_cert_insert(name, &pair);
-            pair
-        };
-        crate::audit::record("waf", "tls-cert", Some(name), Some("ok"), None).await;
-        // One line: base64(DER cert) SP base64(DER PKCS#8 key).
-        let reply = format!(
-            "OK {} {}\n",
-            base64::engine::general_purpose::STANDARD.encode(&cert),
-            base64::engine::general_purpose::STANDARD.encode(&key)
-        );
-        let _ = stream.write_all(reply.as_bytes()).await;
-    } else if let Some(target) = cmd.strip_prefix("tls-connect ") {
-        // Like `connect`, but the host also performs the TLS client
-        // handshake (with the *real* root certificates), so the sandbox
-        // receives a pipe carrying already-decrypted plaintext and the
-        // server certificate is verified where the trust anchors live.
-        if !valid_target(target) || !target_allowed(target, allow) {
-            eprintln!("ai-bubble waf: connection to {target} denied");
-            crate::audit::record("waf", "tls-connect", Some(target), Some("denied"), None).await;
-            let _ = stream
-                .write_all(b"ERR target not on the allow list\n")
-                .await;
-            return;
+            crate::audit::record("waf", "connect", Some(&target), Some("ok"), None).await;
+            stream.ack(&WafReply::Open).await?;
+            let _ = netmux::copy_bidirectional(stream, &mut tcp).await;
+            let _ = stream.close().await;
+            Ok(())
         }
-        let Some((host, _port)) = target.rsplit_once(':') else {
-            return;
-        };
-        // See `connect` above: resolved-IP filtering pins the dial to a
-        // validated address; TLS still verifies the *name*.
-        let tcp = match connect_checked(target, allow_private).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("ai-bubble waf: can't connect to {target}: {e}");
-                crate::audit::record(
-                    "waf",
-                    "tls-connect",
-                    Some(target),
-                    Some("err"),
-                    Some(format!("{e}")),
-                )
-                .await;
-                let _ = stream
-                    .write_all(format!("ERR can't connect: {e}\n").as_bytes())
+        WafReq::TlsCert { name } => {
+            // Hand out a leaf certificate for the HTTPS MITM: signed by the
+            // waf CA, valid for exactly the SNI the client connected to.
+            if !valid_name(&name) || !host_allowed(&name, allow) {
+                eprintln!("ai-bubble waf: TLS certificate for {name} denied");
+                crate::audit::record("waf", "tls-cert", Some(&name), Some("denied"), None).await;
+                return stream
+                    .ack(&WafReply::Denied {
+                        reason: "name not on the allow list".to_string(),
+                    })
                     .await;
-                return;
             }
-        };
-        let Ok(name) = ServerName::try_from(host.to_string()) else {
-            let _ = stream.write_all(b"ERR invalid server name\n").await;
-            return;
-        };
-        // AUDIT.md L8: bound the upstream handshake, so a black-holed
-        // target cannot hold a connector slot for the kernel's full SYN/
-        // TLS-retry duration (see `ipfilter::DIAL_TIMEOUT`).
-        let mut tls = match tokio::time::timeout(
-            crate::proxy::ipfilter::DIAL_TIMEOUT,
-            tls_client_stream(name, tcp),
-        )
-        .await
-        {
-            Ok(Ok(t)) => t,
-            Err(_) => {
-                let e = io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out");
-                eprintln!("ai-bubble waf: TLS handshake with {target} failed: {e}");
-                crate::audit::record(
-                    "waf",
-                    "tls-connect",
-                    Some(target),
-                    Some("err"),
-                    Some(format!("{e}")),
-                )
-                .await;
-                let _ = stream
-                    .write_all(format!("ERR TLS handshake failed: {e}\n").as_bytes())
-                    .await;
-                return;
-            }
-            Ok(Err(e)) => {
-                eprintln!("ai-bubble waf: TLS handshake with {target} failed: {e}");
-                crate::audit::record(
-                    "waf",
-                    "tls-connect",
-                    Some(target),
-                    Some("err"),
-                    Some(format!("{e}")),
-                )
-                .await;
-                let _ = stream
-                    .write_all(format!("ERR TLS handshake failed: {e}\n").as_bytes())
-                    .await;
-                return;
-            }
-        };
-        crate::audit::record("waf", "tls-connect", Some(target), Some("ok"), None).await;
-        if stream.write_all(b"OK\n").await.is_err() {
-            return;
+            // A certificate is generated once per domain and then cached (see
+            // [`CERT_CACHE`]), so the normal flow — a browser hitting the same
+            // handful of hosts repeatedly — never touches the keygen throttle.
+            // Only *fresh* keygens (new domains, cache misses) are rate-limited:
+            // keygen costs real host CPU (a fresh key pair plus a signature),
+            // and the rate limit stops the sandbox from burning the
+            // supervisor's CPU by requesting certificates for endlessly
+            // different names in a loop (AUDIT.md, resource limits on the
+            // frontends). Excess requests get a `denied`, which the in-sandbox
+            // HTTPS server already handles as a failed MITM.
+            let (cert, key) = if let Some(pair) = cached_cert(&name) {
+                pair
+            } else {
+                if !take_keygen_token().await {
+                    eprintln!("ai-bubble waf: tls-cert for {name} rate-limited");
+                    crate::audit::record("waf", "tls-cert", Some(&name), Some("rate-limited"), None)
+                        .await;
+                    return stream
+                        .ack(&WafReply::Denied {
+                            reason: "too many certificate requests".to_string(),
+                        })
+                        .await;
+                }
+                let pair = match sign_leaf(&name) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!("ai-bubble waf: can't sign a certificate for {name}: {e}");
+                        crate::audit::record(
+                            "waf",
+                            "tls-cert",
+                            Some(&name),
+                            Some("err"),
+                            Some(format!("{e}")),
+                        )
+                        .await;
+                        return stream
+                            .ack(&WafReply::Failed {
+                                reason: "can't sign certificate".to_string(),
+                            })
+                            .await;
+                    }
+                };
+                cached_cert_insert(&name, &pair);
+                pair
+            };
+            crate::audit::record("waf", "tls-cert", Some(&name), Some("ok"), None).await;
+            // One frame: base64(DER cert) SP base64(DER PKCS#8 key).
+            stream
+                .ack(&WafReply::Cert {
+                    cert: base64::engine::general_purpose::STANDARD.encode(&cert),
+                    key: base64::engine::general_purpose::STANDARD.encode(&key),
+                })
+                .await
         }
-        // Both streams are full duplex; the pipe carries plaintext now.
-        let _ = copy_bidirectional(&mut stream, &mut tls).await;
-    } else {
-        let _ = stream.write_all(b"ERR unknown command\n").await;
+        WafReq::TlsConnect { target } => {
+            // Like `connect`, but the host also performs the TLS client
+            // handshake (with the *real* root certificates), so the sandbox
+            // receives a pipe carrying already-decrypted plaintext and the
+            // server certificate is verified where the trust anchors live.
+            if !valid_target(&target) || !target_allowed(&target, allow) {
+                eprintln!("ai-bubble waf: connection to {target} denied");
+                crate::audit::record("waf", "tls-connect", Some(&target), Some("denied"), None)
+                    .await;
+                return stream
+                    .ack(&WafReply::Denied {
+                        reason: "target not on the allow list".to_string(),
+                    })
+                    .await;
+            }
+            let Some((host, _port)) = target.rsplit_once(':') else {
+                return Ok(());
+            };
+            // See `connect` above: resolved-IP filtering pins the dial to a
+            // validated address; TLS still verifies the *name*.
+            let tcp = match connect_checked(&target, allow_private).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("ai-bubble waf: can't connect to {target}: {e}");
+                    crate::audit::record(
+                        "waf",
+                        "tls-connect",
+                        Some(&target),
+                        Some("err"),
+                        Some(format!("{e}")),
+                    )
+                    .await;
+                    return stream
+                        .ack(&WafReply::Failed {
+                            reason: format!("can't connect: {e}"),
+                        })
+                        .await;
+                }
+            };
+            let Ok(name) = ServerName::try_from(host.to_string()) else {
+                return stream
+                    .ack(&WafReply::Failed {
+                        reason: "invalid server name".to_string(),
+                    })
+                    .await;
+            };
+            // AUDIT.md L8: bound the upstream handshake, so a black-holed
+            // target cannot hold a connector slot for the kernel's full SYN/
+            // TLS-retry duration (see `ipfilter::DIAL_TIMEOUT`).
+            let mut tls = match tokio::time::timeout(
+                crate::proxy::ipfilter::DIAL_TIMEOUT,
+                tls_client_stream(name, tcp),
+            )
+            .await
+            {
+                Ok(Ok(t)) => t,
+                Err(_) => {
+                    let e = io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out");
+                    eprintln!("ai-bubble waf: TLS handshake with {target} failed: {e}");
+                    crate::audit::record(
+                        "waf",
+                        "tls-connect",
+                        Some(&target),
+                        Some("err"),
+                        Some(format!("{e}")),
+                    )
+                    .await;
+                    return stream
+                        .ack(&WafReply::Failed {
+                            reason: format!("TLS handshake failed: {e}"),
+                        })
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("ai-bubble waf: TLS handshake with {target} failed: {e}");
+                    crate::audit::record(
+                        "waf",
+                        "tls-connect",
+                        Some(&target),
+                        Some("err"),
+                        Some(format!("{e}")),
+                    )
+                    .await;
+                    return stream
+                        .ack(&WafReply::Failed {
+                            reason: format!("TLS handshake failed: {e}"),
+                        })
+                        .await;
+                }
+            };
+            crate::audit::record("waf", "tls-connect", Some(&target), Some("ok"), None).await;
+            stream.ack(&WafReply::Open).await?;
+            // Both streams are full duplex; the pipe carries plaintext now.
+            let _ = netmux::copy_bidirectional(stream, &mut tls).await;
+            let _ = stream.close().await;
+            Ok(())
+        }
     }
-}
-
-/// Read one line (the command) from the connection.
-async fn read_line(stream: &mut UnixStream) -> Option<String> {
-    crate::line::read_line_limited(stream, 512).await.ok()?
 }
 
 /// A token bucket throttling leaf-key generation (`tls-cert`). Each
@@ -428,16 +429,14 @@ fn cached_cert_insert(name: &str, (cert, key): &(Vec<u8>, Vec<u8>)) {
 
 /// Sanity-check a DNS name before it reaches the allow-list matcher.
 /// Only printable ASCII (`0x21..=0x7e`) is accepted: the name is
-/// interpolated verbatim into a command line on the host socket, and a
-/// control byte would inject a second line into that protocol once more
-/// than one command per connection is ever processed (AUDIT.md L4).
-/// Whether `name` is a DNS name safe to handle: ASCII only, no control
-/// bytes or whitespace, no leading label wildcards (see the tests).
-/// Used by both the waf HTTP/CONNECT frontends (against the allow-list)
-/// and the DNS server (NET-5: the raw qname is interpolated into the
-/// host command line `resolve-dns {name}` — DNS labels may contain `\n`,
-/// so the name is validated *before* it is sent, instead of riding on
-/// the accidental invariant that only one line is read per connection).
+/// echoed into audit records and error strings, and a control byte could
+/// forge log lines or terminal escape sequences there (AUDIT.md L1/L4 —
+/// the old command-line injection concern is gone with the framed
+/// protocol, but the log-hygiene reason stands). Whether `name` is a DNS
+/// name safe to handle: ASCII only, no control bytes or whitespace, no
+/// leading label wildcards (see the tests). Used by both the waf
+/// HTTP/CONNECT frontends (against the allow-list) and the DNS server
+/// (NET-5: the raw qname is validated *before* it is sent to the host).
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains([' ', '*', '\0'])
@@ -603,6 +602,7 @@ async fn tls_client_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::netmux::MuxHandle;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -612,39 +612,39 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_dns_allowed_and_denied() {
-        let dir = std::env::temp_dir().join(format!("ai-bubble-waf-dns-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("sock");
-        let std_listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let _ = std_listener.set_nonblocking(true);
-        let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
-        tokio::spawn(serve_host(
-            listener,
-            allow(&["example.com", "*.github.com:443"]),
-            false,
-        ));
+        let (a, b) = netmux::pair().unwrap();
+        tokio::spawn(serve_host(a, allow(&["example.com", "*.github.com:443"]), false));
+        let mux = MuxHandle::<WafSpec>::client(b);
 
-        let mut c = UnixStream::connect(&sock).await.unwrap();
-        c.write_all(b"resolve-dns example.com\n").await.unwrap();
-        let mut reply = String::new();
-        c.read_to_string(&mut reply).await.unwrap();
-        assert_eq!(reply.trim(), "OK 127.0.0.2");
+        // Allowed: the redirect address comes back as a typed reply.
+        let (reply, mut s) = mux
+            .open(&WafReq::ResolveDns {
+                name: "example.com".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, WafReply::Dns { ref addr } if addr == REDIRECT_ADDR));
+        let _ = s.close().await;
 
-        let mut c = UnixStream::connect(&sock).await.unwrap();
-        c.write_all(b"resolve-dns evil.com\n").await.unwrap();
-        let mut reply = String::new();
-        c.read_to_string(&mut reply).await.unwrap();
-        assert!(reply.starts_with("ERR"));
+        // Denied: a `denied` reply, which the P side maps to NXDOMAIN.
+        let (reply, mut s) = mux
+            .open(&WafReq::ResolveDns {
+                name: "evil.com".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, WafReply::Denied { .. }));
+        let _ = s.close().await;
 
         // A port-restricted entry still permits resolving the host.
-        let mut c = UnixStream::connect(&sock).await.unwrap();
-        c.write_all(b"resolve-dns api.github.com\n").await.unwrap();
-        let mut reply = String::new();
-        c.read_to_string(&mut reply).await.unwrap();
-        assert_eq!(reply.trim(), "OK 127.0.0.2");
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let (reply, mut s) = mux
+            .open(&WafReq::ResolveDns {
+                name: "api.github.com".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, WafReply::Dns { .. }));
+        let _ = s.close().await;
     }
 
     #[tokio::test]
@@ -666,49 +666,37 @@ mod tests {
             }
         });
 
-        let dir = std::env::temp_dir().join(format!("ai-bubble-waf-conn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("sock");
-        let std_listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let _ = std_listener.set_nonblocking(true);
-        let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
+        let (a, b) = netmux::pair().unwrap();
         tokio::spawn(serve_host(
-            listener,
+            a,
             allow(&[&format!("127.0.0.1:{}", echo_addr.port())]),
             true,
         ));
+        let mux = MuxHandle::<WafSpec>::client(b);
 
         // Denied target.
-        let mut c = UnixStream::connect(&sock).await.unwrap();
-        c.write_all(b"connect evil.example:443\n").await.unwrap();
-        let mut reply = String::new();
-        c.read_to_string(&mut reply).await.unwrap();
-        assert!(reply.starts_with("ERR"));
-
-        // Allowed target: OK, then a raw pipe.
-        let mut c = UnixStream::connect(&sock).await.unwrap();
-        c.write_all(format!("connect 127.0.0.1:{}\n", echo_addr.port()).as_bytes())
+        let (reply, mut s) = mux
+            .open(&WafReq::Connect {
+                target: "evil.example:443".to_string(),
+            })
             .await
             .unwrap();
-        let mut buf = [0u8; 3];
-        c.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf[..3], b"OK\n");
-        c.write_all(b"ping").await.unwrap();
+        assert!(matches!(reply, WafReply::Denied { .. }));
+        let _ = s.close().await;
+
+        // Allowed target: open, then a raw data stream.
+        let (_, mut stream) = mux
+            .open(&WafReq::Connect {
+                target: format!("127.0.0.1:{}", echo_addr.port()),
+            })
+            .await
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
         let mut echo = [0u8; 4];
-        c.read_exact(&mut echo).await.unwrap();
+        stream.read_exact(&mut echo).await.unwrap();
         assert_eq!(&echo, b"ping");
-
-        // Unknown commands get an ERR, too.
-        let mut c = UnixStream::connect(&sock).await.unwrap();
-        c.write_all(b"make http-request example.com /\n")
-            .await
-            .unwrap();
-        let mut reply = String::new();
-        c.read_to_string(&mut reply).await.unwrap();
-        assert!(reply.starts_with("ERR"));
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = stream.close().await;
     }
 
     /// AUDIT.md H3: an allowed *name* whose DNS resolves into a private or
@@ -734,51 +722,40 @@ mod tests {
         });
 
         for allow_private in [false, true] {
-            let dir = std::env::temp_dir().join(format!(
-                "ai-bubble-waf-ssrf-{}-{allow_private}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let sock = dir.join("sock");
-            let std_listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-            let _ = std_listener.set_nonblocking(true);
-            let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
+            let (a, b) = netmux::pair().unwrap();
             tokio::spawn(serve_host(
-                listener,
+                a,
                 allow(&[&format!("127.0.0.1:{}", echo_addr.port())]),
                 allow_private,
             ));
-
-            let mut c = UnixStream::connect(&sock).await.unwrap();
-            c.write_all(format!("connect 127.0.0.1:{}\n", echo_addr.port()).as_bytes())
+            let mux = MuxHandle::<WafSpec>::client(b);
+            let (reply, mut s) = mux
+                .open(&WafReq::Connect {
+                    target: format!("127.0.0.1:{}", echo_addr.port()),
+                })
                 .await
                 .unwrap();
-            let mut reply = String::new();
             if allow_private {
-                // The connection stays open as a raw pipe, so the reply
-                // must be read by length, not to EOF.
-                let mut ok = [0u8; 3];
-                c.read_exact(&mut ok).await.unwrap();
-                reply = String::from_utf8_lossy(&ok).into_owned();
-            } else {
-                c.read_to_string(&mut reply).await.unwrap();
-            }
-            if allow_private {
-                // Opted out: the dial succeeds and the pipe is live. The
-                // connection stays open as a raw pipe, so the reply must
-                // be read by length, not to EOF.
-                assert_eq!(reply, "OK\n", "allow_private={allow_private}");
+                // Opted out: the dial succeeds and the stream is a live
+                // raw pipe.
+                assert!(
+                    matches!(reply, WafReply::Open),
+                    "allow_private={allow_private}"
+                );
+                s.write_all(b"ping").await.unwrap();
+                s.flush().await.unwrap();
+                let mut echo = [0u8; 4];
+                s.read_exact(&mut echo).await.unwrap();
+                assert_eq!(&echo, b"ping");
             } else {
                 // Default: the resolved loopback address is refused —
                 // before the TLS/plaintext pipe is ever opened.
                 assert!(
-                    reply.starts_with("ERR can't connect"),
+                    matches!(&reply, WafReply::Failed { reason } if reason.contains("blocked range")),
                     "allow_private={allow_private}: {reply:?}"
                 );
-                assert!(reply.contains("blocked range"));
             }
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = s.close().await;
         }
     }
 
@@ -853,10 +830,9 @@ mod tests {
         assert!(!valid_name("evil .com"));
         assert!(!valid_name("*.example.com"));
         assert!(!valid_name("exa\0mple.com"));
-        // AUDIT.md L4: control characters (and other non-printables) must
-        // be refused — the name is interpolated into a command line on the
-        // host socket, so `0x0a` would inject a second line into the
-        // protocol.
+        // AUDIT.md L4/L1: control characters (and other non-printables)
+        // must be refused — the name is echoed into audit records and
+        // error strings, where it could forge log lines.
         assert!(!valid_name("exa\nmple.com"));
         assert!(!valid_name("exa\rmple.com"));
         assert!(!valid_name("exa\u{1}mple.com"));

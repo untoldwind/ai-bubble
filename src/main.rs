@@ -17,6 +17,10 @@
 //!   a real controlling terminal without exposing the caller's tty.
 //! * `hostfs`  — the host-side FUSE filesystem server process and the virtual
 //!   filesystem it serves; bind-mounted into the sandbox at `/host`.
+//! * `ipc`     — inter-process plumbing shared by several components;
+//!   `ipc::netmux` is the stream-multiplexed socketpair transport that
+//!   replaces the filesystem Unix socket between the in-sandbox network
+//!   process P and the host-side connector (PLAN.md).
 //! * `netns`   — the isolated-network process tree: forks, user/network
 //!   namespaces, id maps, loopback setup, waitpid lifecycle.
 //! * `proxy`   — pure async networking (tokio): the host-side connector on
@@ -35,6 +39,7 @@ mod audit;
 mod cli;
 mod connlimit;
 mod hostfs;
+mod ipc;
 mod line;
 mod proxy;
 mod sandbox;

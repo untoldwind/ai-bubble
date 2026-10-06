@@ -24,7 +24,6 @@
 //! mode wants.
 
 use std::io;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -43,8 +42,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use super::{tls_cert, tls_connect_target};
+use super::{tls_cert, tls_connect_target, WafSpec};
 use crate::connlimit::ConnLimit;
+use crate::ipc::netmux::MuxHandle;
 
 /// The response body type: the upstream's streamed body, or an empty
 /// one for the proxy's own error responses.
@@ -60,8 +60,7 @@ const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Accept loop on `127.0.0.2:443`. Concurrent connections are capped
 /// (see [`crate::connlimit`]); at capacity the newly accepted connection
 /// is dropped immediately instead of spawning a task for it.
-pub async fn serve_https(listener: TcpListener, sock: PathBuf) {
-    let sock = Arc::new(sock);
+pub async fn serve_https(listener: TcpListener, mux: MuxHandle<WafSpec>) {
     let limit = ConnLimit::new();
     loop {
         match listener.accept().await {
@@ -69,10 +68,10 @@ pub async fn serve_https(listener: TcpListener, sock: PathBuf) {
                 let Some(guard) = limit.try_acquire() else {
                     continue; // at capacity: drop the connection
                 };
-                let sock = sock.clone();
+                let mux = mux.clone();
                 tokio::spawn(async move {
                     let _guard = guard;
-                    handle_tls(tcp, &sock).await;
+                    handle_tls(tcp, mux).await;
                 });
             }
             Err(_) => return,
@@ -85,7 +84,7 @@ pub async fn serve_https(listener: TcpListener, sock: PathBuf) {
 /// plaintext to the real endpoint through the host's `tls-connect`.
 /// Anything that is not a ClientHello with a SNI (or whose SNI is denied)
 /// is dropped.
-async fn handle_tls(mut tcp: TcpStream, sock: &Path) {
+async fn handle_tls(mut tcp: TcpStream, mux: MuxHandle<WafSpec>) {
     // Slowloris guard (AUDIT.md, resource limits on the frontends): the ClientHello — and the rest of
     // the TLS handshake, which the client could equally stall — must
     // complete within HELLO_TIMEOUT. On timeout the connection is simply
@@ -98,7 +97,7 @@ async fn handle_tls(mut tcp: TcpStream, sock: &Path) {
     let Some(sni) = sni else {
         return; // no SNI: we cannot know the target, so nothing to forward
     };
-    let (cert, key) = match tls_cert(sock, &sni).await {
+    let (cert, key) = match tls_cert(&mux, &sni).await {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("ai-bubble waf: HTTPS MITM of {sni} failed: {e}");
@@ -137,12 +136,11 @@ async fn handle_tls(mut tcp: TcpStream, sock: &Path) {
     // exactly the class waf mode exists to close. The decrypted stream
     // is therefore parsed by hyper and every request is re-authorized
     // against the SNI before it is forwarded (see [`handle_request`]).
-    let sock = sock.to_path_buf();
     let sni_service = sni.clone();
     let svc = service_fn(move |req| {
-        let sock = sock.clone();
+        let mux = mux.clone();
         let sni = sni_service.clone();
-        async move { Ok::<_, std::convert::Infallible>(handle_request(&sock, &sni, req).await) }
+        async move { Ok::<_, std::convert::Infallible>(handle_request(&mux, &sni, req).await) }
     });
     let _ = http1::Builder::new()
         .serve_connection(TokioIo::new(&mut tls), svc)
@@ -152,7 +150,7 @@ async fn handle_tls(mut tcp: TcpStream, sock: &Path) {
 /// One decrypted HTTP request: enforce `Host == SNI`, rewrite the
 /// request to origin-form against the dialed authority, and forward it
 /// to the real endpoint through the host's `tls-connect`.
-async fn handle_request(sock: &Path, sni: &str, req: Request<Incoming>) -> Response<BodyT> {
+async fn handle_request(mux: &MuxHandle<WafSpec>, sni: &str, req: Request<Incoming>) -> Response<BodyT> {
     // HTTP-level fronting check (AUDIT.md M2): the `Host` header of the
     // decrypted request must name the same host the TLS ClientHello's
     // SNI did (and that the allow-list admitted). Anything else is a
@@ -182,7 +180,7 @@ async fn handle_request(sock: &Path, sni: &str, req: Request<Incoming>) -> Respo
     };
     parts.headers.insert(hyper::header::HOST, host);
 
-    let upstream = match tls_connect_target(sock, &format!("{sni}:443")).await {
+    let upstream = match tls_connect_target(mux, &format!("{sni}:443")).await {
         Ok(pipe) => pipe,
         Err(e) => {
             eprintln!("ai-bubble waf: HTTPS forward to {sni} failed: {e}");
@@ -442,12 +440,10 @@ fn sni_from_client_hello(hello: &[u8]) -> Option<String> {
                 if name_type == 0 {
                     let name = &data[p..p + name_len];
                     // AUDIT.md L4: only printable ASCII, no backslash.
-                    // Control bytes here would be re-emitted verbatim on
-                    // the host connector's command line (`tls-cert <sni>`)
-                    // — currently neutralized because exactly one line per
-                    // connection is read, but that robustness is
-                    // accidental; refusing non-printable bytes closes the
-                    // latent injection for good.
+                    // Control bytes here would be re-emitted verbatim
+                    // into audit records and error strings on the host
+                    // (`tls-cert`); refusing non-printable bytes keeps
+                    // those escape-proof.
                     return if name.iter().all(|&b| b.is_ascii_graphic() && b != b'\\') {
                         Some(String::from_utf8_lossy(name).to_ascii_lowercase())
                     } else {
@@ -467,6 +463,7 @@ fn sni_from_client_hello(hello: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use crate::waf::{WafReply, WafReq, host};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsConnector;
@@ -515,8 +512,8 @@ mod tests {
         );
 
         // AUDIT.md L4: the SNI must consist of printable ASCII only —
-        // control bytes would be re-emitted verbatim on the host
-        // connector's command line (`tls-cert <sni>`).
+        // control bytes would be re-emitted verbatim into the host's
+        // audit records and error strings.
         for evil in [
             "evil\nexample.com",
             "evil\r.com",
@@ -539,68 +536,68 @@ mod tests {
     }
 
     /// A stand-in for the host command server: `tls-cert` requests are
-    /// answered with really signed leaves, `tls-connect` pipes (as if a
-    /// TLS handshake had succeeded) to a plain TCP echo server.
-    async fn fake_host(
-        listener: tokio::net::UnixListener,
-        echo_port: u16,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            use super::super::host;
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                // Read the command line.
-                let mut line = Vec::new();
-                let mut byte = [0u8; 1];
-                while line.last() != Some(&b'\n') {
-                    match stream.read(&mut byte).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => line.push(byte[0]),
-                    }
-                }
-                let cmd = String::from_utf8_lossy(&line).trim().to_string();
-                if let Some(name) = cmd.strip_prefix("tls-cert ") {
+    /// answered with really signed leaves, `tls-connect` streams (as if a
+    /// TLS handshake had succeeded) pipe to a plain TCP echo server.
+    async fn fake_host(pair: tokio::net::UnixStream, echo_port: u16) {
+        use crate::ipc::netmux::{copy_bidirectional, serve_pair};
+        serve_pair::<WafSpec, _, _>(pair, crate::ipc::netmux::StreamLimit::new(), move |req, mut stream| async move {
+            match req {
+                WafReq::TlsCert { name } => {
                     if name == "evil.example" {
-                        let _ = stream.write_all(b"ERR denied\n").await;
-                        continue;
+                        return stream
+                            .ack(&WafReply::Denied {
+                                reason: "denied".to_string(),
+                            })
+                            .await;
                     }
-                    match host::sign_leaf(name) {
+                    match host::sign_leaf(&name) {
                         Ok((cert, key)) => {
                             let enc =
                                 |d: &[u8]| base64::engine::general_purpose::STANDARD.encode(d);
-                            let _ = stream
-                                .write_all(format!("OK {} {}\n", enc(&cert), enc(&key)).as_bytes())
-                                .await;
+                            stream
+                                .ack(&WafReply::Cert {
+                                    cert: enc(&cert),
+                                    key: enc(&key),
+                                })
+                                .await
                         }
                         Err(e) => {
-                            let _ = stream.write_all(format!("ERR {e}\n").as_bytes()).await;
+                            stream
+                                .ack(&WafReply::Failed {
+                                    reason: e.to_string(),
+                                })
+                                .await
                         }
                     }
-                    continue;
                 }
-                if cmd == "tls-connect evil.example:443" {
-                    let _ = stream.write_all(b"ERR denied\n").await;
-                    continue;
-                }
-                if let Some(_target) = cmd.strip_prefix("tls-connect ") {
-                    let Ok(tcp) = TcpStream::connect(("127.0.0.1", echo_port)).await else {
-                        let _ = stream.write_all(b"ERR no target\n").await;
-                        continue;
-                    };
-                    let _ = stream.write_all(b"OK\n").await;
-                    let (mut rs, mut ws) = stream.into_split();
-                    let (mut rt, mut wt) = tcp.into_split();
-                    tokio::select! {
-                        _ = tokio::io::copy(&mut rs, &mut wt) => {}
-                        _ = tokio::io::copy(&mut rt, &mut ws) => {}
+                WafReq::TlsConnect { target } => {
+                    if target == "evil.example:443" {
+                        return stream
+                            .ack(&WafReply::Denied {
+                                reason: "denied".to_string(),
+                            })
+                            .await;
                     }
-                    continue;
+                    let Ok(mut tcp) = TcpStream::connect(("127.0.0.1", echo_port)).await else {
+                        return stream
+                            .ack(&WafReply::Failed {
+                                reason: "no target".to_string(),
+                            })
+                            .await;
+                    };
+                    stream.ack(&WafReply::Open).await?;
+                    let _ = copy_bidirectional(&mut stream, &mut tcp).await;
+                    let _ = stream.close().await;
+                    Ok(())
                 }
-                let _ = stream.write_all(b"ERR unknown\n").await;
+                _ => stream
+                    .ack(&WafReply::Failed {
+                        reason: "unknown".to_string(),
+                    })
+                    .await,
             }
         })
+        .await;
     }
 
     /// Full MITM pipeline: a rustls client trusting only the waf CA ->
@@ -645,18 +642,13 @@ mod tests {
             }
         });
 
-        let dir = std::env::temp_dir().join(format!("ai-bubble-waf-tls-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("sock");
-        let std_listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let _ = std_listener.set_nonblocking(true);
-        let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
-        tokio::spawn(fake_host(listener, echo_addr.port()));
+        let (a, b) = crate::ipc::netmux::pair().unwrap();
+        tokio::spawn(fake_host(a, echo_addr.port()));
+        let mux = crate::ipc::netmux::MuxHandle::<WafSpec>::client(b);
 
         let tls = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tls_addr = tls.local_addr().unwrap();
-        tokio::spawn(serve_https(tls, sock));
+        tokio::spawn(serve_https(tls, mux));
 
         // A rustls client that trusts only the waf CA — exactly what the
         // injected /etc/ssl/certs/ca-certificates.crt amounts to.
@@ -728,8 +720,6 @@ mod tests {
         let tcp = TcpStream::connect(tls_addr).await.unwrap();
         let name: rustls::pki_types::ServerName<'static> = "evil.example".try_into().unwrap();
         assert!(connector.connect(name, tcp).await.is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `Host` header check behind the M2 fix: the parsed authority's

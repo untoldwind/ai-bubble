@@ -2,8 +2,8 @@
 //!
 //! Runs inside the sandbox network namespace (process P of the waf mode,
 //! see `crate::sandbox::netns`). It answers every name-resolution question by
-//! asking the host over the waf command socket (`resolve-dns <name>`,
-//! see `super::host`): allowed names get `127.0.0.2` as their A record,
+//! asking the host over the net mux pair (`resolve-dns`, see
+//! `super::host`): allowed names get `127.0.0.2` as their A record,
 //! so all further client traffic lands on the in-sandbox HTTP/HTTPS
 //! servers; anything else gets NXDOMAIN.
 //!
@@ -14,15 +14,15 @@
 //! everything else is answered with NXDOMAIN, SERVFAIL (host unreachable)
 //! or FORMERR (unsupported query).
 
-use std::path::{Path, PathBuf};
-
 use simple_dns::rdata::{A, RData};
 use simple_dns::{CLASS, OPCODE, Packet, PacketFlag, QCLASS, QTYPE, RCODE, ResourceRecord};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use super::command;
 use crate::connlimit::ConnLimit;
+use crate::ipc::netmux::MuxHandle;
+
+use super::WafSpec;
 
 /// How long a DNS-over-TCP client may take to send the length prefix and
 /// the query of one message. A client that opens a TCP connection but
@@ -41,13 +41,13 @@ fn redirect_addr() -> std::net::Ipv4Addr {
 
 /// Serve DNS over UDP on `socket`: the transport glibc and most resolvers
 /// use first. Runs until the socket errors out.
-pub async fn serve_udp(socket: UdpSocket, sock: PathBuf) {
+pub async fn serve_udp(socket: UdpSocket, mux: MuxHandle<WafSpec>) {
     let mut buf = vec![0u8; 4096];
     loop {
         let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
             return;
         };
-        let response = reply(&sock, &buf[..len]).await;
+        let response = reply(&mux, &buf[..len]).await;
         if socket.send_to(&response, peer).await.is_err() {
             return;
         }
@@ -59,7 +59,7 @@ pub async fn serve_udp(socket: UdpSocket, sock: PathBuf) {
 /// errors out. Concurrent connections are capped (see
 /// [`crate::connlimit`]); at capacity the newly accepted connection is
 /// dropped immediately instead of spawning a task for it.
-pub async fn serve_tcp(listener: TcpListener, sock: PathBuf) {
+pub async fn serve_tcp(listener: TcpListener, mux: MuxHandle<WafSpec>) {
     let limit = ConnLimit::new();
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
@@ -68,10 +68,10 @@ pub async fn serve_tcp(listener: TcpListener, sock: PathBuf) {
         let Some(guard) = limit.try_acquire() else {
             continue; // at capacity: drop the connection
         };
-        let sock = sock.clone();
+        let mux = mux.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            let _ = serve_tcp_conn(tcp, &sock).await;
+            let _ = serve_tcp_conn(tcp, &mux).await;
         });
     }
 }
@@ -91,7 +91,7 @@ async fn read_exact_timed(tcp: &mut TcpStream, buf: &mut [u8]) -> std::io::Resul
     }
 }
 
-async fn serve_tcp_conn(mut tcp: TcpStream, sock: &Path) -> std::io::Result<()> {
+async fn serve_tcp_conn(mut tcp: TcpStream, mux: &MuxHandle<WafSpec>) -> std::io::Result<()> {
     let mut len_buf = [0u8; 2];
     loop {
         read_exact_timed(&mut tcp, &mut len_buf).await?;
@@ -101,7 +101,7 @@ async fn serve_tcp_conn(mut tcp: TcpStream, sock: &Path) -> std::io::Result<()> 
         }
         let mut query = vec![0u8; len];
         read_exact_timed(&mut tcp, &mut query).await?;
-        let response = reply(sock, &query).await;
+        let response = reply(mux, &query).await;
         tcp.write_all(
             u16::try_from(response.len())
                 .unwrap_or(0)
@@ -118,11 +118,8 @@ async fn serve_tcp_conn(mut tcp: TcpStream, sock: &Path) -> std::io::Result<()> 
 /// from here), `Ok(false)`: not on the allow list. A failed round trip
 /// (the host may already be tearing down) is an error, answered with
 /// SERVFAIL.
-async fn resolve(sock: &Path, name: &str) -> std::io::Result<bool> {
-    match command(sock, &format!("resolve-dns {name}")).await {
-        Ok(reply) => Ok(reply.starts_with("OK")),
-        Err(e) => Err(e),
-    }
+async fn resolve(mux: &MuxHandle<WafSpec>, name: &str) -> std::io::Result<bool> {
+    super::resolve_name(mux, name).await
 }
 
 /// Whether this packet is a query this server answers: not a response,
@@ -138,7 +135,7 @@ fn is_supported_query(packet: &Packet<'_>) -> bool {
 /// ask the host for the allow-list decision and build the reply — an A
 /// record for the redirect address on allowed A queries, NXDOMAIN
 /// otherwise, SERVFAIL when the host cannot be reached.
-async fn reply(sock: &Path, query: &[u8]) -> Vec<u8> {
+async fn reply(mux: &MuxHandle<WafSpec>, query: &[u8]) -> Vec<u8> {
     let Ok(packet) = Packet::parse(query) else {
         return formerr(query);
     };
@@ -149,15 +146,14 @@ async fn reply(sock: &Path, query: &[u8]) -> Vec<u8> {
     // reply needs before the packet is turned into a reply.
     let question = packet.questions[0].clone();
     let name = question.qname.to_string().to_ascii_lowercase();
-    // NET-5: the qname is interpolated verbatim into the host command
-    // line (`resolve-dns {name}`); validate it here, before sending —
-    // the waf frontends' `valid_name` rejects control bytes (a `\n` in a
-    // DNS label would otherwise ride on the one-line-per-connection
-    // invariant and could inject a second command).
+    // NET-5: the qname is sent to the host as the `resolve-dns` frame's
+    // payload; validate it here, before sending — the waf frontends'
+    // `valid_name` rejects control bytes (which would otherwise reach
+    // audit records and error strings unescaped).
     if !super::host::valid_name(&name) {
         return formerr(query);
     }
-    let (rcode, answer) = match resolve(sock, &name).await {
+    let (rcode, answer) = match resolve(mux, &name).await {
         Ok(true) => match question.qtype {
             QTYPE::TYPE(simple_dns::TYPE::A) => (RCODE::NoError, Some(redirect_addr())),
             _ => (RCODE::NoError, None),
@@ -198,7 +194,6 @@ fn formerr(query: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::waf::host;
-    use std::os::unix::net::UnixListener as StdUnixListener;
 
     /// Build a query packet for `name` with type `A`.
     fn make_query(name: &str) -> Vec<u8> {
@@ -283,28 +278,24 @@ mod tests {
     }
 
     /// Full pipeline: a DNS query over UDP -> the DNS server -> the
-    /// command socket (denied by an empty allow list) -> NXDOMAIN.
+    /// mux pair (denied by an empty allow list) -> NXDOMAIN.
     #[tokio::test]
     async fn end_to_end_denial() {
-        let dir =
-            std::env::temp_dir().join(format!("ai-bubble-waf-dns-e2e-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("sock");
-        let std_listener = StdUnixListener::bind(&sock).unwrap();
-        let _ = std_listener.set_nonblocking(true);
-        let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
+        use crate::ipc::netmux::MuxHandle;
+
+        let (a, b) = crate::ipc::netmux::pair().unwrap();
         tokio::spawn(host::serve_host(
-            listener,
+            a,
             crate::proxy::allowlist::shared(vec![]),
             false,
         ));
+        let mux = MuxHandle::<WafSpec>::client(b);
 
         // The server side of the "nameserver": a UDP socket the DNS
         // server serves queries on.
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
-        tokio::spawn(serve_udp(server, sock.clone()));
+        tokio::spawn(serve_udp(server, mux.clone()));
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let query = make_query("example.com");
@@ -316,29 +307,20 @@ mod tests {
         assert_eq!(&buf[6..8], &[0, 0]);
 
         // An allowed name gets the redirect address as its A record.
-        let dir2 =
-            std::env::temp_dir().join(format!("ai-bubble-waf-dns-e2e2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir2);
-        std::fs::create_dir_all(&dir2).unwrap();
-        let sock2 = dir2.join("sock");
-        let std_listener = StdUnixListener::bind(&sock2).unwrap();
-        let _ = std_listener.set_nonblocking(true);
-        let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
+        let (a, b) = crate::ipc::netmux::pair().unwrap();
         tokio::spawn(host::serve_host(
-            listener,
+            a,
             crate::proxy::allowlist::shared(vec!["example.com".to_string()]),
             false,
         ));
+        let mux = MuxHandle::<WafSpec>::client(b);
         let server2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server2_addr = server2.local_addr().unwrap();
-        tokio::spawn(serve_udp(server2, sock2));
+        tokio::spawn(serve_udp(server2, mux));
         client.send_to(&query, server2_addr).await.unwrap();
         let mut buf = vec![0u8; 1024];
         let (len, _) = client.recv_from(&mut buf).await.unwrap();
         assert_eq!(buf[3] & 0x0F, 0);
         assert_eq!(&buf[..len][len - 4..], &[127, 0, 0, 2]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

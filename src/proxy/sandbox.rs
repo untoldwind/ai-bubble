@@ -2,17 +2,19 @@
 //!
 //! This code runs inside the sandbox network namespace (process P). It is
 //! a minimal HTTP CONNECT proxy on `PROXY_ADDR` that forwards every
-//! connection over the Unix socket to the connector, which lives on the
-//! host side (see `super::connector`) and holds the real network access.
+//! connection as a netmux stream (see [`crate::ipc::netmux`]) to the
+//! connector, which lives on the host side (see `super::connector`) and
+//! holds the real network access.
 
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use super::allowlist::target_allowed;
+use super::{ProxyReq, ProxySpec};
 use crate::connlimit::ConnLimit;
+use crate::ipc::netmux::{self, MuxHandle};
 
 /// How long a client may take to deliver a complete HTTP CONNECT request
 /// head. A client that opens a connection but never sends (or trickles
@@ -25,13 +27,13 @@ const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Accept loop inside the sandbox network namespace: handle one HTTP
 /// CONNECT request per connection. The actual connection is made by the
-/// connector process (host network namespace) over the Unix socket.
+/// connector process (host network namespace) over the net mux pair.
 /// Concurrent connections are capped (see [`crate::connlimit`]); when
 /// the cap is reached the newly accepted connection is dropped instead
 /// of spawning a task for it.
 pub async fn serve_sandbox_proxy(
     listener: TcpListener,
-    sock: PathBuf,
+    mux: MuxHandle<ProxySpec>,
     allow: super::allowlist::SharedAllow,
 ) {
     let limit = ConnLimit::new();
@@ -43,14 +45,14 @@ pub async fn serve_sandbox_proxy(
                 let Some(guard) = limit.try_acquire() else {
                     continue;
                 };
-                let sock = sock.clone();
+                let mux = mux.clone();
                 // Snapshot at accept time: a runtime swap of the shared
                 // list affects new connections only.
                 let allow = super::allowlist::load(&allow);
                 tokio::spawn(async move {
                     // Hold the connection slot for the task's lifetime.
                     let _guard = guard;
-                    handle_connect_proxy(tcp, &sock, &allow).await;
+                    handle_connect_proxy(tcp, mux, &allow).await;
                 });
             }
             Err(_) => return,
@@ -58,7 +60,11 @@ pub async fn serve_sandbox_proxy(
     }
 }
 
-async fn handle_connect_proxy(mut tcp: TcpStream, sock: &Path, allow: &[String]) {
+async fn handle_connect_proxy(
+    mut tcp: TcpStream,
+    mux: MuxHandle<ProxySpec>,
+    allow: &[String],
+) {
     // The request head must arrive within HEADER_TIMEOUT (see the
     // constant's doc); a timed-out or malformed head gets the same 400.
     let target = match tokio::time::timeout(HEADER_TIMEOUT, read_connect_target(&mut tcp)).await {
@@ -77,32 +83,24 @@ async fn handle_connect_proxy(mut tcp: TcpStream, sock: &Path, allow: &[String])
         let _ = tcp.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
         return;
     }
-    let mut unix = match UnixStream::connect(sock).await {
-        Ok(u) => u,
+    // Open the mux stream: the connector authorizes again host-side (the
+    // snapshot it took at OPEN may differ from P's), dials the target and
+    // acks once the tunnel is live.
+    let (_, mut stream) = match mux.open(&ProxyReq { target: target.clone() }).await {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("ai-bubble proxy: can't reach connector: {e}");
+            crate::audit::record("proxy", "CONNECT", Some(&target), Some("err"), None).await;
             let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             return;
         }
     };
-    let mut line = target.clone().into_bytes();
-    line.push(b'\n');
-    if unix.write_all(&line).await.is_err() {
-        let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-        return;
-    }
-    // Wait for the connector's status byte before answering the client.
-    let mut status = [0u8; 1];
-    if unix.read_exact(&mut status).await.is_err() || status[0] != b'K' {
-        crate::audit::record("proxy", "CONNECT", Some(&target), Some("err"), None).await;
-        let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-        return;
-    }
     crate::audit::record("proxy", "CONNECT", Some(&target), Some("ok"), None).await;
     let _ = tcp
         .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
         .await;
-    let _ = copy_bidirectional(&mut unix, &mut tcp).await;
+    let _ = netmux::copy_bidirectional(&mut stream, &mut tcp).await;
+    let _ = stream.close().await;
 }
 
 /// Read one HTTP CONNECT request and return the `host:port` target.
@@ -191,17 +189,22 @@ mod tests {
         assert_eq!(parse_connect_request(b"\r\n\r\n"), None);
     }
 
-    /// A denied target must get a 403 instead of a tunnel.
+    /// A denied target must get a 403 instead of a tunnel. The mux pair's
+    /// connector end is served but never contacted: the denial happens at
+    /// P's own allow-list check, before any stream is opened.
     #[tokio::test]
     async fn connect_denied_by_allow_list() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
-        let dir = std::env::temp_dir().join(format!("ai-bubble-deny-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = netmux::pair().unwrap();
+        tokio::spawn(crate::proxy::serve_connector(
+            a,
+            crate::proxy::allowlist::shared(vec![]),
+            false,
+        ));
         tokio::spawn(serve_sandbox_proxy(
             proxy,
-            dir.join("sock"),
+            MuxHandle::<ProxySpec>::client(b),
             crate::proxy::allowlist::shared(vec!["allowed.example:443".to_string()]),
         ));
 
@@ -212,7 +215,5 @@ mod tests {
         let mut resp = [0u8; 12];
         c.read_exact(&mut resp).await.unwrap();
         assert_eq!(&resp, b"HTTP/1.1 403");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

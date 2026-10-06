@@ -15,9 +15,7 @@
 //! upstream response is streamed back through the server connection.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -32,6 +30,9 @@ use tokio::net::TcpListener;
 
 use super::connect_target;
 use crate::connlimit::ConnLimit;
+use crate::ipc::netmux::MuxHandle;
+
+use super::WafSpec;
 
 /// The response body type: the upstream's streamed body, or an empty
 /// one for the proxy's own error responses.
@@ -51,8 +52,7 @@ const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6
 /// once the target is known) per connection. Concurrent connections are
 /// capped (see [`crate::connlimit`]); at capacity the newly accepted
 /// connection is dropped immediately instead of spawning a task for it.
-pub async fn serve_http(listener: TcpListener, sock: PathBuf) {
-    let sock = Arc::new(sock);
+pub async fn serve_http(listener: TcpListener, mux: MuxHandle<WafSpec>) {
     let limit = ConnLimit::new();
     loop {
         match listener.accept().await {
@@ -60,7 +60,7 @@ pub async fn serve_http(listener: TcpListener, sock: PathBuf) {
                 let Some(guard) = limit.try_acquire() else {
                     continue; // at capacity: drop the connection
                 };
-                let sock = sock.clone();
+                let mux = mux.clone();
                 tokio::spawn(async move {
                     let _guard = guard;
                     // hyper has no built-in read timer; the one-request-
@@ -68,7 +68,7 @@ pub async fn serve_http(listener: TcpListener, sock: PathBuf) {
                     // a whole-connection timeout the simplest equivalent.
                     let _ = tokio::time::timeout(
                         CONNECTION_TIMEOUT,
-                        http1::Builder::new().serve_connection(TokioIo::new(tcp), Proxy { sock }),
+                        http1::Builder::new().serve_connection(TokioIo::new(tcp), Proxy { mux }),
                     )
                     .await;
                 });
@@ -83,7 +83,7 @@ pub async fn serve_http(listener: TcpListener, sock: PathBuf) {
 /// host side and pipe the response back.
 #[derive(Clone)]
 struct Proxy {
-    sock: Arc<PathBuf>,
+    mux: MuxHandle<WafSpec>,
 }
 
 impl Service<Request<Incoming>> for Proxy {
@@ -102,7 +102,7 @@ impl Proxy {
         let Some(target) = extract_target(&req) else {
             return empty_response(StatusCode::BAD_REQUEST);
         };
-        let upstream = match connect_target(&self.sock, &target).await {
+        let upstream = match connect_target(&self.mux, &target).await {
             Ok(pipe) => pipe,
             Err(e) => {
                 eprintln!("ai-bubble waf: HTTP proxy to {target} failed: {e}");
@@ -230,8 +230,8 @@ fn authority_target(authority: &Authority) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::netmux::{self, MuxHandle};
     use crate::waf::host;
-    use std::os::unix::net::UnixListener as StdUnixListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -307,22 +307,17 @@ mod tests {
             }
         });
 
-        let dir = std::env::temp_dir().join(format!("ai-bubble-waf-http-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock = dir.join("sock");
-        let std_listener = StdUnixListener::bind(&sock).unwrap();
-        let _ = std_listener.set_nonblocking(true);
-        let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
+        let (a, b) = netmux::pair().unwrap();
         tokio::spawn(host::serve_host(
-            listener,
+            a,
             crate::proxy::allowlist::shared(vec![format!("127.0.0.1:{}", echo_addr.port())]),
             true,
         ));
+        let mux = MuxHandle::<WafSpec>::client(b);
 
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = http.local_addr().unwrap();
-        tokio::spawn(serve_http(http, sock));
+        tokio::spawn(serve_http(http, mux.clone()));
 
         let mut c = TcpStream::connect(http_addr).await.unwrap();
         c.write_all(
@@ -373,21 +368,16 @@ mod tests {
         );
 
         // Denied targets get a 403 (empty allow list).
-        let dir2 = std::env::temp_dir().join(format!("ai-bubble-waf-http2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir2);
-        std::fs::create_dir_all(&dir2).unwrap();
-        let sock2 = dir2.join("sock");
-        let std_listener = StdUnixListener::bind(&sock2).unwrap();
-        let _ = std_listener.set_nonblocking(true);
-        let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
+        let (a, b) = netmux::pair().unwrap();
         tokio::spawn(host::serve_host(
-            listener,
+            a,
             crate::proxy::allowlist::shared(vec![]),
             false,
         ));
+        let mux = MuxHandle::<WafSpec>::client(b);
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = http.local_addr().unwrap();
-        tokio::spawn(serve_http(http, sock2));
+        tokio::spawn(serve_http(http, mux));
         let mut c = TcpStream::connect(http_addr).await.unwrap();
         c.write_all(b"GET http://evil.example/x HTTP/1.1\r\n\r\n")
             .await
@@ -395,9 +385,6 @@ mod tests {
         let mut resp = Vec::new();
         c.read_to_end(&mut resp).await.unwrap();
         assert!(resp.starts_with(b"HTTP/1.1 403"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// A POST request with no target is rejected too.
