@@ -10,7 +10,7 @@
 //!   These types carry the serde and JSON-schema attributes and are
 //!   documented for the file format.
 //! * The internal configuration — [`internal`]: what the sandbox
-//!   machinery (`crate::sandbox`, `crate::hostfs`, `crate::netns`)
+//!   machinery (`crate::sandbox`, `crate::hostfs`, `crate::sandbox::netns`)
 //!   actually runs with, compiled down from the parsed file by
 //!   [`internal::SandboxConfig::compile`]. Internal code never touches
 //!   the config-file types.

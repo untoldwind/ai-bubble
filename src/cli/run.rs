@@ -4,7 +4,8 @@
 use clap::Args;
 use std::path::Path;
 
-use crate::{audit, control, hostfs, netns, sandbox, spec, waf};
+use crate::{audit, control, hostfs, sandbox, spec, waf};
+use crate::sandbox::netns;
 
 /// Run COMMAND inside a fresh sandbox (new user + mount namespace, empty
 /// tmpfs root) configured by the spec file.

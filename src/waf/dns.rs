@@ -1,7 +1,7 @@
 //! The in-sandbox DNS server (127.0.0.2:53).
 //!
 //! Runs inside the sandbox network namespace (process P of the waf mode,
-//! see `crate::netns`). It answers every name-resolution question by
+//! see `crate::sandbox::netns`). It answers every name-resolution question by
 //! asking the host over the waf command socket (`resolve-dns <name>`,
 //! see `super::host`): allowed names get `127.0.0.2` as their A record,
 //! so all further client traffic lands on the in-sandbox HTTP/HTTPS

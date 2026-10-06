@@ -27,6 +27,9 @@ use std::sync::OnceLock;
 
 use crate::spec::internal::{Op, SeccompPolicy, SeccompViolation};
 
+pub(crate) mod netns;
+pub(crate) mod pty;
+
 #[cfg(test)]
 use crate::spec::internal::SocketGate;
 use crate::spec::rlimits::Rlimits;
@@ -621,12 +624,12 @@ pub(crate) unsafe fn new_terminal_session() {
 
 /// The parent keeps waiting for the child and forwards its exit status.
 ///
-/// Pty mode ([`crate::pty::wanted`]): when new-session is requested and
+/// Pty mode ([`crate::sandbox::pty::wanted`]): when new-session is requested and
 /// the caller's stdin/stdout are ttys, a *private* pty is allocated
-/// before the fork ([`crate::pty::open`]). The child gets the slave as
-/// fds 0/1/2 and controlling terminal ([`crate::pty::child_attach`]);
+/// before the fork ([`crate::sandbox::pty::open`]). The child gets the slave as
+/// fds 0/1/2 and controlling terminal ([`crate::sandbox::pty::child_attach`]);
 /// this process (the one that waitpid()s) becomes the stdio ⇄ master
-/// relay ([`crate::pty::parent_relay`]). See the `pty` module docs for
+/// relay ([`crate::sandbox::pty::parent_relay`]). See the `pty` module docs for
 /// why this keeps new-session's security properties while restoring full
 /// controlling-terminal functionality (job control, SIGWINCH, …).
 pub(crate) unsafe fn pidns_and_exec(
@@ -655,7 +658,7 @@ pub(crate) unsafe fn pidns_and_exec(
         // run, while the control socket needs the supervisor's runtime
         // (below). Refuse the combination instead of silently serving
         // control only while the relay happens to idle.
-        let use_pty = crate::pty::wanted(new_session);
+        let use_pty = crate::sandbox::pty::wanted(new_session);
         if use_pty && crate::control::listening() {
             // SB-8: this fires when control *is* enabled (the default) —
             // the remedy is to pass `--no-control`, not `--no-new-session`
@@ -667,7 +670,7 @@ pub(crate) unsafe fn pidns_and_exec(
             );
         }
         let pty = if use_pty {
-            Some(crate::pty::open())
+            Some(crate::sandbox::pty::open())
         } else {
             None
         };
@@ -699,7 +702,7 @@ pub(crate) unsafe fn pidns_and_exec(
             // leader, so setsid() cannot fail with EPERM — so both entry
             // points get it.
             if let Some(p) = &pty {
-                crate::pty::child_attach(p, stderr_is_tty);
+                crate::sandbox::pty::child_attach(p, stderr_is_tty);
             } else if new_session {
                 new_terminal_session();
             }
@@ -718,10 +721,10 @@ pub(crate) unsafe fn pidns_and_exec(
         // Parent: the child must not keep the slave open, or the master
         // would never see EOF when the command exits.
         if let Some(p) = &pty {
-            crate::pty::close_slave(p);
+            crate::sandbox::pty::close_slave(p);
             // Relay stdio ⇄ master until the pty closes or a fatal
             // signal arrives; the terminal is restored before returning.
-            crate::pty::parent_relay(p, pid);
+            crate::sandbox::pty::parent_relay(p, pid);
         }
 
         // Supervise the PID-1 child and forward its exit status.
@@ -751,7 +754,7 @@ pub(crate) unsafe fn pidns_and_exec(
                         _ = crate::control::reload_task() => {
                             unreachable!("SIGHUP reload loop never ends")
                         }
-                        st = crate::netns::wait_status(pid) => st,
+                        st = crate::sandbox::netns::wait_status(pid) => st,
                     };
                     // The sandboxed command is gone. Tell FS the run is
                     // ending (half-close the hub peers), gather every
