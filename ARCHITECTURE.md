@@ -217,54 +217,135 @@ Key points:
 
 ## Inter-process communication
 
-### The network bridge (net path)
+All process-to-process channels are established **before the forks**, as
+fds that the children inherit; nothing needs to be discovered or bound
+afterwards. Three channels exist: the network bridge (socketpair mux), the
+audit/control channels (socketpairs shared by both), and the FUSE kernel
+channel. Lifecycle synchronization is done with pipes and `waitpid` chains.
 
-The only channel between the network-isolated world and the host is a
-**Unix-domain socket** at a private `/tmp/ai-bubble-net.XXXXXX/sock`
-directory:
+### The network bridge (net path, `ipc::netmux`)
+
+The bridge between the network-isolated world and the host is a single
+**pre-fork `socketpair(SOCK_STREAM | SOCK_CLOEXEC)`** created in
+`netns::run` before `P` is forked — an fd pair, not a filesystem object, so
+there is nothing to bind, mount or clean up, and it crosses the namespace
+boundary the same way every inherited fd does:
 
 ```
-COMMAND ──TCP──▶ P's frontends on 127.0.0.2 ──Unix socket──▶ A's connector ──TCP──▶ host
-        (sandbox netns)                        (host netns)
+COMMAND ──TCP──▶ P's frontends on 127.0.0.2 ──netmux socketpair──▶ A's connector ──TCP──▶ host
+        (sandbox netns)                     (P)                  (A, host netns)
 ```
 
-* `A` (the **connector**) binds the socket and serves it in the *host*
-  network namespace. It never enters the sandbox; it answers the socket
-  protocol with real TCP connections.
+* `A` (the **connector** side) runs `netmux::serve_pair` on the socketpair
+  in the *host* network namespace. It never enters the sandbox; it turns
+  stream-open requests into real TCP dials.
 * `P` runs the in-sandbox frontends in the *sandbox* network namespace:
   in proxy mode a minimal HTTP CONNECT proxy on 127.0.0.2:3128 (the
   `http_proxy`-family env vars make standard tools use it); in waf mode a
   DNS/HTTP/HTTPS triple on 127.0.0.2:53/80/443 (DNS answers point at
   127.0.0.2, and waf mode injects its own resolv.conf and MITM CA into the
-  sandbox).
-* P opens the Unix socket **before** any filesystem sandboxing exists: P is
-  forked before the mount namespace is unshared and never chroots, so it
-  simply opens `/tmp/ai-bubble-net.XXXXXX/sock` on the host tree. COMMAND
-  itself never touches the socket — it only speaks TCP to 127.0.0.2.
-* The socket crosses the network-namespace boundary because Unix sockets
-  are filesystem objects, not network objects. The listener fds are opened
-  with `FD_CLOEXEC` so the exec'd COMMAND can never inherit them.
-* Protocol: in proxy mode the connector receives `host:port` CONNECT
-  requests; in waf mode a small command protocol (`resolve-dns`, `connect`).
-  The allow-list check (`proxy::allowlist`) is shared by both sides.
-* Both sides of the socket enforce the same allow-list, so neither a
-  sandbox-side bypass nor a host-side over-reach is possible.
+  sandbox). The frontends open mux streams via `MuxHandle::open()`.
+* Wire format: length-prefixed frames (`LengthDelimitedCodec`, big-endian
+  u32) carrying a tag byte, a u32 stream id and a flags byte. Tags are
+  `OPEN`/`ACK`/`ERR` (JSON, mode-typed against `NetSpec`) and `DATA` (raw
+  bytes; the `FIN` flag half-closes the stream), plus `CLOSE`. Payloads are
+  capped at `PAYLOAD_CAP` (256 KiB).
+* Multiplexing: many concurrent streams share the one socketpair. Each
+  stream has a bounded inbox; a full inbox backpressures end-to-end
+  (producer-to-consumer), and the total stream count is capped by the
+  connection limit, enforced at `OPEN`. An EOF on the pair fails all
+  pending openers.
+* Peer authentication: `netmux::check_peer` verifies `SO_PEERCRED` against
+  the creds snapshotted when the socketpair was created; a mismatch cuts
+  the connection and produces an audit event.
+* COMMAND itself never touches the socketpair — it only speaks TCP to
+  127.0.0.2, and the fd is `CLOEXEC`. The allow-list check
+  (`proxy::allowlist`) is shared by both sides, so neither a sandbox-side
+  bypass nor a host-side over-reach is possible.
+
+### The audit/control channels (`audit::ipc`)
+
+A pair of pre-fork Unix **socketpairs** — one between `A` and `FS`, one
+between `A` and `P` — carries both audit events (upstream) and control-plane
+policy updates (downstream) over the same fds. They exist whenever auditing
+is active together with either the host-FS child or isolated networking
+(`audit::set_ipc_enabled`, set in `cli/run.rs`).
+
+**Fork roles.** The child (`FS`/`P`) registers its end via
+`audit::set_channel(fd)`; `A` registers the peer ends via
+`add_peer(role, fd)`. On the child side the fd is split into a read half
+(consumed by the channel reader, which feeds the control loop) and a write
+half — `Arc<Mutex<UnixStream>>` shared by the audit batch writer and the
+control reply writer, so frames never tear. The child drops its inherited
+audit-log fd (`drop_log_fd`): **the launcher is the only writer of the
+audit log file**.
+
+**Upstream: audit events.** Each process still owns its own bounded tokio
+mpsc queue (65536 events) because tokio channels cannot be shared across
+`fork` — but only the launcher writes the file:
+
+* `FS` and `P` batch their events (flush interval 200 ms, up to 4096 events
+  per batch, one `write(2)` per batch) and send them upstream as
+  `FRAME_CAP`-limited (64 KiB) JSON-line frames.
+* `A`'s hub (`spawn_hub`) runs one reader per peer that demultiplexes
+  frames: audit events go into the same queue that feeds the file writer;
+  `{"ack":true}` / `{"err":…}` frames go to the control-plane reply
+  channel. Forged `source` fields are cross-checked against the peer role
+  and overridden; malformed frames fail the channel closed (warn once).
+* Events are never dropped: all queues are bounded with
+  suspend-on-full backpressure, so a slow log file slows the producers
+  instead of losing events. Per-field size caps (4096 chars) and a
+  truncating `detail` budget keep frames within `FRAME_CAP`.
+* On shutdown, A shuts down the write side of each peer (`shutdown_peers`);
+  the child sees EOF ("run ending"), performs a final flush upstream, and
+  drains its own queue before exiting. The launcher drains its queue and
+  file writer last.
+
+**Downstream: the control plane (`cli/control`).** The control channel lets
+a trusted local client adjust policy while the run is live:
+
+* **Socket**: a Linux abstract-namespace socket
+  `@ai-bubble-control-<16 hex of sha256(canonical spec dir)>`, bound by
+  `A` in `control::start` before forking. `EADDRINUSE` (a second concurrent
+  run of the same spec) simply continues without control. The listener fd
+  is `CLOEXEC` and closed in every forked child.
+* **Auth**: each run generates a 128-bit token, written `0600` to
+  `<spec-dir>/run/control-token` (`run/` is `0700`). The client must send
+  the hex token as the first line of the connection; it is compared in
+  constant time (`SO_PEERCRED` is useless across the user namespace).
+  Token and reply timeouts are 10 s each; the accept loop is connection-
+  limited.
+* **Protocol** (one connection, JSON lines, 64 KiB line cap):
+  ```
+  → <32-hex token>
+  → {"cmd":"policy-get"}              ← {"ok":true,"fs":{…}|null,"net":{…}|null}
+  → {"cmd":"fs-set","mappings":[…]}    ← {"ok":true} / {"ok":false,"err":…}
+  → {"cmd":"net-set","allow":[…]}      ← ditto
+  → {"cmd":"spec-reload"}              ← ditto
+  ```
+  The control plane is policy-only — there are no stop/status or I/O-relay
+  commands.
+* **Propagation.** `A` is the hub and keeps the authoritative copies of the
+  FS policy and network allow-list. An accepted update is pushed to `FS`
+  and/or `P` as a `{"upd":{…}}` frame over the same audit socketpair; the
+  children apply it (swapping the compiled pattern set / allow-list behind
+  an `Arc` swap) and reply `{"ack":true}` / `{"err":…}` on the shared write
+  half — replies are written directly, never through the audit queue, and
+  at most one update is outstanding per channel (`UPD_GATE`), so
+  correlation is positional. A rejected child update is rolled back in `A`
+  — policy is never left half-applied. `fs-set` re-validates like the spec
+  loader (including the spec-dir protections); `spec-reload` (also
+  triggered by `SIGHUP` on the launcher) refuses immutable changes (ops,
+  env, cwd, seccomp, rlimits, audit log, net mode) by name.
+* **Client**: `ai-bubble control --policy-get | --fs-set JSON |
+  --net-set JSON | --spec-reload` (`cli/control_cli.rs`), exit code 1 on
+  `ok:false`.
 
 ### The FUSE channel
 
 COMMAND's filesystem accesses to mirrored host paths are served by `FS` over
 the kernel FUSE channel — no direct process-to-process IPC. The only
 explicit synchronization is the one-byte readiness pipe at startup.
-
-### The audit log
-
-Every forked process (`FS`, `A`/connector, `P`, `S`) can produce audit
-events. Because tokio channels cannot be shared across `fork`, **each
-process initializes its own** bounded mpsc channel (65536 events) plus a
-writer task, and all of them append to the same audit log file. Writes are
-line-buffered with a single small `write` per batch, so concurrent writers
-interleave safely. On shutdown each process drains its own channel before
-exiting.
 
 ### Lifecycle synchronization
 
