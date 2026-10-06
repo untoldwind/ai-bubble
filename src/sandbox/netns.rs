@@ -94,8 +94,9 @@ pub fn run(
         // connector over this pre-fork socketpair. `SOCK_CLOEXEC` on
         // both ends — the exec'd sandboxed command never sees either
         // side. `sv[0]` stays with the connector (its hub reads it),
-        // `sv[1]` goes to P. The same pair carries the control plane's
-        // downstream `net-set` updates and P's acks (see `crate::cli::control`).
+        // `sv[1]` goes to P. The pair carries only P's upstream audit
+        // events: P holds no control state, so nothing is ever pushed
+        // downstream over it.
         let mut audit_pair: Option<[libc::c_int; 2]> = None;
         if crate::audit::ipc_channel_wanted() {
             let mut sv: [libc::c_int; 2] = [0; 2];
@@ -403,60 +404,33 @@ fn isolated_parent(
         }
 
         // Serve the mode's network frontends while the command runs.
-        // The shared allow-list: P serves the CONNECT proxy from it, and
-        // P's control loop (once wired) applies launcher-pushed `net-set`
-        // updates by swapping this handle. Swaps affect new connections
-        // only — every accepted connection snapshots the list.
-        let allow = crate::proxy::allowlist::shared(net.allow.clone());
+        // The allow-list lives entirely in A: the connector re-checks
+        // every OPEN host-side (and filters the resolved address), so P
+        // holds no list of its own and nothing needs to be pushed to it
+        // when the control plane swaps the list.
         let status = block_on(async move {
             // The P end of the net mux channel (PLAN.md Phase 2): the
             // frontends open their host-side requests as mux streams on
             // it. Wrapped inside the runtime, like the audit channel.
             let net_pair = crate::ipc::netmux::stream_from_raw_fd(net_fd);
-            // Proxy mode: register P's control loop on the inherited
-            // channel — the launcher's `net-set` arrives here as an
-            // `upd` frame and swaps the allow-list (affecting new
-            // connections only). Waf mode keeps no allow-list of its
-            // own (every decision is forwarded to the connector), so
-            // the launcher never pushes net updates to it.
+            // The audit sink must exist before any `record` fires; there
+            // is no P-side control loop any more (the allow-list is
+            // A-local), so the channel's read half stays unused.
             crate::audit::init_channel_sink();
-            let control_loop = match (
-                net.mode,
-                crate::audit::channel_reader(),
-                crate::audit::reply_writer(),
-            ) {
-                (NetMode::Proxy, Some(read), Some(reply)) => Some(tokio::spawn(
-                    crate::cli::control::net_child_loop(read, reply, std::sync::Arc::clone(&allow)),
-                )),
-                _ => None,
-            };
             let status = match (net.mode, proxy_listener, waf_listeners) {
                 (NetMode::Proxy, Some(listener), _) => {
                     let _ = listener.set_nonblocking(true);
                     let l = tokio::net::TcpListener::from_std(listener)
                         .unwrap_or_else(|e| die(&format!("Can't register proxy listener: {e}")));
-                    let mux =
-                        crate::ipc::netmux::MuxHandle::<crate::proxy::ProxySpec>::client(net_pair);
+                    let mux = crate::ipc::netmux::MuxHandle::<crate::proxy::ProxySpec>::client(
+                        net_pair,
+                    );
                     tokio::select! {
                         st = wait_status(child_pid) => st,
-                        // The proxy accept loop never ends; the control loop
-                        // below merely ends at the launcher's EOF (P's
-                        // shutdown stays driven by the child's exit), after
-                        // which this block waits for the child like the
-                        // proxy arm does.
-                        _ = async {
-                            tokio::select! {
-                                _ = crate::proxy::serve_sandbox_proxy(l, mux, allow) => {
-                                    unreachable!("proxy accept loop never ends")
-                                }
-                                _ = async {
-                                    match control_loop {
-                                        Some(task) => { let _ = task.await; }
-                                        None => std::future::pending::<()>().await,
-                                    }
-                                } => std::future::pending::<()>().await,
-                            }
-                        } => unreachable!("proxy accept loop never ends"),
+                        // The proxy accept loop never ends.
+                        _ = crate::proxy::serve_sandbox_proxy(l, mux) => {
+                            unreachable!("proxy accept loop never ends")
+                        }
                     }
                 }
                 (NetMode::Waf, _, Some((tcp53, tcp80, tcp443, udp53))) => {

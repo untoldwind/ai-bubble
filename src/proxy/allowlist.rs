@@ -1,9 +1,11 @@
 //! The allow-list, shared by the proxy and the waf mode.
 //!
-//! The list is built on the host from the spec's `net` section. The
-//! proxy's connector and the waf host (`crate::waf::host`) re-check every
-//! request; the sandbox-side HTTP CONNECT proxy answers CONNECT requests
-//! early with 403.
+//! The list is built on the host from the spec's `net` section and lives
+//! entirely on the host side: the proxy's connector and the waf host
+//! (`crate::waf::host`) re-check every request before dialing. The
+//! sandbox-side HTTP CONNECT proxy deliberately holds no list of its
+//! own — denials are relayed from the connector — so there is nothing
+//! to keep in sync with the control plane's swaps.
 
 //! The list is runtime-swappable: the launcher and each frontend hold a
 //! cheap-clone [`SharedAllow`] handle to the same instance, and a swap
@@ -14,8 +16,8 @@
 //! the new list, never a mix.
 
 /// The allow-list, shared between the launcher (which keeps the
-/// authoritative copy) and the frontends (connector, sandbox CONNECT
-/// proxy, waf host), so it can be **swapped at runtime**.
+/// authoritative copy and swaps it at runtime) and the host-side
+/// frontends (connector, waf host), so it can be **swapped at runtime**.
 ///
 /// Every accepted connection takes a snapshot ([`load`]) and keeps it for
 /// its whole lifetime: a swap affects *new* connections only, never

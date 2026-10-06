@@ -50,22 +50,24 @@
 //!
 //! `A` is the single control hub. `fs-set` swaps the whole compiled
 //! pattern set in the FUSE server (FS); `net-set` swaps the allow-list in
-//! `A` and — on the proxy path only — in the in-sandbox proxy (P). The
-//! updates travel over the pre-fork `A`↔FS / `A`↔P socketpairs as
-//! tagged line-JSON frames: `{"upd": {...}}` downstream, `{"ack": true}` /
-//! `{"err": "..."}` upstream (audit events share the same pairs as
-//! `{"audit": {...}}` — see [`crate::audit::ipc`]).
+//! `A` only — the connector/waf host serves from that same copy, and the
+//! in-sandbox proxy deliberately holds no list of its own, so no net
+//! update ever needs to travel to a child. The `fs-set` updates travel
+//! over the pre-fork `A`↔FS socketpair as tagged line-JSON frames:
+//! `{"upd": {...}}` downstream, `{"ack": true}` / `{"err": "..."}` upstream
+//! (audit events share the same pairs as `{"audit": {...}}` — see
+//! [`crate::audit::ipc`]).
 //!
 //! Correlation is positional, not by id: **at most one outstanding update
-//! per channel** (the update gate below serializes applies), and each
+//! per channel** (the update gate below serializes applies), and the FS
 //! child replies to the last `upd` in FIFO order.
 //!
 //! # Semantics
 //!
 //! * **Full replacement per domain** — never deltas.
-//! * **Not retroactive**: both the connector and the proxy snapshot the
-//!   allow-list per accepted connection; a swap affects new connections
-//!   only. Pattern swaps apply to every new filesystem operation (and
+//! * **Not retroactive**: the connector snapshots the allow-list per
+//!   accepted stream; a swap affects new connections only. Pattern swaps
+//!   apply to every new filesystem operation (and
 //!   invalidate the readdir cache), but the kernel-level read-only mount
 //!   flag, if the run started fully read-only *without* control
 //!   (i.e. with `--no-control`),
@@ -73,8 +75,9 @@
 //!   control-enabled run mounts the FUSE mirror writable and relies on
 //!   the per-operation pattern checks alone.
 //! * **A keeps the authoritative copy** of both mutable domains (updated
-//!   on each accepted `fs-set`/`net-set`, reverted if a child rejects the
-//!   apply) — `policy-get` reads it.
+//!   on each accepted `fs-set`/`net-set`; an `fs-set` push the FUSE
+//!   server rejects — or never acknowledges — is reverted) —
+//!   `policy-get` reads it.
 //! * Immutable parts (seccomp, mounts, env, `net.allow_private`, the
 //!   address-family gates, ...) cannot be changed at runtime.
 //!   `spec-reload` re-reads the spec file and applies the *mutable*
@@ -161,7 +164,6 @@ static SERVER: OnceLock<Server> = OnceLock::new();
 static FS_POLICY: Mutex<Option<Vec<Value>>> = Mutex::new(None);
 static FS_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static NET_APPLICABLE: AtomicBool = AtomicBool::new(false);
-static NET_PROXY: AtomicBool = AtomicBool::new(false);
 
 /// The authoritative compiled configuration the run started with (see
 /// [`Start::config`]) and where the spec lives — the baseline and the
@@ -185,9 +187,6 @@ pub struct Start {
     pub fs_initial: Option<Vec<Value>>,
     /// A network allow-list exists in `A` (isolated networking).
     pub net_applicable: bool,
-    /// The in-sandbox proxy (P) holds its own copy (proxy mode only; the
-    /// waf mode's P forwards every decision to `A` and keeps no list).
-    pub net_proxy: bool,
     /// The authoritative compiled configuration this run started with:
     /// the baseline `spec-reload` diffs the freshly compiled spec
     /// against (immutable fields must not change).
@@ -221,7 +220,6 @@ pub fn record_initial(cfg: Start) {
         .replace(fs_initial.clone().unwrap_or_default());
     FS_AVAILABLE.store(fs_initial.is_some(), Ordering::Relaxed);
     NET_APPLICABLE.store(cfg.net_applicable, Ordering::Relaxed);
-    NET_PROXY.store(cfg.net_proxy, Ordering::Relaxed);
     *RUNNING_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.config);
     *SPEC_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.spec_dir);
     *SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = cfg.session_cache;
@@ -506,23 +504,23 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 /// Per-peer reply plumbing handed over from [`audit::ipc::spawn_hub`]:
 /// one receiver per child channel, carrying the child's `ack`/`err`
 /// reply frames (demultiplexed from audit events by the hub reader).
+/// Only the FS child ever receives updates; the network child's
+/// receiver (if any) is dropped here.
 pub(crate) struct Replies {
     pub fs: Option<Receiver<audit::UpdReply>>,
-    pub net: Option<Receiver<audit::UpdReply>>,
 }
 
 impl Replies {
     /// Build from [`audit::ipc::spawn_hub`]'s `(role, receiver)` list.
     pub(crate) fn from_peers(peers: Vec<(audit::PeerRole, Receiver<audit::UpdReply>)>) -> Replies {
         let mut fs = None;
-        let mut net = None;
         for (role, rx) in peers {
             match role {
                 audit::PeerRole::HostFs => fs = Some(rx),
-                audit::PeerRole::Network => net = Some(rx),
+                audit::PeerRole::Network => {}
             }
         }
-        Replies { fs, net }
+        Replies { fs }
     }
 }
 
@@ -547,9 +545,8 @@ pub async fn serve(replies: Replies) {
         Ok(l) => l,
         Err(e) => sandbox::die(&format!("Can't register the control socket: {e}")),
     };
-    // Install the per-peer reply receivers the update pusher awaits.
+    // Install the per-peer reply receiver the update pusher awaits.
     *FS_REPLIES.lock().unwrap_or_else(|e| e.into_inner()) = replies.fs;
-    *NET_REPLIES.lock().unwrap_or_else(|e| e.into_inner()) = replies.net;
 
     let token = server.token;
     // NET-2: every other listener caps its connections (see
@@ -788,7 +785,7 @@ async fn fs_apply_list(mappings: &[Value]) -> Result<(), String> {
         .map(|m| serde_json::to_value(m).expect("mapping serializes"))
         .collect();
     let _gate = UPD_GATE.lock().await;
-    match push_upd(serde_json::json!({ "fs": { "mappings": owned } }), Role::Fs).await {
+    match push_upd(serde_json::json!({ "fs": { "mappings": owned } })).await {
         Ok(()) => {
             *FS_POLICY.lock().unwrap() = Some(owned);
             Ok(())
@@ -854,73 +851,31 @@ fn allow_entries(allow: &[Value]) -> Result<Vec<String>, String> {
     Ok(list)
 }
 
-/// Swap the allow-list in `A` (and, on the proxy path, in P) — shared by
-/// the `net-set` command and `spec-reload`; the caller audits the
-/// change. Serialized behind [`UPD_GATE`] like [`fs_apply_list`].
+/// Swap the allow-list in `A` — shared by the `net-set` command and
+/// `spec-reload`; the caller audits the change. Serialized behind
+/// [`UPD_GATE`] like [`fs_apply_list`]. The connector/waf host serves
+/// from this same copy; the in-sandbox proxy holds no list, so this is
+/// purely A-local.
 async fn net_apply_list(list: Vec<String>) -> Result<(), String> {
     let _gate = UPD_GATE.lock().await;
     let Some(shared) = NET_ALLOW.get() else {
         return Err("no network allow-list in this run".to_string());
     };
-    let previous = {
-        let mut guard = shared.write().unwrap_or_else(|e| e.into_inner());
-        std::mem::replace(&mut *guard, list)
-    };
-    // Proxy mode only: P holds its own copy and answers 403 early.
-    let push = if NET_PROXY.load(Ordering::Relaxed) {
-        push_upd(
-            serde_json::json!({ "net": { "allow": shared.read().unwrap_or_else(|e| e.into_inner()).clone() } }),
-            Role::Net,
-        )
-        .await
-    } else {
-        Ok(())
-    };
-    match push {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Revert: `A`'s copy must never diverge from the children's.
-            *shared.write().unwrap_or_else(|e| e.into_inner()) = previous;
-            Err(e)
-        }
-    }
+    *shared.write().unwrap_or_else(|e| e.into_inner()) = list;
+    Ok(())
 }
 
-/// Which child channel an update is pushed to.
-#[derive(Clone, Copy, PartialEq)]
-enum Role {
-    Fs,
-    Net,
-}
-
-impl Role {
-    fn peer(self) -> audit::PeerRole {
-        match self {
-            Role::Fs => audit::PeerRole::HostFs,
-            Role::Net => audit::PeerRole::Network,
-        }
-    }
-}
-
-/// The per-peer reply receivers, filled by `serve`'s caller from
+/// The per-peer reply receiver, filled by `serve`'s caller from
 /// [`audit::ipc::spawn_hub`]'s return value.
 static FS_REPLIES: Mutex<Option<Receiver<audit::UpdReply>>> = Mutex::new(None);
-static NET_REPLIES: Mutex<Option<Receiver<audit::UpdReply>>> = Mutex::new(None);
 
-/// Send one `upd` frame to a child and await its reply (FIFO, positional
-/// correlation — at most one outstanding update per channel, enforced by
-/// [`UPD_GATE`]). The reply is awaited with a timeout: a wedged child
-/// fails the apply instead of wedging the control client.
-async fn push_upd(upd: Value, role: Role) -> Result<(), String> {
-    let rx_slot = match role {
-        Role::Fs => &FS_REPLIES,
-        Role::Net => &NET_REPLIES,
-    };
-    let Some(mut stream) = audit::peer_writer(role.peer()) else {
-        return Err(match role {
-            Role::Fs => "the FUSE server is not reachable".to_string(),
-            Role::Net => "the sandbox proxy is not reachable".to_string(),
-        });
+/// Send one `upd` frame to the FS child and await its reply (FIFO,
+/// positional correlation — at most one outstanding update per channel,
+/// enforced by [`UPD_GATE`]). The reply is awaited with a timeout: a
+/// wedged child fails the apply instead of wedging the control client.
+async fn push_upd(upd: Value) -> Result<(), String> {
+    let Some(mut stream) = audit::peer_writer(audit::PeerRole::HostFs) else {
+        return Err("the FUSE server is not reachable".to_string());
     };
     let mut frame =
         serde_json::to_string(&upd).map_err(|e| format!("can't serialize the update: {e}"))?;
@@ -931,7 +886,7 @@ async fn push_upd(upd: Value, role: Role) -> Result<(), String> {
     if stream.write_all(frame.as_bytes()).await.is_err() {
         return Err("can't send the update to the sandbox child".to_string());
     }
-    let mut rx = rx_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut rx = FS_REPLIES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let reply = tokio::time::timeout(REPLY_TIMEOUT, async {
         match &mut rx {
             Some(rx) => rx.recv().await,
@@ -942,7 +897,7 @@ async fn push_upd(upd: Value, role: Role) -> Result<(), String> {
     // The receiver goes back for the next update (one outstanding per
     // channel is enforced by the gate, so this is race-free).
     if rx.is_some() {
-        *rx_slot.lock().unwrap_or_else(|e| e.into_inner()) = rx.take();
+        *FS_REPLIES.lock().unwrap_or_else(|e| e.into_inner()) = rx.take();
     }
     match reply {
         Ok(Some(audit::UpdReply::Ack)) => Ok(()),
@@ -1179,9 +1134,14 @@ pub(crate) struct FsUpd {
     mappings: Vec<Value>,
 }
 
+/// The net domain of an update frame. No child applies net updates any
+/// more (the allow-list is A-local), but the type must keep parsing so
+/// a stray `net` frame is rejected *explicitly* ("not handled by the
+/// filesystem server") instead of as a serde error.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NetUpd {
+    #[allow(dead_code)] // presence-check only; see the type's doc
     allow: Vec<String>,
 }
 
@@ -1242,22 +1202,6 @@ pub(crate) async fn fs_apply(
     Ok(())
 }
 
-/// Parse and apply one downstream frame on the sandbox proxy side (P,
-/// proxy mode): swap the allow-list. Affects new connections only.
-pub(crate) async fn net_apply(
-    upd: Upd,
-    allow: &crate::proxy::allowlist::SharedAllow,
-) -> Result<(), String> {
-    let Some(net) = upd.net else {
-        if upd.fs.is_some() {
-            return Err("fs updates are not handled by the network proxy".into());
-        }
-        return Ok(());
-    };
-    *allow.write().unwrap_or_else(|e| e.into_inner()) = net.allow;
-    Ok(())
-}
-
 /// The FUSE server's control loop: read one downstream frame from the
 /// channel's read half, apply it, reply on the shared write half —
 /// until the launcher half-closes the channel (EOF: the run is ending)
@@ -1300,46 +1244,10 @@ pub(crate) async fn fs_child_loop(
     }
 }
 
-/// The sandbox proxy's control loop (P, proxy mode): same discipline as
-/// [`fs_child_loop`], swapping the allow-list. P's shutdown stays driven
-/// by the sandboxed command's exit (`wait_status`); this loop simply
-/// ends at the launcher's EOF.
-pub(crate) async fn net_child_loop(
-    mut stream: UnixStream,
-    reply: SharedWrite,
-    allow: crate::proxy::allowlist::SharedAllow,
-) {
-    let mut malformed_reported = false;
-    loop {
-        match line::read_frame_limited(&mut stream, audit::FRAME_CAP).await {
-            Ok(Some(frame)) => {
-                let r = match serde_json::from_str::<UpdFrame>(&frame) {
-                    Ok(parsed) => net_apply(parsed.upd, &allow).await,
-                    Err(e) => {
-                        if !malformed_reported {
-                            malformed_reported = true;
-                            eprintln!("warning: malformed control frame from the launcher: {e}");
-                        }
-                        Err(format!("malformed update: {e}"))
-                    }
-                };
-                write_reply(&reply, r).await;
-            }
-            Ok(None) => return,
-            Err(e) => {
-                if !malformed_reported {
-                    eprintln!("warning: control channel error: {e}");
-                }
-                return;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod testing {
     //! Test-only access to the pieces the real paths wire up.
-    pub(crate) use super::{fs_apply, net_apply};
+    pub(crate) use super::fs_apply;
 }
 
 #[cfg(test)]
@@ -1471,7 +1379,6 @@ mod tests {
         FS_POLICY.lock().unwrap().replace(Vec::new());
         FS_AVAILABLE.store(false, Ordering::Relaxed);
         NET_APPLICABLE.store(false, Ordering::Relaxed);
-        NET_PROXY.store(false, Ordering::Relaxed);
 
         let reply = handle_command(serde_json::json!({"cmd": "policy-get"})).await;
         assert!(reply.ok);
@@ -1514,7 +1421,6 @@ mod tests {
         let _guard = scope_guard();
         FS_AVAILABLE.store(false, Ordering::Relaxed);
         NET_APPLICABLE.store(true, Ordering::Relaxed);
-        NET_PROXY.store(false, Ordering::Relaxed);
         // `NET_ALLOW` is a process-global OnceLock; if another test in
         // this process (e.g. the end-to-end one) already set it, reuse
         // that instance and reset its contents.
@@ -1544,9 +1450,10 @@ mod tests {
         NET_APPLICABLE.store(false, Ordering::Relaxed);
     }
 
-    /// The downstream frame parses, and the child-side appliers swap the
-    /// shared state (patterns with a generation bump, allow-list) and
-    /// reject foreign domains.
+    /// The downstream frame parses, and the child-side applier swaps the
+    /// shared state (patterns with a generation bump) and rejects
+    /// foreign domains. (The net domain has no child applier any more:
+    /// the allow-list is A-local.)
     #[tokio::test]
     async fn child_appliers_swap_shared_state() {
         use crate::hostfs::{SharedPatterns, patterns::Permission};
@@ -1567,66 +1474,9 @@ mod tests {
         let frame = r#"{"upd":{"net":{"allow":["example.com"]}}}"#;
         let parsed: UpdFrame = serde_json::from_str(frame).unwrap();
         assert!(testing::fs_apply(parsed.upd, &policy).await.is_err());
-
-        // The net applier swaps the allow-list; fs frames are foreign.
-        let shared = Arc::new(std::sync::RwLock::new(Vec::new()));
-        let frame = r#"{"upd":{"net":{"allow":["example.com:443"]}}}"#;
-        let parsed: UpdFrame = serde_json::from_str(frame).unwrap();
-        testing::net_apply(parsed.upd, &shared).await.unwrap();
-        assert_eq!(*shared.read().unwrap(), vec!["example.com:443".to_string()]);
-        let frame = r#"{"upd":{"fs":{"mappings":[]}}}"#;
-        let parsed: UpdFrame = serde_json::from_str(frame).unwrap();
-        assert!(testing::net_apply(parsed.upd, &shared).await.is_err());
     }
 
     use tokio::io::AsyncReadExt as _;
-
-    /// End-to-end through a real socketpair: `net_child_loop` swaps the
-    /// allow-list and answers `{"ack":true}` on the same stream.
-    #[tokio::test]
-    async fn net_child_loop_swaps_and_acks() {
-        let (launcher_std, child_std) = std::os::unix::net::UnixStream::pair().unwrap();
-        // Split the child end into its read half (control loop) and the
-        // mutex-shared write half (replies), like `ipc::channel_streams`.
-        let child_read = child_std.try_clone().unwrap();
-        let _ = child_read.set_nonblocking(true);
-        let _ = child_std.set_nonblocking(true);
-        let _ = launcher_std.set_nonblocking(true);
-        let mut launcher = tokio::net::UnixStream::from_std(launcher_std).unwrap();
-        let child = tokio::net::UnixStream::from_std(child_read).unwrap();
-        let reply: crate::cli::control::SharedWrite = Arc::new(tokio::sync::Mutex::new(
-            tokio::net::UnixStream::from_std(child_std).unwrap(),
-        ));
-        let shared = Arc::new(std::sync::RwLock::new(Vec::new()));
-        let loop_task = tokio::spawn(crate::cli::control::net_child_loop(
-            child,
-            reply,
-            std::sync::Arc::clone(&shared),
-        ));
-        launcher
-            .write_all(b"{\"upd\":{\"net\":{\"allow\":[\"example.com:443\"]}}}\n")
-            .await
-            .unwrap();
-        let mut reply = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            let n = launcher.read(&mut byte).await.unwrap();
-            assert!(n > 0, "no reply");
-            if byte[0] == b'\n' {
-                break;
-            }
-            reply.push(byte[0] as char);
-        }
-        assert_eq!(reply, "{\"ack\":true}");
-        assert_eq!(*shared.read().unwrap(), vec!["example.com:443".to_string()]);
-        // The launcher's half-close ends the loop (the shutdown signal on
-        // the FS path; P's loop simply ends here too).
-        let _ = launcher.shutdown().await;
-        tokio::time::timeout(std::time::Duration::from_secs(5), loop_task)
-            .await
-            .expect("child loop must end at the launcher's EOF")
-            .unwrap();
-    }
 
     /// The FS loop applies a pattern swap and answers an error for a
     /// mapping list the spec parser would reject — without swapping
@@ -1730,7 +1580,6 @@ mod tests {
         crate::cli::control::record_initial(crate::cli::control::Start {
             fs_initial: Some(vec![serde_json::json!({"type": "ro", "glob": "/etc"})]),
             net_applicable: true,
-            net_proxy: false,
             config: crate::spec::internal::SandboxConfig::compile(
                 &serde_json::from_str(r#"{"hostfs":{"mappings":[{"type":"ro","glob":"/etc"}]}}"#)
                     .unwrap(),
@@ -1755,7 +1604,6 @@ mod tests {
         let spec_dir = dir.join("spec");
         let _server = tokio::spawn(crate::cli::control::serve(crate::cli::control::Replies {
             fs: None,
-            net: None,
         }));
 
         // The whole client exchange, blocking I/O and all, off the
@@ -1792,8 +1640,8 @@ mod tests {
             assert_eq!(reply["fs"]["mappings"][0]["type"], "ro");
             assert_eq!(reply["net"]["allow"][0], "example.com:443");
 
-            // net-set (no proxy peer: A-local only, P push skipped) swaps the
-            // authoritative list.
+            // net-set swaps the authoritative list (A-local: the connector
+            // serves from this copy, and P holds no list of its own).
             let mut conn = connect();
             conn.write_all(format!("{token}\n").as_bytes()).unwrap();
             conn.write_all(b"{\"cmd\":\"net-set\",\"allow\":[\"api.example:443\"]}\n")
@@ -1842,10 +1690,10 @@ mod tests {
     }
 
     /// `spec-reload` end to end against the real statics: an unchanged
-    /// spec reloads cleanly (and only the diff decides what is pushed),
+    /// spec reloads cleanly (and only the diff decides what is applied),
     /// a changed immutable section is an error naming it, a changed
-    /// allow-list that the proxy cannot acknowledge is reverted, and
-    /// added mappings without a FUSE filesystem are refused.
+    /// allow-list applies A-locally, and added mappings without a FUSE
+    /// filesystem are refused.
     #[tokio::test]
     async fn spec_reload_diffs_and_applies() {
         let _guard = scope_guard();
@@ -1872,7 +1720,6 @@ mod tests {
         crate::cli::control::record_initial(crate::cli::control::Start {
             fs_initial: Some(mappings),
             net_applicable: true,
-            net_proxy: true,
             config,
             spec_dir: spec_dir.clone(),
             session_cache: None,
@@ -1905,21 +1752,16 @@ mod tests {
         let err = spec_reload_inner().await.unwrap_err();
         assert!(err.contains("seccomp"), "{err}");
 
-        // 3. A changed allow-list with no live proxy peer: the push
-        // fails and the authoritative copy is reverted — the run is
-        // never left half-reloaded.
+        // 3. A changed allow-list: applies A-locally, with no child push (P
+        // holds no list; the connector serves from A's copy).
         write_spec(
             r#"{"hostfs":{"mappings":[{"type":"ro","glob":"/etc"}]},
                 "net":{"mode":"proxy","allow":["other.example:443"]}}"#,
         );
-        let err = spec_reload_inner().await.unwrap_err();
-        assert!(
-            err.contains("proxy is not reachable") || err.contains("did not acknowledge"),
-            "{err}"
-        );
+        spec_reload_inner().await.unwrap();
         assert_eq!(
             shared.read().unwrap().clone(),
-            vec!["example.com:443".to_string()]
+            vec!["other.example:443".to_string()]
         );
 
         // 4. Added mappings without a FUSE filesystem: refused.

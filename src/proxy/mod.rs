@@ -122,7 +122,6 @@ mod tests {
         tokio::spawn(serve_sandbox_proxy(
             proxy,
             crate::ipc::netmux::MuxHandle::<ProxySpec>::client(b),
-            crate::proxy::allowlist::shared(vec![format!("127.0.0.1:{}", echo_addr.port())]),
         ));
 
         // Client: CONNECT, then echo through the tunnel.

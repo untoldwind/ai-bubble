@@ -243,8 +243,6 @@ impl RunCommand {
                 .then(|| serde_json::to_value(&spec.hostfs.mappings).unwrap_or_default())
                 .and_then(|value| value.as_array().cloned()),
             net_applicable: sandbox_config.net.isolated,
-            net_proxy: sandbox_config.net.isolated
-                && matches!(sandbox_config.net.mode, spec::internal::NetMode::Proxy),
             config: sandbox_config.clone(),
             spec_dir: std::fs::canonicalize(spec_dir).unwrap_or_else(|_| spec_dir.to_path_buf()),
             session_cache: session_cache.clone(),
