@@ -422,9 +422,8 @@ fn isolated_parent(
                     let _ = listener.set_nonblocking(true);
                     let l = tokio::net::TcpListener::from_std(listener)
                         .unwrap_or_else(|e| die(&format!("Can't register proxy listener: {e}")));
-                    let mux = crate::ipc::netmux::MuxHandle::<crate::proxy::ProxySpec>::client(
-                        net_pair,
-                    );
+                    let mux =
+                        crate::ipc::netmux::MuxHandle::<crate::proxy::ProxySpec>::client(net_pair);
                     tokio::select! {
                         st = wait_status(child_pid) => st,
                         // The proxy accept loop never ends.
@@ -446,7 +445,8 @@ fn isolated_parent(
                         .unwrap_or_else(|e| die(&format!("Can't register HTTPS listener: {e}")));
                     let udp53 = tokio::net::UdpSocket::from_std(udp53)
                         .unwrap_or_else(|e| die(&format!("Can't register DNS UDP socket: {e}")));
-                    let mux = crate::ipc::netmux::MuxHandle::<crate::waf::WafSpec>::client(net_pair);
+                    let mux =
+                        crate::ipc::netmux::MuxHandle::<crate::waf::WafSpec>::client(net_pair);
                     tokio::spawn(waf::dns::serve_tcp(tcp53, mux.clone()));
                     tokio::spawn(waf::http::serve_http(tcp80, mux.clone()));
                     tokio::spawn(waf::https::serve_https(tcp443, mux.clone()));

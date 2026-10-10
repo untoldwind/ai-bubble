@@ -1,27 +1,45 @@
 {
   "$schema": "../ai-bubble.spec.schema.json",
+  "cwd": "${PWD}",
+  "env": {
+    "values": {
+      "HOME": "${HOME}",
+      "PATH": "${PATH}",
+      "TERM": "${TERM}"
+    }
+  },
   "hostfs": {
     "mappings": [
       {
-        "type": "rw",
-        "glob": "${PWD}"
+        "glob": "${PWD}",
+        "type": "rw"
       },
       {
-        "type": "ro",
-        "glob": ["/usr", "/lib", "/lib64", "/bin", "${HOME}/.rustup"]
+        "glob": [
+          "/usr",
+          "/lib",
+          "/lib64",
+          "/bin",
+          "${HOME}/.rustup"
+        ],
+        "type": "ro"
       },
       {
-        "type": "project-cache",
-        "path": ["${HOME}/.cargo", "${HOME}/.local", "${HOME}/.config/opencode"]
+        "path": [
+          "${HOME}/.cargo",
+          "${HOME}/.local",
+          "${HOME}/.config/opencode"
+        ],
+        "type": "project-cache"
       },
       {
-        "type": "session-cache",
-        "path": "${HOME}/.cache"
+        "path": "${HOME}/.cache",
+        "type": "session-cache"
       },
       {
-        "type": "redirect-ro",
+        "dest": "${HOME}/.config/opencode/opencode.jsonc",
         "source": "conf/opencode.jsonc",
-        "dest": "${HOME}/.config/opencode/opencode.jsonc"
+        "type": "redirect-ro"
       },
       {
         "type": "dev"
@@ -30,14 +48,15 @@
         "type": "proc"
       },
       {
-        "type": "tmpfs",
-        "path":["/run", "/tmp"]
+        "path": [
+          "/run",
+          "/tmp"
+        ],
+        "type": "tmpfs"
       }
     ]
   },
-  "cwd": "${PWD}",
   "net": {
-    "mode": "waf",
     "allow": [
       "registry.cube.home:80",
       "registry.cube.home:443",
@@ -53,14 +72,10 @@
       "api.tokenfactory.nebius.com:443",
       "api.together.ai:443",
       "api.together.xyz:443"
-    ]
+    ],
+    "mode": "waf"
   },
-  "env": {
-    "values": {
-      "PATH": "${PATH}",
-      "HOME": "${HOME}",
-      "TERM": "${TERM}"
-    }
-  },
-  "seccomp": { "preset": "strict" }
+  "seccomp": {
+    "preset": "strict"
+  }
 }

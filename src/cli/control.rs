@@ -58,6 +58,22 @@
 //! (audit events share the same pairs as `{"audit": {...}}` — see
 //! [`crate::audit::ipc`]).
 //!
+//! **Persistence.** An accepted `fs-set`/`net-set` is also written back
+//! into the spec file (see `spec::file::patch_spec_file`): the runtime
+//! change becomes the next run's initial policy. The write is a
+//! read-modify-write over the current file content (untouched sections
+//! and manual edits survive) and an atomic rename (`O_NOFOLLOW` temp
+//! sibling, fsync, rename — a crash can never leave a torn policy file).
+//! The persisted form is the resolved runtime policy: relative sources
+//! absolute, cache mappings and `${VAR}` references expanded, and the
+//! auto-hide mapping not written (the loader re-appends it at load
+//! time). If the persist fails, the change is rolled back (`fs-set`:
+//! the FUSE server is pushed the previous list again; `net-set`: nothing
+//! was swapped yet) and the client gets an error — A's authoritative
+//! copy, the children and the spec file never disagree. `spec-reload`
+//! deliberately does *not* persist: it re-reads the file, which stays
+//! the source of truth.
+//!
 //! Correlation is positional, not by id: **at most one outstanding update
 //! per channel** (the update gate below serializes applies), and the FS
 //! child replies to the last `upd` in FIFO order.
@@ -78,6 +94,9 @@
 //!   on each accepted `fs-set`/`net-set`; an `fs-set` push the FUSE
 //!   server rejects — or never acknowledges — is reverted) —
 //!   `policy-get` reads it.
+//! * **Accepted changes are persisted** into the spec file (see
+//!   "Propagation" above): a runtime change survives the run and is the
+//!   next run's initial policy. A failed persist rolls the change back.
 //! * Immutable parts (seccomp, mounts, env, `net.allow_private`, the
 //!   address-family gates, ...) cannot be changed at runtime.
 //!   `spec-reload` re-reads the spec file and applies the *mutable*
@@ -734,7 +753,7 @@ async fn fs_set(value: &Value) -> Reply {
     let Some(mappings) = mappings.as_array() else {
         return err_reply("\"mappings\" must be an array");
     };
-    match fs_apply_list(mappings).await {
+    match fs_apply_list(mappings, true).await {
         Ok(()) => {
             audit::record(
                 "control",
@@ -756,7 +775,14 @@ async fn fs_set(value: &Value) -> Reply {
 /// is serialized behind [`UPD_GATE`] (one outstanding update per
 /// channel, and no interleaved applies from concurrent control
 /// connections or the SIGHUP shim).
-async fn fs_apply_list(mappings: &[Value]) -> Result<(), String> {
+///
+/// With `persist` (an explicit control change), the accepted list is
+/// also written back into the spec file — the runtime change becomes the
+/// next run's initial policy. `spec-reload` re-reads the file instead
+/// and passes `false`. If the persist fails, the child is rolled back to
+/// the previous list: policy is never left half-applied, and the control
+/// client gets an error even though the push itself succeeded.
+async fn fs_apply_list(mappings: &[Value], persist: bool) -> Result<(), String> {
     // Validate exactly what the spec parser would accept (glob compile
     // failures included), *before* anything is swapped anywhere.
     let parsed: Vec<Mapping> = match mappings
@@ -785,13 +811,55 @@ async fn fs_apply_list(mappings: &[Value]) -> Result<(), String> {
         .map(|m| serde_json::to_value(m).expect("mapping serializes"))
         .collect();
     let _gate = UPD_GATE.lock().await;
+    let previous = FS_POLICY.lock().unwrap_or_else(|e| e.into_inner()).clone();
     match push_upd(serde_json::json!({ "fs": { "mappings": owned } })).await {
         Ok(()) => {
+            if persist {
+                // The accepted change must survive the run: patch the
+                // spec file *before* committing, and roll the child back
+                // if the persist fails — A's authoritative copy, the FUSE
+                // server and the spec file must never disagree.
+                if let Err(e) = persist_fs(&spec_dir, &owned) {
+                    let _ = push_upd(
+                        serde_json::json!({ "fs": { "mappings": previous.unwrap_or_default() } }),
+                    )
+                    .await;
+                    return Err(format!(
+                        "the FUSE server applied the pattern set, but it could not be persisted \
+                         to the spec file ({e}); the previous pattern set was restored"
+                    ));
+                }
+            }
             *FS_POLICY.lock().unwrap() = Some(owned);
             Ok(())
         }
         Err(e) => Err(e),
     }
+}
+
+/// Persist an accepted `fs-set` into the spec file: the hardened mapping
+/// list the FUSE server now serves, minus the auto-hide mapping the
+/// loader re-appends at load time, written back as `hostfs.mappings`.
+///
+/// The persisted form is the *resolved* runtime policy: relative sources
+/// are absolute, `session-cache`/`project-cache` mappings and the
+/// injected waf mappings appear in their resolved `redirect-rw` form
+/// (preprocessing replays idempotently, so a later reload does not
+/// duplicate them), and `${VAR}` references are already expanded.
+fn persist_fs(spec_dir: &Path, owned: &[Value]) -> Result<(), String> {
+    let auto_hide = serde_json::to_value(crate::spec::file::spec_dir_auto_hide_mapping(spec_dir))
+        .expect("mapping serializes");
+    crate::spec::file::patch_spec_file(spec_dir, |tree| {
+        let obj = tree.as_object_mut().expect("checked JSON object");
+        let hostfs = obj.entry("hostfs").or_insert_with(|| serde_json::json!({}));
+        if !hostfs.is_object() {
+            // A non-object `hostfs` section can only come from a manual
+            // edit raced into the file; overwrite rather than corrupt.
+            *hostfs = serde_json::json!({});
+        }
+        hostfs["mappings"] =
+            Value::Array(owned.iter().filter(|m| **m != auto_hide).cloned().collect());
+    })
 }
 
 /// Replace the whole network allow-list: swap `A`'s copy first (the
@@ -813,7 +881,7 @@ async fn net_set(value: &Value) -> Reply {
         Ok(list) => list,
         Err(e) => return err_reply(e),
     };
-    match net_apply_list(list).await {
+    match net_apply_list(list, true).await {
         Ok(()) => {
             audit::record(
                 "control",
@@ -856,13 +924,48 @@ fn allow_entries(allow: &[Value]) -> Result<Vec<String>, String> {
 /// [`UPD_GATE`] like [`fs_apply_list`]. The connector/waf host serves
 /// from this same copy; the in-sandbox proxy holds no list, so this is
 /// purely A-local.
-async fn net_apply_list(list: Vec<String>) -> Result<(), String> {
+///
+/// With `persist` (an explicit control change), the list is written back
+/// into the spec file first — a failed persist changes nothing anywhere,
+/// so there is no rollback to do. `spec-reload` re-reads the file and
+/// passes `false`.
+async fn net_apply_list(list: Vec<String>, persist: bool) -> Result<(), String> {
     let _gate = UPD_GATE.lock().await;
     let Some(shared) = NET_ALLOW.get() else {
         return Err("no network allow-list in this run".to_string());
     };
+    if persist {
+        let spec_dir = SPEC_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or("no spec directory recorded for this run")?;
+        if let Err(e) = persist_net(&spec_dir, &list) {
+            return Err(format!(
+                "the allow-list could not be persisted to the spec file ({e}); nothing was changed"
+            ));
+        }
+    }
     *shared.write().unwrap_or_else(|e| e.into_inner()) = list;
     Ok(())
+}
+
+/// Persist an accepted `net-set` into the spec file: the allow-list is
+/// written back as `net.allow` (the `net` section is created when the
+/// spec file has none). The persisted entries are the validated,
+/// expanded ones — `${VAR}` references in the file resolve to what the
+/// run actually enforces.
+fn persist_net(spec_dir: &Path, list: &[String]) -> Result<(), String> {
+    crate::spec::file::patch_spec_file(spec_dir, |tree| {
+        let obj = tree.as_object_mut().expect("checked JSON object");
+        let net = obj.entry("net").or_insert_with(|| serde_json::json!({}));
+        if !net.is_object() {
+            // A non-object `net` section can only come from a manual
+            // edit raced into the file; overwrite rather than corrupt.
+            *net = serde_json::json!({});
+        }
+        net["allow"] = serde_json::json!(list);
+    })
 }
 
 /// The per-peer reply receiver, filled by `serve`'s caller from
@@ -989,7 +1092,7 @@ async fn spec_reload_inner() -> Result<(), String> {
         );
     }
     if fs_changed {
-        fs_apply_list(&mappings).await?;
+        fs_apply_list(&mappings, false).await?;
     }
 
     // The net domain: same "only when changed" rule; a host-networking
@@ -1002,7 +1105,7 @@ async fn spec_reload_inner() -> Result<(), String> {
         // The fs domain may have been applied above: revert it, so the
         // run is never left half-reloaded.
         if fs_changed {
-            let _ = fs_apply_list(&previous_mappings).await;
+            let _ = fs_apply_list(&previous_mappings, false).await;
         }
         return Err(
             "the new spec changes net.allow, but this run has no network \
@@ -1012,7 +1115,7 @@ async fn spec_reload_inner() -> Result<(), String> {
     }
     if let Err(e) = async {
         if net_changed {
-            net_apply_list(fresh.net.allow.clone()).await?;
+            net_apply_list(fresh.net.allow.clone(), false).await?;
         }
         Ok::<(), String>(())
     }
@@ -1020,7 +1123,7 @@ async fn spec_reload_inner() -> Result<(), String> {
     {
         // Revert the fs domain: never half-reloaded.
         if fs_changed {
-            let _ = fs_apply_list(&previous_mappings).await;
+            let _ = fs_apply_list(&previous_mappings, false).await;
         }
         return Err(e);
     }
@@ -1414,21 +1517,192 @@ mod tests {
         FS_AVAILABLE.store(false, Ordering::Relaxed);
     }
 
-    /// Allow-list entries are validated: strings, non-empty, printable,
-    /// bounded length.
+    /// Register a fake FUSE child for `push_upd`: the launcher end of a
+    /// fresh socketpair becomes the HostFs peer, and the spawned child
+    /// end answers every `upd` frame with `{"ack":true}` fed straight
+    /// into the reply receiver (exactly what the real hub + FS child
+    /// produce, minus the pattern swap).
+    fn fake_fs_peer() {
+        let (laun, child) = std::os::unix::net::UnixStream::pair().unwrap();
+        let _ = child.set_nonblocking(true);
+        audit::add_peer(audit::PeerRole::HostFs, laun.into());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        *FS_REPLIES.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut child = match tokio::net::UnixStream::from_std(child) {
+                Ok(child) => child,
+                Err(_) => return,
+            };
+            // The update gate keeps one frame outstanding at a time, so
+            // a read-then-ack loop is enough.
+            let mut buf = [0u8; 8192];
+            loop {
+                match child.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if child.write_all(b"{\"ack\":true}\n").await.is_err()
+                            || tx.send(audit::UpdReply::Ack).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Drop the fake peer's state, so later tests see the statics as the
+    /// real launcher leaves them.
+    fn drop_fake_fs_peer() {
+        *FS_REPLIES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        crate::audit::close_inherited();
+    }
+
+    /// An accepted `fs-set` is persisted into the spec file: the
+    /// mapping list written back is exactly the client's list (the
+    /// auto-hide mapping the loader re-appends at load time is stripped,
+    /// so reloads never accumulate duplicates), and a re-loaded spec
+    /// compiles to the same authoritative pattern set.
     #[tokio::test]
-    async fn net_set_validates_entries() {
+    async fn fs_set_persists_to_the_spec_file() {
+        let _guard = scope_guard();
+        let dir =
+            std::env::temp_dir().join(format!("ai-bubble-ctl-fs-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec_dir = dir.join("spec");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let spec_path = spec_dir.join(crate::spec::file::SPEC_FILE);
+        std::fs::write(
+            &spec_path,
+            r#"{"audit":{"log":"/tmp/audit.jsonl"},
+                "hostfs":{"mappings":[{"type":"ro","glob":"/etc"}]}}"#,
+        )
+        .unwrap();
+
+        FS_AVAILABLE.store(true, Ordering::Relaxed);
+        FS_POLICY.lock().unwrap().replace(vec![serde_json::json!(
+            {"type": "ro", "glob": "/etc"}
+        )]);
+        *SPEC_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(spec_dir.clone());
+        fake_fs_peer();
+
+        let reply = handle_command(serde_json::json!({"cmd": "fs-set", "mappings": [
+            {"type": "rw", "glob": "/work"}
+        ]}))
+        .await;
+        assert!(reply.ok, "{:?}", reply.err);
+
+        // The authoritative copy holds the hardened list (including the
+        // auto-hide mapping).
+        let authoritative = FS_POLICY.lock().unwrap().clone().unwrap();
+        assert_eq!(authoritative.len(), 2, "{authoritative:?}");
+        // The persisted file holds exactly the client's list (the
+        // auto-hide mapping stripped again), and untouched sections
+        // survive the rewrite.
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["hostfs"]["mappings"],
+            serde_json::json!([{"type": "rw", "glob": ["/work"]}])
+        );
+        assert_eq!(persisted["audit"]["log"], "/tmp/audit.jsonl");
+        // Re-loading the persisted file reproduces the authoritative list.
+        let reloaded = crate::spec::Spec::try_load(Some(&spec_dir)).unwrap();
+        let reloaded: Vec<Value> = serde_json::to_value(&reloaded.hostfs.mappings)
+            .unwrap()
+            .as_array()
+            .cloned()
+            .unwrap();
+        assert_eq!(reloaded, authoritative);
+
+        FS_AVAILABLE.store(false, Ordering::Relaxed);
+        *SPEC_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        drop_fake_fs_peer();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed persistence rolls the FUSE server back: the reply is an
+    /// error, and the authoritative copy (and the child's pattern set,
+    /// via the rollback push) keep the previous list.
+    #[tokio::test]
+    async fn fs_set_persist_failure_rolls_back() {
+        let _guard = scope_guard();
+        let dir = std::env::temp_dir().join(format!(
+            "ai-bubble-ctl-fs-persist-fail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec_dir = dir.join("spec");
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        // `spec.json` is a directory: the persist cannot read it.
+        std::fs::create_dir_all(spec_dir.join(crate::spec::file::SPEC_FILE)).unwrap();
+
+        FS_AVAILABLE.store(true, Ordering::Relaxed);
+        FS_POLICY.lock().unwrap().replace(vec![serde_json::json!(
+            {"type": "ro", "glob": "/etc"}
+        )]);
+        *SPEC_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(spec_dir);
+        fake_fs_peer();
+
+        let reply = handle_command(serde_json::json!({"cmd": "fs-set", "mappings": [
+            {"type": "rw", "glob": "/work"}
+        ]}))
+        .await;
+        assert!(!reply.ok, "{:?}", reply.err);
+        let err = reply.err.unwrap();
+        assert!(err.contains("persisted"), "{err}");
+        assert!(err.contains("restored"), "{err}");
+        // The authoritative copy keeps the previous list (the rollback
+        // push to the fake child is best-effort and cannot be asserted
+        // here beyond the acks the responder produced).
+        assert_eq!(
+            FS_POLICY.lock().unwrap().clone().unwrap(),
+            vec![serde_json::json!({"type": "ro", "glob": "/etc"})]
+        );
+
+        FS_AVAILABLE.store(false, Ordering::Relaxed);
+        *SPEC_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        drop_fake_fs_peer();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Allow-list entries are validated: strings, non-empty, printable,
+    /// bounded length — and an accepted change is persisted into the
+    /// spec file, with untouched sections carried over verbatim.
+    #[tokio::test]
+    async fn net_set_validates_and_persists_entries() {
+        use std::os::unix::fs::PermissionsExt;
         let _guard = scope_guard();
         FS_AVAILABLE.store(false, Ordering::Relaxed);
         NET_APPLICABLE.store(true, Ordering::Relaxed);
+        // A spec dir with a spec file whose `net` section holds the
+        // current allow-list (and an unrelated section persistence must
+        // not touch), plus mode 0600 like `init` writes it.
+        let dir =
+            std::env::temp_dir().join(format!("ai-bubble-ctl-net-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec_path = dir.join(crate::spec::file::SPEC_FILE);
+        std::fs::write(
+            &spec_path,
+            r#"{"audit":{"log":"/tmp/audit.jsonl"},
+                "net":{"mode":"proxy","allow":["initial.example:443"]}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&spec_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        *SPEC_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
         // `NET_ALLOW` is a process-global OnceLock; if another test in
         // this process (e.g. the end-to-end one) already set it, reuse
         // that instance and reset its contents.
-        let shared = crate::cli::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
-            let shared = Arc::new(std::sync::RwLock::new(Vec::new()));
-            let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
-            shared
-        });
+        let shared = crate::cli::control::NET_ALLOW
+            .get()
+            .cloned()
+            .unwrap_or_else(|| {
+                let shared = Arc::new(std::sync::RwLock::new(Vec::new()));
+                let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
+                shared
+            });
         *shared.write().unwrap() = vec!["initial.example:443".to_string()];
 
         let reply =
@@ -1436,6 +1710,25 @@ mod tests {
                 .await;
         assert!(reply.ok, "{:?}", reply.err);
         assert_eq!(*shared.read().unwrap(), vec!["ok.example:443".to_string()]);
+        // The change is persisted: `net.allow` replaced, every other
+        // section (and the file mode) untouched, no temp files left.
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["net"]["allow"],
+            serde_json::json!(["ok.example:443"])
+        );
+        assert_eq!(persisted["audit"]["log"], "/tmp/audit.jsonl");
+        assert_eq!(
+            std::fs::metadata(&spec_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".spec.json.tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
 
         for bad in [
             serde_json::json!({"cmd": "net-set", "allow": ["has space.example"]}),
@@ -1445,9 +1738,59 @@ mod tests {
             let reply = handle_command(bad.clone()).await;
             assert!(!reply.ok, "{bad}");
         }
-        // The list is untouched by the failures.
+        // The list (and the file) are untouched by the failures.
         assert_eq!(*shared.read().unwrap(), vec!["ok.example:443".to_string()]);
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["net"]["allow"],
+            serde_json::json!(["ok.example:443"])
+        );
         NET_APPLICABLE.store(false, Ordering::Relaxed);
+        *SPEC_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed persistence leaves everything untouched: the reply is an
+    /// error and `A`'s authoritative allow-list keeps the previous value
+    /// (nothing is applied half-way).
+    #[tokio::test]
+    async fn net_set_persist_failure_changes_nothing() {
+        let _guard = scope_guard();
+        FS_AVAILABLE.store(false, Ordering::Relaxed);
+        NET_APPLICABLE.store(true, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ai-bubble-ctl-net-persist-fail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `spec.json` is a directory: the persist cannot read it.
+        std::fs::create_dir_all(dir.join(crate::spec::file::SPEC_FILE)).unwrap();
+        *SPEC_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
+        let shared = crate::cli::control::NET_ALLOW
+            .get()
+            .cloned()
+            .unwrap_or_else(|| {
+                let shared = Arc::new(std::sync::RwLock::new(Vec::new()));
+                let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
+                shared
+            });
+        *shared.write().unwrap() = vec!["keep.example:443".to_string()];
+
+        let reply =
+            handle_command(serde_json::json!({"cmd": "net-set", "allow": ["new.example:443"]}))
+                .await;
+        assert!(!reply.ok, "{:?}", reply.err);
+        assert!(reply.err.unwrap().contains("persisted"));
+        assert_eq!(
+            *shared.read().unwrap(),
+            vec!["keep.example:443".to_string()]
+        );
+
+        NET_APPLICABLE.store(false, Ordering::Relaxed);
+        *SPEC_DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The downstream frame parses, and the child-side applier swaps the
@@ -1592,11 +1935,14 @@ mod tests {
         // authoritative list is whatever it holds — reuse *that* Arc
         // (the server swaps what `NET_ALLOW` holds, so asserting on a
         // fresh Arc here would race the setter) and reset the contents.
-        let shared = crate::cli::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
-            let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
-            let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
-            shared
-        });
+        let shared = crate::cli::control::NET_ALLOW
+            .get()
+            .cloned()
+            .unwrap_or_else(|| {
+                let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
+                let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
+                shared
+            });
         *shared.write().unwrap() = vec!["example.com:443".to_string()];
         crate::cli::control::start(&dir.join("spec"));
         assert!(crate::cli::control::running());
@@ -1649,6 +1995,15 @@ mod tests {
             let reply: serde_json::Value = serde_json::from_str(&read_line(&mut conn)).unwrap();
             assert_eq!(reply["ok"], true, "{reply}");
             assert_eq!(*shared.read().unwrap(), vec!["api.example:443".to_string()]);
+            // The accepted change is persisted into the spec file (which
+            // did not exist: persistence synthesizes the touched section).
+            let persisted: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(spec_dir.join("spec.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                persisted["net"]["allow"],
+                serde_json::json!(["api.example:443"])
+            );
 
             // An fs-set without a live FS peer fails cleanly (the push errors).
             let mut conn = connect();
@@ -1727,11 +2082,14 @@ mod tests {
         FS_AVAILABLE.store(true, Ordering::Relaxed);
         // `NET_ALLOW` is a OnceLock: reuse the authoritative Arc (the
         // server swaps what `NET_ALLOW` holds) and reset the contents.
-        let shared = crate::cli::control::NET_ALLOW.get().cloned().unwrap_or_else(|| {
-            let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
-            let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
-            shared
-        });
+        let shared = crate::cli::control::NET_ALLOW
+            .get()
+            .cloned()
+            .unwrap_or_else(|| {
+                let shared = Arc::new(std::sync::RwLock::new(vec!["example.com:443".to_string()]));
+                let _ = crate::cli::control::NET_ALLOW.set(std::sync::Arc::clone(&shared));
+                shared
+            });
         *shared.write().unwrap() = vec!["example.com:443".to_string()];
 
         // 1. Unchanged spec: reloads cleanly (no push happens — there

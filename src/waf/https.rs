@@ -42,7 +42,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use super::{tls_cert, tls_connect_target, WafSpec};
+use super::{WafSpec, tls_cert, tls_connect_target};
 use crate::connlimit::ConnLimit;
 use crate::ipc::netmux::MuxHandle;
 
@@ -150,7 +150,11 @@ async fn handle_tls(mut tcp: TcpStream, mux: MuxHandle<WafSpec>) {
 /// One decrypted HTTP request: enforce `Host == SNI`, rewrite the
 /// request to origin-form against the dialed authority, and forward it
 /// to the real endpoint through the host's `tls-connect`.
-async fn handle_request(mux: &MuxHandle<WafSpec>, sni: &str, req: Request<Incoming>) -> Response<BodyT> {
+async fn handle_request(
+    mux: &MuxHandle<WafSpec>,
+    sni: &str,
+    req: Request<Incoming>,
+) -> Response<BodyT> {
     // HTTP-level fronting check (AUDIT.md M2): the `Host` header of the
     // decrypted request must name the same host the TLS ClientHello's
     // SNI did (and that the allow-list admitted). Anything else is a
@@ -462,8 +466,8 @@ fn sni_from_client_hello(hello: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use crate::waf::{WafReply, WafReq, host};
+    use base64::Engine as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsConnector;
@@ -540,63 +544,69 @@ mod tests {
     /// TLS handshake had succeeded) pipe to a plain TCP echo server.
     async fn fake_host(pair: tokio::net::UnixStream, echo_port: u16) {
         use crate::ipc::netmux::{copy_bidirectional, serve_pair};
-        serve_pair::<WafSpec, _, _>(pair, crate::ipc::netmux::StreamLimit::new(), move |req, mut stream| async move {
-            match req {
-                WafReq::TlsCert { name } => {
-                    if name == "evil.example" {
-                        return stream
-                            .ack(&WafReply::Denied {
-                                reason: "denied".to_string(),
-                            })
-                            .await;
-                    }
-                    match host::sign_leaf(&name) {
-                        Ok((cert, key)) => {
-                            let enc =
-                                |d: &[u8]| base64::engine::general_purpose::STANDARD.encode(d);
-                            stream
-                                .ack(&WafReply::Cert {
-                                    cert: enc(&cert),
-                                    key: enc(&key),
+        serve_pair::<WafSpec, _, _>(
+            pair,
+            crate::ipc::netmux::StreamLimit::new(),
+            move |req, mut stream| async move {
+                match req {
+                    WafReq::TlsCert { name } => {
+                        if name == "evil.example" {
+                            return stream
+                                .ack(&WafReply::Denied {
+                                    reason: "denied".to_string(),
                                 })
-                                .await
+                                .await;
                         }
-                        Err(e) => {
-                            stream
+                        match host::sign_leaf(&name) {
+                            Ok((cert, key)) => {
+                                let enc =
+                                    |d: &[u8]| base64::engine::general_purpose::STANDARD.encode(d);
+                                stream
+                                    .ack(&WafReply::Cert {
+                                        cert: enc(&cert),
+                                        key: enc(&key),
+                                    })
+                                    .await
+                            }
+                            Err(e) => {
+                                stream
+                                    .ack(&WafReply::Failed {
+                                        reason: e.to_string(),
+                                    })
+                                    .await
+                            }
+                        }
+                    }
+                    WafReq::TlsConnect { target } => {
+                        if target == "evil.example:443" {
+                            return stream
+                                .ack(&WafReply::Denied {
+                                    reason: "denied".to_string(),
+                                })
+                                .await;
+                        }
+                        let Ok(mut tcp) = TcpStream::connect(("127.0.0.1", echo_port)).await else {
+                            return stream
                                 .ack(&WafReply::Failed {
-                                    reason: e.to_string(),
+                                    reason: "no target".to_string(),
                                 })
-                                .await
-                        }
+                                .await;
+                        };
+                        stream.ack(&WafReply::Open).await?;
+                        let _ = copy_bidirectional(&mut stream, &mut tcp).await;
+                        let _ = stream.close().await;
+                        Ok(())
                     }
-                }
-                WafReq::TlsConnect { target } => {
-                    if target == "evil.example:443" {
-                        return stream
-                            .ack(&WafReply::Denied {
-                                reason: "denied".to_string(),
-                            })
-                            .await;
-                    }
-                    let Ok(mut tcp) = TcpStream::connect(("127.0.0.1", echo_port)).await else {
-                        return stream
+                    _ => {
+                        stream
                             .ack(&WafReply::Failed {
-                                reason: "no target".to_string(),
+                                reason: "unknown".to_string(),
                             })
-                            .await;
-                    };
-                    stream.ack(&WafReply::Open).await?;
-                    let _ = copy_bidirectional(&mut stream, &mut tcp).await;
-                    let _ = stream.close().await;
-                    Ok(())
+                            .await
+                    }
                 }
-                _ => stream
-                    .ack(&WafReply::Failed {
-                        reason: "unknown".to_string(),
-                    })
-                    .await,
-            }
-        })
+            },
+        )
         .await;
     }
 

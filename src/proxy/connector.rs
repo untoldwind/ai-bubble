@@ -13,7 +13,7 @@ use std::io;
 use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 
-use super::allowlist::{target_allowed, SharedAllow};
+use super::allowlist::{SharedAllow, target_allowed};
 use super::ipfilter::connect_checked;
 use super::{ProxyReply, ProxyReq, ProxySpec};
 use crate::ipc::netmux::{self, MuxStream};
@@ -33,13 +33,22 @@ use crate::ipc::netmux::{self, MuxStream};
 /// gone with the line protocol: the target arrives as the `OPEN` frame's
 /// payload, so there is no idle first-read to bound.
 pub async fn serve_connector(pair: UnixStream, allow: SharedAllow, allow_private: bool) {
-    netmux::serve_pair::<ProxySpec, _, _>(pair, netmux::StreamLimit::new(), move |req, mut stream| {
-        let allow = allow.clone();
-        async move {
-            handle_connector_conn(req, &super::allowlist::load(&allow), allow_private, &mut stream)
+    netmux::serve_pair::<ProxySpec, _, _>(
+        pair,
+        netmux::StreamLimit::new(),
+        move |req, mut stream| {
+            let allow = allow.clone();
+            async move {
+                handle_connector_conn(
+                    req,
+                    &super::allowlist::load(&allow),
+                    allow_private,
+                    &mut stream,
+                )
                 .await
-        }
-    })
+            }
+        },
+    )
     .await;
 }
 

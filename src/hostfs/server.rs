@@ -250,11 +250,9 @@ fn serve(policy: SharedPatterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> 
             //    anyway; the poll is redundant but harmless) and for
             //    channel-less runs.
             let mut child_loop = match (control_read, control_reply) {
-                (Some(read), Some(reply)) => Some(tokio::spawn(crate::cli::control::fs_child_loop(
-                    read,
-                    reply,
-                    policy.clone(),
-                ))),
+                (Some(read), Some(reply)) => Some(tokio::spawn(
+                    crate::cli::control::fs_child_loop(read, reply, policy.clone()),
+                )),
                 _ => None,
             };
             let mut heartbeat = 0u64;

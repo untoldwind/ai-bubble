@@ -337,8 +337,25 @@ a trusted local client adjust policy while the run is live:
   loader (including the spec-dir protections); `spec-reload` (also
   triggered by `SIGHUP` on the launcher) refuses immutable changes (ops,
   env, cwd, seccomp, rlimits, audit log, net mode) by name.
+* **Persistence.** An accepted update is also written back into the spec
+  file by `A` (`spec::file::patch_spec_file`): the runtime change becomes
+  the next run's initial policy, so `control net add …` / `fs-set` are
+  durable, not per-run tweaks. The write is a read-modify-write over the
+  current file content — sections the change does not touch (and manual
+  edits) survive — and is atomic (`O_NOFOLLOW|O_EXCL` temp sibling,
+  fsync, rename; the original file mode is preserved), so a crash mid-write
+  can never leave a torn or empty policy file behind and a symlink at the
+  temp name cannot be written through. The persisted form is the resolved
+  runtime policy: relative sources absolute, cache mappings and `${VAR}`
+  references expanded, and the auto-hide mapping *not* written (the spec
+  loader re-appends it at load time — persisting it would duplicate it on
+  every reload). A failed persist rolls the change back (`fs-set`: the FUSE
+  server is pushed the previous list again; `net-set`: nothing had been
+  swapped yet) and the client gets `ok:false` — `A`'s authoritative copy,
+  the children and the spec file never disagree. `spec-reload` does not
+  persist: it re-reads the file, which remains the source of truth.
 * **Client**: `ai-bubble control --policy-get | --fs-set JSON |
-  --net-set JSON | --spec-reload` (`cli/control_cli.rs`), exit code 1 on
+  net list/add/rm | --spec-reload` (`cli/control_cli.rs`), exit code 1 on
   `ok:false`.
 
 ### The FUSE channel

@@ -4,8 +4,8 @@
 use clap::Args;
 use std::path::Path;
 
-use crate::{audit, cli::control, hostfs, sandbox, spec, waf};
 use crate::sandbox::netns;
+use crate::{audit, cli::control, hostfs, sandbox, spec, waf};
 
 /// Run COMMAND inside a fresh sandbox (new user + mount namespace, empty
 /// tmpfs root) configured by the spec file.
@@ -66,9 +66,11 @@ pub struct RunCommand {
     /// A control-enabled run can then be steered while it runs:
     /// `ai-bubble control --policy-get` reads the current mutable
     /// policy, `--fs-set` replaces the whole hostfs pattern set and
-    /// `--net-set` the whole network allow-list (both apply to new
-    /// operations/connections only, and only to what is runtime-
-    /// mutable — never seccomp, mounts or env). Because fuse3 has no
+    /// `net add`/`net rm`/`net list` edit the network allow-list (the
+    /// swaps apply to new operations/connections only, and only to what
+    /// is runtime-mutable — never seccomp, mounts or env; accepted
+    /// changes are persisted into the spec file, so they survive the
+    /// run). Because fuse3 has no
     /// remount, a control-enabled run mounts its FUSE mirror
     /// **writable** even when every initial mapping is `ro`: the
     /// per-operation pattern checks are then the only write policy.

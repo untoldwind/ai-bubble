@@ -295,7 +295,9 @@ impl Filesystem for HostFs {
         if self.patterns.load().is_empty(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        let target = self.root.read_link(&self.patterns.load().redirect(&mirrored))?;
+        let target = self
+            .root
+            .read_link(&self.patterns.load().redirect(&mirrored))?;
         Ok(ReplyData::from(Bytes::copy_from_slice(
             target.as_os_str().as_encoded_bytes(),
         )))
@@ -591,23 +593,23 @@ impl Filesystem for HostFs {
         // parent — never following symlinks (a host symlink is visible only
         // as a link, and its target may not be mirrored at all; and no
         // intermediate component is followed either).
-        let mut file = match self.root.open_at(
-            &self.patterns.load().redirect(&mirrored),
-            libc::O_RDONLY,
-            0,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                log_op_err(
-                    "read",
-                    &mirrored,
-                    Some(&self.patterns.load().redirect(&mirrored)),
-                    &e,
-                )
-                .await;
-                return Err(e.into());
-            }
-        };
+        let mut file =
+            match self
+                .root
+                .open_at(&self.patterns.load().redirect(&mirrored), libc::O_RDONLY, 0)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    log_op_err(
+                        "read",
+                        &mirrored,
+                        Some(&self.patterns.load().redirect(&mirrored)),
+                        &e,
+                    )
+                    .await;
+                    return Err(e.into());
+                }
+            };
         // HF-2: never proxy host device nodes/sockets (authoritative
         // post-open check; see `open`).
         match file.metadata() {
@@ -773,8 +775,7 @@ impl Filesystem for HostFs {
         if append {
             oflags |= libc::O_APPEND;
         }
-        let mut file = match self.root.open_at(&patterns.redirect(&mirrored), oflags, 0)
-        {
+        let mut file = match self.root.open_at(&patterns.redirect(&mirrored), oflags, 0) {
             Ok(f) => f,
             Err(e) => {
                 log_op_err(
@@ -1378,8 +1379,9 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        let anchored =
-            self.root.anchor_parent(&self.patterns.load().redirect(&mirrored))?;
+        let anchored = self
+            .root
+            .anchor_parent(&self.patterns.load().redirect(&mirrored))?;
         if unsafe { libc::unlinkat(anchored.dir().as_raw_fd(), anchored.name().as_ptr(), 0) } != 0 {
             let e = std::io::Error::last_os_error();
             log_op_err(
@@ -1443,8 +1445,9 @@ impl Filesystem for HostFs {
             .await;
             return Err(libc::EACCES.into());
         }
-        let anchored =
-            self.root.anchor_parent(&self.patterns.load().redirect(&mirrored))?;
+        let anchored = self
+            .root
+            .anchor_parent(&self.patterns.load().redirect(&mirrored))?;
         if unsafe {
             libc::unlinkat(
                 anchored.dir().as_raw_fd(),
@@ -1741,10 +1744,12 @@ impl Filesystem for HostFs {
         // behavior is correct, the comment was not.) The check and the
         // syscall below run in one await-free block — on the
         // single-threaded runtime nothing can swap the entry in between.
-        let old_anchored =
-            self.root.anchor_parent(&self.patterns.load().redirect(&old))?;
-        let new_anchored =
-            self.root.anchor_parent(&self.patterns.load().redirect(&new))?;
+        let old_anchored = self
+            .root
+            .anchor_parent(&self.patterns.load().redirect(&old))?;
+        let new_anchored = self
+            .root
+            .anchor_parent(&self.patterns.load().redirect(&new))?;
         let source_stat = old_anchored.stat_entry()?;
         if Self::stat_is_symlink(&source_stat) {
             // AUDIT.md M5: linking a host symlink used to re-create it on
@@ -1945,11 +1950,10 @@ impl Filesystem for HostFs {
         if append {
             oflags |= libc::O_APPEND;
         }
-        let file = match self.root.open_at(
-            &real,
-            oflags,
-            (mode & SAFE_MODE) as libc::mode_t,
-        ) {
+        let file = match self
+            .root
+            .open_at(&real, oflags, (mode & SAFE_MODE) as libc::mode_t)
+        {
             Ok(f) => f,
             Err(e) => {
                 log_op_err("create-new", &mirrored, Some(&real), &e).await;

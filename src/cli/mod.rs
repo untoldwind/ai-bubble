@@ -21,6 +21,8 @@ mod run;
 
 pub use audit_cli::AuditCommand;
 pub use control_cli::ControlCommand;
+#[cfg(test)]
+use control_cli::{NetAction, NetCommand};
 pub use init::InitCommand;
 pub use ls::LsCommand;
 pub use run::RunCommand;
@@ -88,14 +90,15 @@ pub enum Command {
     /// out), and use the same `--spec-dir`):
     /// read the current mutable policy (`--policy-get`, the default),
     /// replace one of its runtime-mutable domains (`--fs-set` with a JSON
-    /// array of hostfs mapping objects, `--net-set` with a JSON array of
-    /// allow-list entries), or re-read the spec file and apply its
-    /// runtime-mutable subset (`--spec-reload`; every changed immutable
-    /// section is named in the error instead of being silently ignored —
-    /// `kill -HUP` on the run's launcher does the same). The replacements
-    /// are **full** — never deltas — and affect new
-    /// operations/connections only. The command exits nonzero when the
-    /// reply is not `ok`, so scripts can branch on the result.
+    /// array of hostfs mapping objects, or `net` with the allow-list
+    /// sub-commands: `net list`, `net add ENTRY`, `net rm ENTRY`), or
+    /// re-read the spec file and apply its runtime-mutable subset
+    /// (`--spec-reload`; every changed immutable section is named in the
+    /// error instead of being silently ignored — `kill -HUP` on the run's
+    /// launcher does the same). The replacements are **full** — never
+    /// deltas — and affect new operations/connections only. The command
+    /// exits nonzero when the reply is not `ok`, so scripts can branch on
+    /// the result.
     Control(ControlCommand),
 
     /// Show the audit log path (or follow the audit log with
@@ -275,16 +278,15 @@ mod tests {
         }
     }
 
-    /// The control sub-command parses all four actions.
+    /// The control sub-command parses its actions, including the nested
+    /// `net` allow-list sub-commands.
     #[test]
     fn control_subcommand_actions() {
         let actions = |args: &[&str]| match parse(args).command {
-            Some(Command::Control(cmd)) => {
-                (cmd.policy_get, cmd.fs_set, cmd.net_set, cmd.spec_reload)
-            }
+            Some(Command::Control(cmd)) => (cmd.policy_get, cmd.fs_set, cmd.net, cmd.spec_reload),
             other => panic!("expected control, got {other:?}"),
         };
-        // The bare sub-command parses all-false: `--policy-get` is the
+        // The bare sub-command parses all-absent: `--policy-get` is the
         // *default action* (applied when no flag is given), not a
         // default-on flag (see `control_cli::control`).
         assert_eq!(
@@ -296,8 +298,41 @@ mod tests {
             (false, None, None, true)
         );
         assert_eq!(
-            actions(&["ai-bubble", "control", "--net-set", r#"["a.example:443"]"#]),
-            (false, None, Some(r#"["a.example:443"]"#.to_string()), false)
+            actions(&["ai-bubble", "control", "net", "list"]),
+            (
+                false,
+                None,
+                Some(NetCommand::Net {
+                    action: NetAction::List
+                }),
+                false
+            )
+        );
+        assert_eq!(
+            actions(&["ai-bubble", "control", "net", "add", "a.example:443"]),
+            (
+                false,
+                None,
+                Some(NetCommand::Net {
+                    action: NetAction::Add {
+                        entry: "a.example:443".to_string()
+                    }
+                }),
+                false
+            )
+        );
+        assert_eq!(
+            actions(&["ai-bubble", "control", "net", "rm", "*.api.example.com"]),
+            (
+                false,
+                None,
+                Some(NetCommand::Net {
+                    action: NetAction::Rm {
+                        entry: "*.api.example.com".to_string()
+                    }
+                }),
+                false
+            )
         );
     }
 

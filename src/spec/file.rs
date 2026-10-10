@@ -288,26 +288,9 @@ impl Spec {
     /// fail to name the real directory and the spec directory would be
     /// exposed by any mapping that mirrors its parent.
     pub fn hide_spec_dir(&mut self, spec_dir: &Path) {
-        let dir = absolute_dir(spec_dir);
-        // Rebuild the absolute path as a pattern: a `/` root plus one
-        // escaped component per directory level. Non-UTF-8 components are
-        // lossy-converted; they can never match a pattern in
-        // the first place, so every derived decision fails closed.
-        let pattern = format!(
-            "/{}",
-            dir.components()
-                .filter_map(|c| match c {
-                    std::path::Component::Normal(name) => {
-                        Some(crate::hostfs::pattern::escape_glob(&name.to_string_lossy()))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("/")
-        );
-        self.hostfs.mappings.push(super::hostfs::Mapping::Hide {
-            glob: super::hostfs::Globs(vec![pattern]),
-        });
+        self.hostfs
+            .mappings
+            .push(spec_dir_auto_hide_mapping(spec_dir));
     }
 
     /// Security validation of the mappings whose host paths bypass the
@@ -466,6 +449,118 @@ impl Spec {
         }
         Ok(Some(PathBuf::from(expanded)))
     }
+}
+
+/// The auto-hide mapping [`Spec::hide_spec_dir`] appends (and
+/// [`Spec::control_plane_mapping_list`] re-appends for control-plane
+/// replacements). Exposed so the control plane can strip exactly this
+/// mapping again when it persists a runtime-mutated pattern list back
+/// into the spec file: the loader re-appends it at every load, so
+/// persisting it would accumulate one duplicate hide mapping per edit.
+pub(crate) fn spec_dir_auto_hide_mapping(spec_dir: &Path) -> super::hostfs::Mapping {
+    let dir = absolute_dir(spec_dir);
+    // Rebuild the absolute path as a pattern: a `/` root plus one
+    // escaped component per directory level. Non-UTF-8 components are
+    // lossy-converted; they can never match a pattern in
+    // the first place, so every derived decision fails closed.
+    let pattern = format!(
+        "/{}",
+        dir.components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(name) => {
+                    Some(crate::hostfs::pattern::escape_glob(&name.to_string_lossy()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    super::hostfs::Mapping::Hide {
+        glob: super::hostfs::Globs(vec![pattern]),
+    }
+}
+
+/// Persist a runtime-mutable policy change into the spec file: read the
+/// raw JSON, hand the parsed tree to `patch`, and atomically replace the
+/// file with the re-serialized result.
+///
+/// * Read-modify-write over the **current file content**: every section
+///   the patch does not touch — including manual edits that raced in —
+///   is carried over verbatim; the caller owns only the section it
+///   changes. A missing spec file starts from `{}` (the implicit default
+///   policy), so persisting synthesizes the section it writes.
+/// * The replacement is atomic: the new content goes to a
+///   `.spec.json.tmp-…` sibling created `O_EXCL|O_NOFOLLOW`, is fsynced
+///   and renamed over the spec file — a crash mid-write can never leave
+///   a torn (or empty) policy file behind, and a symlink planted at the
+///   temp name cannot be written through. The original file mode is
+///   preserved (a missing file gets `0600`, matching `init`).
+/// * The file is rewritten as canonical pretty JSON: key order and
+///   whitespace normalize (JSON has no comments, so nothing else can be
+///   lost).
+///
+/// Serialization is the caller's job: the control plane applies these
+/// patches behind its update gate, one at a time.
+pub(crate) fn patch_spec_file<F>(spec_dir: &Path, patch: F) -> Result<(), String>
+where
+    F: FnOnce(&mut serde_json::Value),
+{
+    let path = spec_dir.join(SPEC_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
+        Err(e) => return Err(format!("can't read {}: {e}", path.display())),
+    };
+    let mut tree: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+    if !tree.is_object() {
+        return Err(format!("{} must hold a JSON object", path.display()));
+    }
+    patch(&mut tree);
+    let mut new = serde_json::to_string_pretty(&tree)
+        .map_err(|e| format!("can't re-serialize the spec file: {e}"))?;
+    new.push('\n');
+
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mode = std::fs::metadata(&path)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o600);
+    // One persist at a time (the control plane serializes applies); the
+    // attempt counter only guards against a stale temp file left by a
+    // crashed earlier attempt of the same process.
+    for attempt in 0..64u32 {
+        let tmp = spec_dir.join(format!(
+            ".{}.tmp-{}-{}",
+            SPEC_FILE,
+            std::process::id(),
+            attempt
+        ));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("can't create {}: {e}", tmp.display())),
+        };
+        let result = (|| {
+            file.write_all(new.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| format!("can't write {}: {e}", tmp.display()))?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("can't set the mode of {}: {e}", tmp.display()))?;
+            std::fs::rename(&tmp, &path)
+                .map_err(|e| format!("can't replace {}: {e}", path.display()))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return result;
+    }
+    Err("can't create a spec-file temp file: every candidate name exists".to_string())
 }
 
 /// Expand the `${VAR}` references in one string with

@@ -35,7 +35,7 @@ use tokio::net::{TcpStream, UnixStream};
 
 use crate::connlimit::ConnLimit as StreamLimit;
 use crate::ipc::netmux::{self, MuxStream};
-use crate::proxy::allowlist::{host_allowed, target_allowed, SharedAllow};
+use crate::proxy::allowlist::{SharedAllow, host_allowed, target_allowed};
 use crate::proxy::ipfilter::connect_checked;
 use crate::waf::{WafReply, WafReq, WafSpec};
 
@@ -58,8 +58,13 @@ pub async fn serve_host(pair: UnixStream, allow: SharedAllow, allow_private: boo
     netmux::serve_pair::<WafSpec, _, _>(pair, StreamLimit::new(), move |req, mut stream| {
         let allow = allow.clone();
         async move {
-            handle_host_req(req, &crate::proxy::allowlist::load(&allow), allow_private, &mut stream)
-                .await
+            handle_host_req(
+                req,
+                &crate::proxy::allowlist::load(&allow),
+                allow_private,
+                &mut stream,
+            )
+            .await
         }
     })
     .await;
@@ -81,8 +86,7 @@ async fn handle_host_req(
         WafReq::ResolveDns { name } => {
             if !valid_name(&name) || !host_allowed(&name, allow) {
                 eprintln!("ai-bubble waf: DNS lookup of {name} denied");
-                crate::audit::record("waf", "resolve-dns", Some(&name), Some("denied"), None)
-                    .await;
+                crate::audit::record("waf", "resolve-dns", Some(&name), Some("denied"), None).await;
                 return stream
                     .ack(&WafReply::Denied {
                         reason: "name not on the allow list".to_string(),
@@ -161,8 +165,14 @@ async fn handle_host_req(
             } else {
                 if !take_keygen_token().await {
                     eprintln!("ai-bubble waf: tls-cert for {name} rate-limited");
-                    crate::audit::record("waf", "tls-cert", Some(&name), Some("rate-limited"), None)
-                        .await;
+                    crate::audit::record(
+                        "waf",
+                        "tls-cert",
+                        Some(&name),
+                        Some("rate-limited"),
+                        None,
+                    )
+                    .await;
                     return stream
                         .ack(&WafReply::Denied {
                             reason: "too many certificate requests".to_string(),
@@ -613,7 +623,11 @@ mod tests {
     #[tokio::test]
     async fn resolve_dns_allowed_and_denied() {
         let (a, b) = netmux::pair().unwrap();
-        tokio::spawn(serve_host(a, allow(&["example.com", "*.github.com:443"]), false));
+        tokio::spawn(serve_host(
+            a,
+            allow(&["example.com", "*.github.com:443"]),
+            false,
+        ));
         let mux = MuxHandle::<WafSpec>::client(b);
 
         // Allowed: the redirect address comes back as a typed reply.

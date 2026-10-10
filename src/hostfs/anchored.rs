@@ -71,8 +71,7 @@ impl RootDir {
         if comps.is_empty() {
             if absolute {
                 // SAFETY: valid descriptor; the duplicate is owned by the caller.
-                let fd =
-                    unsafe { libc::fcntl(self.as_fd().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+                let fd = unsafe { libc::fcntl(self.as_fd().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
                 if fd < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -243,10 +242,7 @@ impl RootDir {
     /// `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, every intermediate component
     /// no-follow. The result is an owned descriptor usable with `fdopendir`.
     pub(crate) fn open_dir(&self, path: &Path) -> io::Result<OwnedFd> {
-        self.open_full(
-            path,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        )
+        self.open_full(path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)
     }
 
     /// `readlinkat` on the anchored path, growing the buffer until the target

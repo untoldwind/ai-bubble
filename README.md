@@ -72,12 +72,23 @@ ai-bubble --spec-dir .ai-bubble control --policy-get
 # spec file's hostfs.mappings; affects new filesystem operations only):
 ai-bubble --spec-dir .ai-bubble control --fs-set '[{"type":"rw","glob":"/work/**"}]'
 
-# Replace the whole network allow-list (affects new connections only):
-ai-bubble --spec-dir .ai-bubble control --net-set '["example.com:443", "*.api.example.com"]'
+# Edit the network allow-list (affects new connections only; `rm` and
+# `list` work the same way):
+ai-bubble --spec-dir .ai-bubble control net add example.com:443
+ai-bubble --spec-dir .ai-bubble control net add '*.api.example.com'
 
 # Re-read the spec file and apply the mutable subset of what changed:
 ai-bubble --spec-dir .ai-bubble control --spec-reload
 # (equivalently: kill -HUP <pid of the ai-bubble run>)
+
+Every accepted change is **persisted**: the launcher writes it back into
+`<spec-dir>/spec.json` (atomically, preserving every other section), so the
+next `ai-bubble run` starts with the same policy. `--spec-reload` is the
+inverse operation — it re-reads the file without persisting anything.
+Persistent changes are the *resolved* runtime policy: relative sources,
+cache mappings and `${VAR}` references are stored expanded, and the
+auto-hide mapping protecting the spec directory is not written (it is
+re-added at load time).
 
 # Show the audit log path / follow the audit log like tail -f:
 ai-bubble --spec-dir .ai-bubble audit

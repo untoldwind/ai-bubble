@@ -69,7 +69,12 @@ async fn handle_connect_proxy(mut tcp: TcpStream, mux: MuxHandle<ProxySpec>) {
     // resolved address), dials the target and acks once the tunnel is
     // live. A denial arrives as an `ERR` frame, which the client sees as
     // a 502 below.
-    let (_, mut stream) = match mux.open(&ProxyReq { target: target.clone() }).await {
+    let (_, mut stream) = match mux
+        .open(&ProxyReq {
+            target: target.clone(),
+        })
+        .await
+    {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("ai-bubble proxy: can't reach connector: {e}");

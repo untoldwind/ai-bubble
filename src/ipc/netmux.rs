@@ -91,8 +91,8 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
@@ -492,7 +492,12 @@ where
                         let core = Arc::clone(&core);
                         async move {
                             let _ = core
-                                .write_frame(TAG_ERR, id, 0, &err_payload("too many concurrent streams"))
+                                .write_frame(
+                                    TAG_ERR,
+                                    id,
+                                    0,
+                                    &err_payload("too many concurrent streams"),
+                                )
                                 .await;
                         }
                     });
@@ -571,7 +576,9 @@ fn peer_cred(fd: RawFd) -> io::Result<libc::ucred> {
 /// The credential comparison of [`check_peer`], split out for a direct
 /// test: a mismatch on any of pid/uid/gid fails.
 fn peer_credentials_ok(cred: &libc::ucred) -> bool {
-    unsafe { cred.pid == libc::getpid() && cred.uid == libc::geteuid() && cred.gid == libc::getegid() }
+    unsafe {
+        cred.pid == libc::getpid() && cred.uid == libc::geteuid() && cred.gid == libc::getegid()
+    }
 }
 
 /// The connector end of a pre-fork socketpair for mode `S`. Every `OPEN`
@@ -664,11 +671,21 @@ enum OutState {
     Idle,
     /// Acquiring the shared write half (`lock_owned`, an owned guard so
     /// the future stays `'static`).
-    Locking(Pin<Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<OwnedWriteHalf>> + Send>>),
+    Locking(
+        Pin<
+            Box<
+                dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<OwnedWriteHalf>>
+                    + Send,
+            >,
+        >,
+    ),
     /// Writing the assembled frame through the acquired guard; the usize
     /// is the frame's payload length (the `wbuf` prefix to drop on
     /// success — `poll_write` may have appended more bytes meanwhile).
-    Writing(Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>, usize),
+    Writing(
+        Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>>,
+        usize,
+    ),
 }
 
 impl OutState {
@@ -869,7 +886,8 @@ impl MuxStream {
         loop {
             match &mut this.out {
                 OutState::Idle => {
-                    this.out = OutState::Locking(Box::pin(Arc::clone(&this.core.writer).lock_owned()));
+                    this.out =
+                        OutState::Locking(Box::pin(Arc::clone(&this.core.writer).lock_owned()));
                 }
                 OutState::Locking(fut) => {
                     let guard = ready!(fut.as_mut().poll(cx));
@@ -974,10 +992,16 @@ mod tests {
     #[tokio::test]
     async fn request_reply_roundtrip() {
         let (a, b) = pair();
-        tokio::spawn(serve_pair::<EchoSpec, _, _>(b, StreamLimit::new(), echo_handler));
+        tokio::spawn(serve_pair::<EchoSpec, _, _>(
+            b,
+            StreamLimit::new(),
+            echo_handler,
+        ));
         let handle = MuxHandle::<EchoSpec>::client(a);
         let (reply, stream) = handle
-            .open(&EchoReq { msg: "hi".to_string() })
+            .open(&EchoReq {
+                msg: "hi".to_string(),
+            })
             .await
             .expect("open");
         assert_eq!(reply.msg, "hi");
@@ -989,20 +1013,28 @@ mod tests {
         let (a, b) = pair();
         // The handler acks immediately, then blocks on its stream until
         // the client half-closes — it holds its cap slot meanwhile.
-        tokio::spawn(serve_pair::<EchoSpec, _, _>(b, StreamLimit::with_max(1), |req, mut stream| async move {
-            stream.ack(&EchoReply { msg: req.msg }).await?;
-            let mut buf = [0u8; 8];
-            let _ = stream.read(&mut buf).await;
-            stream.close().await
-        }));
+        tokio::spawn(serve_pair::<EchoSpec, _, _>(
+            b,
+            StreamLimit::with_max(1),
+            |req, mut stream| async move {
+                stream.ack(&EchoReply { msg: req.msg }).await?;
+                let mut buf = [0u8; 8];
+                let _ = stream.read(&mut buf).await;
+                stream.close().await
+            },
+        ));
         let handle = MuxHandle::<EchoSpec>::client(a);
         let (r1, mut s1) = handle
-            .open(&EchoReq { msg: "1".to_string() })
+            .open(&EchoReq {
+                msg: "1".to_string(),
+            })
             .await
             .expect("first stream at the cap");
         assert_eq!(r1.msg, "1");
         let err = handle
-            .open(&EchoReq { msg: "2".to_string() })
+            .open(&EchoReq {
+                msg: "2".to_string(),
+            })
             .await
             .expect_err("second stream over the cap");
         assert!(err.to_string().contains("too many concurrent streams"));
@@ -1011,7 +1043,9 @@ mod tests {
         let mut eof = Vec::new();
         s1.read_to_end(&mut eof).await.unwrap();
         let (_r3, s3) = handle
-            .open(&EchoReq { msg: "3".to_string() })
+            .open(&EchoReq {
+                msg: "3".to_string(),
+            })
             .await
             .expect("slot freed");
         drop(s3);
@@ -1020,17 +1054,27 @@ mod tests {
     #[tokio::test]
     async fn data_plane_with_half_close() {
         let (a, b) = pair();
-        tokio::spawn(serve_pair::<EchoSpec, _, _>(b, StreamLimit::new(), |_req, mut stream| async move {
-            stream.ack(&EchoReply { msg: "ignored" .to_string()}).await?;
-            let mut got = Vec::new();
-            stream.read_to_end(&mut got).await?;
-            stream.write_all(b"pong").await?;
-            stream.flush().await?;
-            stream.close().await
-        }));
+        tokio::spawn(serve_pair::<EchoSpec, _, _>(
+            b,
+            StreamLimit::new(),
+            |_req, mut stream| async move {
+                stream
+                    .ack(&EchoReply {
+                        msg: "ignored".to_string(),
+                    })
+                    .await?;
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await?;
+                stream.write_all(b"pong").await?;
+                stream.flush().await?;
+                stream.close().await
+            },
+        ));
         let handle = MuxHandle::<EchoSpec>::client(a);
         let (reply, mut stream) = handle
-            .open(&EchoReq { msg: "unused".to_string() })
+            .open(&EchoReq {
+                msg: "unused".to_string(),
+            })
             .await
             .expect("open");
         stream.write_all(b"ping").await.unwrap();
@@ -1047,21 +1091,29 @@ mod tests {
     #[tokio::test]
     async fn concurrent_streams_are_independent() {
         let (a, b) = pair();
-        tokio::spawn(serve_pair::<EchoSpec, _, _>(b, StreamLimit::new(), |_req, mut stream| async move {
-            stream.ack(&EchoReply { msg: String::new() }).await?;
-            let mut got = Vec::new();
-            stream.read_to_end(&mut got).await?;
-            stream.write_all(&got).await?;
-            stream.flush().await?;
-            stream.close().await
-        }));
+        tokio::spawn(serve_pair::<EchoSpec, _, _>(
+            b,
+            StreamLimit::new(),
+            |_req, mut stream| async move {
+                stream.ack(&EchoReply { msg: String::new() }).await?;
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await?;
+                stream.write_all(&got).await?;
+                stream.flush().await?;
+                stream.close().await
+            },
+        ));
         let handle = MuxHandle::<EchoSpec>::client(a);
         let (_r1, mut s1) = handle
-            .open(&EchoReq { msg: "one".to_string() })
+            .open(&EchoReq {
+                msg: "one".to_string(),
+            })
             .await
             .expect("stream 1");
         let (_r2, mut s2) = handle
-            .open(&EchoReq { msg: "two".to_string() })
+            .open(&EchoReq {
+                msg: "two".to_string(),
+            })
             .await
             .expect("stream 2");
         assert_ne!(s1.id(), s2.id(), "ids must be unique");
@@ -1086,12 +1138,16 @@ mod tests {
     #[tokio::test]
     async fn handler_error_becomes_err() {
         let (a, b) = pair();
-        tokio::spawn(serve_pair::<EchoSpec, _, _>(b, StreamLimit::new(), |_req, _stream| {
-            std::future::ready(Err(io::Error::other("denied")))
-        }));
+        tokio::spawn(serve_pair::<EchoSpec, _, _>(
+            b,
+            StreamLimit::new(),
+            |_req, _stream| std::future::ready(Err(io::Error::other("denied"))),
+        ));
         let handle = MuxHandle::<EchoSpec>::client(a);
         let err = handle
-            .open(&EchoReq { msg: "x".to_string() })
+            .open(&EchoReq {
+                msg: "x".to_string(),
+            })
             .await
             .expect_err("handler refused");
         assert!(err.to_string().contains("denied"));
@@ -1102,7 +1158,11 @@ mod tests {
         // The connector speaks EchoSpec; the client sends an OtherSpec
         // request — undecodable, so refused with ERR, not answered.
         let (a, b) = pair();
-        tokio::spawn(serve_pair::<EchoSpec, _, _>(b, StreamLimit::new(), echo_handler));
+        tokio::spawn(serve_pair::<EchoSpec, _, _>(
+            b,
+            StreamLimit::new(),
+            echo_handler,
+        ));
         let handle = MuxHandle::<OtherSpec>::client(a);
         let err = handle
             .open(&OtherReq { n: 5 })
@@ -1124,7 +1184,11 @@ mod tests {
         raw_std.set_nonblocking(true).unwrap();
         let a = UnixStream::from_std(sa).unwrap();
         let b = UnixStream::from_std(sb).unwrap();
-        tokio::spawn(serve_pair::<EchoSpec, _, _>(b, StreamLimit::new(), echo_handler));
+        tokio::spawn(serve_pair::<EchoSpec, _, _>(
+            b,
+            StreamLimit::new(),
+            echo_handler,
+        ));
         // Shove an over-cap frame into the raw client end: the connector
         // must cut the connection.
         let mut junk = Vec::new();
@@ -1137,7 +1201,9 @@ mod tests {
         let _ = raw.write_all(&junk).await;
         let handle = MuxHandle::<EchoSpec>::client(a);
         let err = handle
-            .open(&EchoReq { msg: "x".to_string() })
+            .open(&EchoReq {
+                msg: "x".to_string(),
+            })
             .await
             .expect_err("connection must be cut");
         // Either the OPEN write hits the already-closed socket (EPIPE) or
@@ -1153,10 +1219,16 @@ mod tests {
     #[tokio::test]
     async fn close_then_reopen_gets_fresh_id() {
         let (a, b) = pair();
-        tokio::spawn(serve_pair::<EchoSpec, _, _>(b, StreamLimit::new(), echo_handler));
+        tokio::spawn(serve_pair::<EchoSpec, _, _>(
+            b,
+            StreamLimit::new(),
+            echo_handler,
+        ));
         let handle = MuxHandle::<EchoSpec>::client(a);
         let (r1, mut s1) = handle
-            .open(&EchoReq { msg: "first".to_string() })
+            .open(&EchoReq {
+                msg: "first".to_string(),
+            })
             .await
             .expect("open 1");
         let id1 = s1.id();
@@ -1164,7 +1236,9 @@ mod tests {
         // Writes after close fail, reads EOF.
         assert!(s1.write_all(b"x").await.is_err());
         let (r2, s2) = handle
-            .open(&EchoReq { msg: "second".to_string() })
+            .open(&EchoReq {
+                msg: "second".to_string(),
+            })
             .await
             .expect("open 2 after close");
         assert_ne!(id1, s2.id());

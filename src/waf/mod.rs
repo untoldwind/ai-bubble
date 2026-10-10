@@ -100,7 +100,11 @@ impl NetSpec for WafSpec {
 /// (the host may already be tearing down) is an error, answered with
 /// SERVFAIL by the DNS server.
 pub(crate) async fn resolve_name(mux: &MuxHandle<WafSpec>, name: &str) -> io::Result<bool> {
-    let (reply, mut stream) = mux.open(&WafReq::ResolveDns { name: name.to_string() }).await?;
+    let (reply, mut stream) = mux
+        .open(&WafReq::ResolveDns {
+            name: name.to_string(),
+        })
+        .await?;
     let r = match reply {
         WafReply::Dns { .. } => Ok(true),
         // An allow-list refusal is a "no", like the old ERR line — the
@@ -173,8 +177,15 @@ async fn pipe_command(mux: &MuxHandle<WafSpec>, req: WafReq, what: &str) -> io::
 /// Ask the host for a leaf certificate (and key) for the HTTPS MITM,
 /// signed by the waf CA: DER cert + DER PKCS#8 key, base64'd in the
 /// reply frame.
-pub(crate) async fn tls_cert(mux: &MuxHandle<WafSpec>, name: &str) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let (reply, mut stream) = mux.open(&WafReq::TlsCert { name: name.to_string() }).await?;
+pub(crate) async fn tls_cert(
+    mux: &MuxHandle<WafSpec>,
+    name: &str,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let (reply, mut stream) = mux
+        .open(&WafReq::TlsCert {
+            name: name.to_string(),
+        })
+        .await?;
     let r = match reply {
         WafReply::Cert { cert, key } => {
             let dec = |s: &str| {
