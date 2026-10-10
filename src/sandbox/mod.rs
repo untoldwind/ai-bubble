@@ -1049,11 +1049,10 @@ unsafe fn build_root(
                     {
                         die(&format!("Invalid bind destination {}", dest.display()));
                     }
-                    let src_c = cstring(OsStr::new(src));
-                    let mut src_stat: libc::stat = std::mem::zeroed();
-                    if libc::stat(src_c.as_ptr(), &mut src_stat) != 0 {
-                        die_with_error(&format!("Can't find source {src}"));
-                    }
+                    let src_meta = match fs::metadata(src) {
+                        Ok(m) => m,
+                        Err(_) => die_with_error(&format!("Can't find source {src}")),
+                    };
                     let dest_abs = sandbox_path(&newroot, dest);
                     // Bind targets must exist; create missing directories on
                     // the tmpfs root (bwrap does the same for its new root).
@@ -1063,14 +1062,14 @@ unsafe fn build_root(
                     // SB-5: a *file* source needs an empty destination
                     // file, not a directory — bwrap behaves the same, and
                     // mounting a file onto a directory fails with
-                    // ENOTDIR. The previously filled-but-unused `src_stat`
-                    // decides.
-                    if src_stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+                    // ENOTDIR. The stat result decides.
+                    if src_meta.file_type().is_file() {
                         ensure_file(&newroot, dest);
                     } else {
                         ensure_dir(&newroot, dest);
                     }
                     refuse_symlink_dest(&newroot, dest);
+                    let src_c = cstring(OsStr::new(src));
                     let dest_c = cstring(dest_abs.as_os_str());
                     if libc::mount(
                         src_c.as_ptr(),
@@ -1237,10 +1236,7 @@ unsafe fn build_root(
                         ("fd", "/proc/self/fd"),
                         ("core", "/proc/kcore"),
                     ] {
-                        let dest_c =
-                            CString::new(dev_abs.join(name).as_os_str().as_bytes()).unwrap();
-                        let target_c = CString::new(target).unwrap();
-                        if libc::symlink(target_c.as_ptr(), dest_c.as_ptr()) != 0 {
+                        if std::os::unix::fs::symlink(target, dev_abs.join(name)).is_err() {
                             die_with_error(&format!("Can't make symlink {name} -> {target}"));
                         }
                     }
@@ -1269,9 +1265,7 @@ unsafe fn build_root(
                     {
                         die_with_error("Can't mount devpts on /dev/pts");
                     }
-                    let ptmx_c = CString::new(dev_abs.join("ptmx").as_os_str().as_bytes()).unwrap();
-                    let target_c = CString::new("pts/ptmx").unwrap();
-                    if libc::symlink(target_c.as_ptr(), ptmx_c.as_ptr()) != 0 {
+                    if std::os::unix::fs::symlink("pts/ptmx", dev_abs.join("ptmx")).is_err() {
                         die_with_error("Can't make symlink ptmx -> pts/ptmx");
                     }
 
@@ -1323,10 +1317,7 @@ unsafe fn build_root(
                         ensure_dir(&newroot, p);
                     }
                     let dest_abs = sandbox_path(&newroot, dest);
-                    let dest_c = cstring(dest_abs.as_os_str());
-                    let src_c = cstring(OsStr::new(src));
-                    if libc::symlink(src_c.as_ptr(), dest_c.as_ptr()) != 0 {
-                        let e = io::Error::last_os_error();
+                    if let Err(e) = std::os::unix::fs::symlink(src, &dest_abs) {
                         if e.kind() == io::ErrorKind::AlreadyExists {
                             // Mirror bwrap: same target is fine, otherwise it's
                             // an error.

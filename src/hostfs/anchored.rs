@@ -70,13 +70,9 @@ impl RootDir {
         // relative path, the current directory).
         if comps.is_empty() {
             if absolute {
-                // SAFETY: valid descriptor; the duplicate is owned by the caller.
-                let fd = unsafe { libc::fcntl(self.as_fd().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-                if fd < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: `fd` is a freshly dup'ed, owned descriptor.
-                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+                // `OwnedFd::try_clone` dups with F_DUPFD_CLOEXEC, same as the
+                // raw call this replaced (AUDIT-unsafe.md, std-only swaps).
+                return self.0.try_clone();
             }
             return self.open_full(
                 Path::new("."),

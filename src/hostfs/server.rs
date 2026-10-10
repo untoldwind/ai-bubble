@@ -82,7 +82,7 @@ pub fn start_host_fs(patterns: &SharedPatterns) {
     );
 
     let _ = HOST_MOUNT_POINT.set(mountpoint.clone());
-    HOST_PID.store(unsafe { libc::getpid() }, Ordering::SeqCst);
+    HOST_PID.store(std::process::id() as i32, Ordering::SeqCst);
 
     // Readiness pipe: the server writes one byte after a successful mount.
     let mut fds: [libc::c_int; 2] = [0; 2];

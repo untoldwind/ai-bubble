@@ -545,7 +545,7 @@ fn check_peer(pair: &UnixStream) -> io::Result<()> {
             cred.pid,
             cred.uid,
             cred.gid,
-            unsafe { libc::getpid() },
+            std::process::id(),
             unsafe { libc::geteuid() },
             unsafe { libc::getegid() },
         )))
@@ -576,9 +576,9 @@ fn peer_cred(fd: RawFd) -> io::Result<libc::ucred> {
 /// The credential comparison of [`check_peer`], split out for a direct
 /// test: a mismatch on any of pid/uid/gid fails.
 fn peer_credentials_ok(cred: &libc::ucred) -> bool {
-    unsafe {
-        cred.pid == libc::getpid() && cred.uid == libc::geteuid() && cred.gid == libc::getegid()
-    }
+    // euid/egid have no std equivalent (AUDIT-unsafe.md); the pid does.
+    (unsafe { cred.uid == libc::geteuid() && cred.gid == libc::getegid() })
+        && cred.pid == std::process::id() as libc::pid_t
 }
 
 /// The connector end of a pre-fork socketpair for mode `S`. Every `OPEN`
