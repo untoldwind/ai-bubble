@@ -600,10 +600,7 @@ pub async fn serve(replies: Replies) {
 /// commands with one reply each. Close on any malformed input (no
 /// banner, no hints, no second chance).
 async fn handle_connection(mut stream: UnixStream, token: [u8; 16]) {
-    let mut conn = FramedRead::new(
-        &mut stream,
-        LinesCodec::new_with_max_length(FRAME_CAP),
-    );
+    let mut conn = FramedRead::new(&mut stream, LinesCodec::new_with_max_length(FRAME_CAP));
     // The token preamble, length-bounded. A mismatch closes silently.
     let preamble = match tokio::time::timeout(TOKEN_TIMEOUT, conn.next()).await {
         Ok(Some(Ok(hex))) => hex,

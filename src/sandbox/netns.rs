@@ -447,9 +447,13 @@ fn isolated_parent(
                         .unwrap_or_else(|e| die(&format!("Can't register DNS UDP socket: {e}")));
                     let mux =
                         crate::ipc::netmux::MuxHandle::<crate::waf::WafSpec>::client(net_pair);
+                    // The HTTP/HTTPS frontend service owns the mux handle; the DNS server
+                    // clones its handle off it. The service holds the accept loops' join
+                    // handles (and their shared connection cap); the loops never end, so
+                    // the service lives until the select! below.
+                    let _http_service = waf::HttpService::new(mux.clone());
                     tokio::spawn(waf::dns::serve_tcp(tcp53, mux.clone()));
-                    tokio::spawn(waf::http::serve_http(tcp80, mux.clone()));
-                    tokio::spawn(waf::https::serve_https(tcp443, mux.clone()));
+                    let _http_loops = _http_service.spawn(tcp80, tcp443);
                     tokio::select! {
                         // The UDP DNS loop never ends; it keeps the runtime
                         // busy while wait_status delivers the exit status.

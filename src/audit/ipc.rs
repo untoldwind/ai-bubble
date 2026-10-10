@@ -351,10 +351,7 @@ pub(crate) async fn hub_reader(
     reply_tx: Sender<UpdReply>,
 ) {
     let mut malformed_reported = false;
-    let mut conn = FramedRead::new(
-        &mut stream,
-        LinesCodec::new_with_max_length(FRAME_CAP),
-    );
+    let mut conn = FramedRead::new(&mut stream, LinesCodec::new_with_max_length(FRAME_CAP));
     let warn = |e: &str, reported: &mut bool| {
         if !*reported {
             *reported = true;

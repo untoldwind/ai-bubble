@@ -44,15 +44,15 @@
 
 pub mod dns;
 pub mod host;
-pub mod http;
-pub mod https;
 
 use std::io;
 
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::ipc::netmux::{MuxHandle, MuxStream, NetSpec};
+use crate::ipc::netmux::{MuxHandle, NetSpec};
+
+pub(crate) mod http_service;
+pub(crate) use http_service::HttpService;
 
 /// The waf mode's command set. Externally tagged (`deny_unknown_fields`
 /// is not supported on internally tagged enums): each frame names its
@@ -115,117 +115,4 @@ pub(crate) async fn resolve_name(mux: &MuxHandle<WafSpec>, name: &str) -> io::Re
     };
     let _ = stream.close().await;
     r
-}
-
-/// Open a raw data stream to `host:port` through the host's `connect`
-/// command: returned only when the host replies `open`.
-pub(crate) async fn connect_target(
-    mux: &MuxHandle<WafSpec>,
-    target: &str,
-) -> io::Result<MuxStream> {
-    pipe_command(
-        mux,
-        WafReq::Connect {
-            target: target.to_string(),
-        },
-        "connect",
-    )
-    .await
-}
-
-/// Like [`connect_target`], but for the host's `tls-connect` command: the
-/// returned stream carries *decrypted* traffic (the host has already done
-/// the TLS client handshake against the real server).
-pub(crate) async fn tls_connect_target(
-    mux: &MuxHandle<WafSpec>,
-    target: &str,
-) -> io::Result<MuxStream> {
-    pipe_command(
-        mux,
-        WafReq::TlsConnect {
-            target: target.to_string(),
-        },
-        "tls-connect",
-    )
-    .await
-}
-
-/// Send a command whose success turns the stream into a raw bidirectional
-/// data pipe; returns that stream once the host replies `open`.
-async fn pipe_command(mux: &MuxHandle<WafSpec>, req: WafReq, what: &str) -> io::Result<MuxStream> {
-    let (reply, mut stream) = mux.open(&req).await?;
-    match reply {
-        WafReply::Open => Ok(stream),
-        WafReply::Denied { reason } => {
-            let _ = stream.close().await;
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{what} denied: {reason}"),
-            ))
-        }
-        WafReply::Failed { reason } => {
-            let _ = stream.close().await;
-            Err(io::Error::other(format!("{what} failed: {reason}")))
-        }
-        _ => {
-            let _ = stream.close().await;
-            Err(io::Error::other(format!("unexpected reply to {what}")))
-        }
-    }
-}
-
-/// Ask the host for a leaf certificate (and key) for the HTTPS MITM,
-/// signed by the waf CA: DER cert + DER PKCS#8 key, base64'd in the
-/// reply frame.
-pub(crate) async fn tls_cert(
-    mux: &MuxHandle<WafSpec>,
-    name: &str,
-) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let (reply, mut stream) = mux
-        .open(&WafReq::TlsCert {
-            name: name.to_string(),
-        })
-        .await?;
-    let r = match reply {
-        WafReply::Cert { cert, key } => {
-            let dec = |s: &str| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(s)
-                    .map_err(|e| io::Error::other(format!("bad tls-cert reply: {e}")))
-            };
-            match (dec(&cert), dec(&key)) {
-                (Ok(cert), Ok(key)) => Ok((cert, key)),
-                (Err(e), _) | (_, Err(e)) => Err(e),
-            }
-        }
-        WafReply::Denied { reason } => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("tls-cert {name} denied: {reason}"),
-        )),
-        WafReply::Failed { reason } => Err(io::Error::other(format!("tls-cert {name}: {reason}"))),
-        _ => Err(io::Error::other("unexpected reply to tls-cert")),
-    };
-    let _ = stream.close().await;
-    r
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `connect_target` must surface the host's denial as an error of
-    /// kind `PermissionDenied` (the frontends map that to 403).
-    #[tokio::test]
-    async fn connect_target_reports_denial() {
-        let (a, b) = crate::ipc::netmux::pair().unwrap();
-        tokio::spawn(host::serve_host(
-            a,
-            crate::proxy::allowlist::shared(vec![]),
-            false,
-        ));
-
-        let mux = MuxHandle::<WafSpec>::client(b);
-        let err = connect_target(&mux, "example.com:443").await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-    }
 }
