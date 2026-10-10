@@ -24,9 +24,7 @@
 //! mode wants.
 
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -38,9 +36,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::LazyConfigAcceptor;
 
 use super::{WafSpec, tls_cert, tls_connect_target};
 use crate::connlimit::ConnLimit;
@@ -79,23 +76,36 @@ pub async fn serve_https(listener: TcpListener, mux: MuxHandle<WafSpec>) {
     }
 }
 
-/// One connection: read the TLS ClientHello, extract the SNI, obtain a
-/// forged certificate for it from the host, terminate TLS and tunnel the
-/// plaintext to the real endpoint through the host's `tls-connect`.
-/// Anything that is not a ClientHello with a SNI (or whose SNI is denied)
-/// is dropped.
-async fn handle_tls(mut tcp: TcpStream, mux: MuxHandle<WafSpec>) {
+/// One connection: let rustls parse the ClientHello (via
+/// [`LazyConfigAcceptor`], which buffers and replays the hello bytes
+/// itself), extract the SNI, obtain a forged certificate for it from the
+/// host, terminate TLS and tunnel the plaintext to the real endpoint
+/// through the host's `tls-connect`. Anything that is not a ClientHello
+/// with a SNI (or whose SNI is denied) is dropped.
+async fn handle_tls(tcp: TcpStream, mux: MuxHandle<WafSpec>) {
     // Slowloris guard (AUDIT.md, resource limits on the frontends): the ClientHello — and the rest of
     // the TLS handshake, which the client could equally stall — must
     // complete within HELLO_TIMEOUT. On timeout the connection is simply
-    // dropped.
-    let (hello, sni) = match tokio::time::timeout(HELLO_TIMEOUT, read_client_hello(&mut tcp)).await
+    // dropped. `LazyConfigAcceptor` resolves once a complete ClientHello
+    // has arrived; the second timeout below bounds the rest of the
+    // handshake.
+    let start = match tokio::time::timeout(
+        HELLO_TIMEOUT,
+        LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp),
+    )
+    .await
     {
-        Ok(Some(pair)) => pair,
-        _ => return, // timeout, EOF or not a usable TLS hello: just close
+        Ok(Ok(start)) => start,
+        Ok(Err(_)) => return, // not a usable TLS hello: just close
+        Err(_) => return,     // timeout: drop the connection
     };
+    let hello = start.client_hello();
+    let sni = hello.server_name().and_then(printable_sni);
     let Some(sni) = sni else {
-        return; // no SNI: we cannot know the target, so nothing to forward
+        // Either no SNI (we cannot know the target, so nothing to
+        // forward) or one that fails the printable-ASCII check (AUDIT.md
+        // L4: control bytes must not reach the host side).
+        return;
     };
     let (cert, key) = match tls_cert(&mux, &sni).await {
         Ok(pair) => pair,
@@ -111,15 +121,10 @@ async fn handle_tls(mut tcp: TcpStream, mux: MuxHandle<WafSpec>) {
             return;
         }
     };
-    let acceptor = TlsAcceptor::from(Arc::new(config));
-    // The hello bytes were already consumed from the socket; hand them
-    // back to rustls via a prefix stream. The client's side of the
-    // handshake is time-boxed too (see the HELLO_TIMEOUT doc).
-    let mut tls = match tokio::time::timeout(
-        HELLO_TIMEOUT,
-        acceptor.accept(PrefixedStream::new(hello, tcp)),
-    )
-    .await
+    // The client's side of the handshake is time-boxed too (see the
+    // HELLO_TIMEOUT doc).
+    let mut tls = match tokio::time::timeout(HELLO_TIMEOUT, start.into_stream(Arc::new(config)))
+        .await
     {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
@@ -259,208 +264,18 @@ fn server_config(cert: &[u8], key: &[u8]) -> io::Result<rustls::ServerConfig> {
         .map_err(|e| io::Error::other(format!("bad leaf certificate from the host: {e}")))
 }
 
-/// A [`TcpStream`] prefixed with bytes already read from it (the TLS
-/// ClientHello consumed during SNI extraction): reads first replay the
-/// prefix, then continue with the socket.
-struct PrefixedStream {
-    prefix: Vec<u8>,
-    pos: usize,
-    inner: TcpStream,
-}
-
-impl PrefixedStream {
-    fn new(prefix: Vec<u8>, inner: TcpStream) -> Self {
-        PrefixedStream {
-            prefix,
-            pos: 0,
-            inner,
-        }
+/// Validate and normalize a SNI that rustls has already parsed out of a
+/// ClientHello: only printable ASCII, no backslash (AUDIT.md L4) —
+/// control bytes here would be re-emitted verbatim into audit records
+/// and error strings on the host (`tls-cert`); refusing them keeps those
+/// escape-proof. Returned lowercased, as the rest of the waf compares
+/// names case-insensitively.
+fn printable_sni(sni: &str) -> Option<String> {
+    if !sni.is_empty() && sni.bytes().all(|b| b.is_ascii_graphic()) && !sni.contains('\\') {
+        Some(sni.to_ascii_lowercase())
+    } else {
+        None
     }
-}
-
-impl AsyncRead for PrefixedStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.pos < self.prefix.len() {
-            let remaining = &self.prefix[self.pos..];
-            let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            self.pos += n;
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for PrefixedStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-/// Read the ClientHello (possibly spanning several TLS records until the
-/// handshake message is complete, bounded by a sane limit) and extract
-/// the SNI. Returns the bytes read so far — the hello itself, ready to be
-/// replayed — and the SNI if it was found.
-async fn read_client_hello(tcp: &mut TcpStream) -> Option<(Vec<u8>, Option<String>)> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let mut hello_len = None;
-    loop {
-        match tcp.read(&mut chunk).await {
-            Ok(0) => return None,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        }
-        if buf.len() > 64 * 1024 {
-            return None;
-        }
-        if hello_len.is_none() {
-            // First record: a 5-byte header (content type, version,
-            // length), then the handshake message header (type, 3-byte
-            // length).
-            if buf.len() < 5 {
-                continue;
-            }
-            if buf[0] != 0x16 {
-                return None; // not a handshake record
-            }
-            let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-            if record_len == 0 || record_len > 16 * 1024 {
-                return None;
-            }
-            if buf.len() < 9 {
-                continue;
-            }
-            if buf[5] != 0x01 {
-                return None; // not a ClientHello
-            }
-            let len = ((buf[6] as usize) << 16) | ((buf[7] as usize) << 8) | buf[8] as usize;
-            if len == 0 || len > 64 * 1024 {
-                return None;
-            }
-            hello_len = Some(len);
-        }
-        let len = hello_len.unwrap();
-        if buf.len() < 9 + len {
-            continue; // the hello is not complete yet: keep reading
-        }
-        let sni = sni_from_client_hello(&buf[9..9 + len]);
-        // NET-4: truncate the replay prefix at the *record* boundary that
-        // covers the end of the hello, not at the handshake-message
-        // boundary. Truncating at `9 + len` dropped the tail of a
-        // coalesced record (e.g. a ChangeCipherSpec sent in the same TCP
-        // segment) from the replay — rustls then saw a torn stream and
-        // the handshake failed — and could not represent a ClientHello
-        // fragmented across records at all. The scan walks the record
-        // headers from the start; the first boundary at or past the
-        // hello's end is the cut point. A boundary past `buf.len()` means
-        // the last record is only partially read: everything read so far
-        // must be replayed, and the record's remainder is still in the
-        // socket for the acceptor to read.
-        let mut pos = 0usize;
-        let mut end = buf.len();
-        while pos + 5 <= buf.len() {
-            let rlen = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
-            if rlen == 0 || rlen > 16 * 1024 {
-                return None; // malformed record header
-            }
-            pos += 5 + rlen;
-            if pos >= 9 + len {
-                end = pos.min(buf.len());
-                break;
-            }
-        }
-        buf.truncate(end);
-        return Some((buf, sni));
-    }
-}
-
-/// Extract the SNI host name from a ClientHello body (the handshake
-/// message without its 4-byte header): parse down to the `server_name`
-/// (type 0x0000) extension and return its `host_name` entry, lowercased.
-/// `None` means: no SNI, or a structure this parser does not understand.
-fn sni_from_client_hello(hello: &[u8]) -> Option<String> {
-    // client version (2) + random (32)
-    let mut pos = 34usize;
-    // session id
-    let sid_len = *hello.get(pos)?;
-    pos += 1 + usize::from(sid_len);
-    // cipher suites
-    if pos + 2 > hello.len() {
-        return None;
-    }
-    let cipher_len = u16::from_be_bytes([hello[pos], hello[pos + 1]]) as usize;
-    pos += 2 + cipher_len;
-    // compression methods
-    let comp_len = *hello.get(pos)?;
-    pos += 1 + usize::from(comp_len);
-    if pos + 2 > hello.len() {
-        return None;
-    }
-    let ext_len = u16::from_be_bytes([hello[pos], hello[pos + 1]]) as usize;
-    pos += 2;
-    let ext_end = (pos + ext_len).min(hello.len());
-    while pos + 4 <= ext_end {
-        let etype = u16::from_be_bytes([hello[pos], hello[pos + 1]]);
-        let elen = u16::from_be_bytes([hello[pos + 2], hello[pos + 3]]) as usize;
-        pos += 4;
-        if pos + elen > ext_end {
-            return None;
-        }
-        if etype == 0x0000 {
-            // server_name: a list of named entries; take the host_name
-            // (type 0) one.
-            let data = &hello[pos..pos + elen];
-            if data.len() < 2 {
-                return None;
-            }
-            let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-            let list_end = (2 + list_len).min(data.len());
-            let mut p = 2usize;
-            while p + 3 <= list_end {
-                let name_type = data[p];
-                let name_len = u16::from_be_bytes([data[p + 1], data[p + 2]]) as usize;
-                p += 3;
-                if p + name_len > list_end {
-                    return None;
-                }
-                if name_type == 0 {
-                    let name = &data[p..p + name_len];
-                    // AUDIT.md L4: only printable ASCII, no backslash.
-                    // Control bytes here would be re-emitted verbatim
-                    // into audit records and error strings on the host
-                    // (`tls-cert`); refusing non-printable bytes keeps
-                    // those escape-proof.
-                    return if name.iter().all(|&b| b.is_ascii_graphic() && b != b'\\') {
-                        Some(String::from_utf8_lossy(name).to_ascii_lowercase())
-                    } else {
-                        None
-                    };
-                }
-                p += name_len;
-            }
-            return None;
-        }
-        pos += elen;
-    }
-    None
 }
 
 #[cfg(test)]
@@ -472,71 +287,29 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsConnector;
 
-    /// Build a ClientHello record with the given SNI (or none).
-    fn make_client_hello(sni: Option<&str>) -> Vec<u8> {
-        let mut exts = Vec::new();
-        if let Some(sni) = sni {
-            let mut entry = vec![0u8]; // host_name
-            entry.extend_from_slice(&(sni.len() as u16).to_be_bytes());
-            entry.extend_from_slice(sni.as_bytes());
-            let mut list = (entry.len() as u16).to_be_bytes().to_vec();
-            list.extend_from_slice(&entry);
-            exts.extend_from_slice(&0u16.to_be_bytes()); // server_name type
-            exts.extend_from_slice(&(list.len() as u16).to_be_bytes());
-            exts.extend_from_slice(&list);
-        }
-        let mut body = Vec::new();
-        body.extend_from_slice(&[0x03, 0x03]); // client version
-        body.extend_from_slice(&[0u8; 32]); // random
-        body.push(0); // session id
-        body.extend_from_slice(&2u16.to_be_bytes()); // one cipher suite
-        body.extend_from_slice(&[0x13, 0x01]);
-        body.push(1); // one compression method
-        body.push(0);
-        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
-        body.extend_from_slice(&exts);
-
-        let mut handshake = vec![0x01]; // ClientHello type
-        handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
-        handshake.extend_from_slice(&body);
-
-        let mut record = vec![0x16, 0x03, 0x01];
-        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        record.extend_from_slice(&handshake);
-        record
-    }
-
+    /// The SNI validation behind AUDIT.md L4: the SNI must consist of
+    /// printable ASCII only — control bytes would be re-emitted verbatim
+    /// into the host's audit records and error strings.
     #[test]
-    fn sni_extraction() {
-        let record = make_client_hello(Some("Example.COM"));
-        // Strip the record header (5) and handshake header (4) bytes.
+    fn sni_must_be_printable() {
         assert_eq!(
-            sni_from_client_hello(&record[9..]).as_deref(),
+            printable_sni("Example.COM").as_deref(),
             Some("example.com")
         );
-
-        // AUDIT.md L4: the SNI must consist of printable ASCII only —
-        // control bytes would be re-emitted verbatim into the host's
-        // audit records and error strings.
         for evil in [
             "evil\nexample.com",
             "evil\r.com",
             "e\x01vil.com",
             "evil\x7f.com",
+            "evil\\example.com",
+            "",
         ] {
-            let record = make_client_hello(Some(evil));
             assert_eq!(
-                sni_from_client_hello(&record[9..]),
+                printable_sni(evil),
                 None,
                 "SNI {evil:?} must be refused"
             );
         }
-
-        let record = make_client_hello(None);
-        assert_eq!(sni_from_client_hello(&record[9..]), None);
-
-        // Truncated input is rejected outright.
-        assert_eq!(sni_from_client_hello(&record[9..20]), None);
     }
 
     /// A stand-in for the host command server: `tls-cert` requests are
@@ -789,7 +562,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let _ = TlsAcceptor::from(Arc::new(config))
+            let _ = tokio_rustls::TlsAcceptor::from(Arc::new(config))
                 .accept(tcp)
                 .await
                 .unwrap();
