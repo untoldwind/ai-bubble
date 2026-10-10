@@ -29,8 +29,8 @@
 //!    the connection with no hints.
 //! 2. JSON-line commands; each gets exactly one JSON-line reply. Lines are
 //!    capped at [`crate::audit`] frame cap (64 KiB) and read with
-//!    [`crate::line::read_frame_limited`]; anything malformed closes the
-//!    connection.
+//!    `tokio_util::codec::{FramedRead, LinesCodec}`; anything malformed
+//!    closes the connection.
 //!
 //! ```text
 //! → <hex token>
@@ -115,9 +115,12 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::Receiver;
+use tokio_util::codec::{FramedRead, LinesCodec};
+
+use futures_util::StreamExt;
 
 use crate::spec::hostfs::Mapping;
-use crate::{audit, line, sandbox};
+use crate::{audit, sandbox};
 
 /// Cap for control-protocol command and reply lines: the same budget as
 /// the inter-process frames (`waf/mod.rs` `MAX_REPLY` precedent).
@@ -597,22 +600,21 @@ pub async fn serve(replies: Replies) {
 /// commands with one reply each. Close on any malformed input (no
 /// banner, no hints, no second chance).
 async fn handle_connection(mut stream: UnixStream, token: [u8; 16]) {
+    let mut conn = FramedRead::new(
+        &mut stream,
+        LinesCodec::new_with_max_length(FRAME_CAP),
+    );
     // The token preamble, length-bounded. A mismatch closes silently.
-    let preamble = match tokio::time::timeout(
-        TOKEN_TIMEOUT,
-        line::read_line_limited(&mut stream, 128),
-    )
-    .await
-    {
-        Ok(Ok(Some(hex))) => hex,
+    let preamble = match tokio::time::timeout(TOKEN_TIMEOUT, conn.next()).await {
+        Ok(Some(Ok(hex))) => hex,
         _ => return,
     };
     if !ct_eq_hex(&preamble, &token) {
         return;
     }
     loop {
-        match line::read_frame_limited(&mut stream, FRAME_CAP).await {
-            Ok(Some(cmd)) => {
+        match conn.next().await {
+            Some(Ok(cmd)) => {
                 // Malformed input (non-JSON, no "cmd") closes the
                 // connection without a reply; a well-formed command gets
                 // exactly one reply (errors included).
@@ -627,7 +629,7 @@ async fn handle_connection(mut stream: UnixStream, token: [u8; 16]) {
                 let mut line = serde_json::to_string(&reply)
                     .unwrap_or_else(|_| r#"{"ok":false,"err":"internal error"}"#.to_string());
                 line.push('\n');
-                if stream.write_all(line.as_bytes()).await.is_err() {
+                if conn.get_mut().write_all(line.as_bytes()).await.is_err() {
                     return;
                 }
             }
@@ -1317,9 +1319,13 @@ pub(crate) async fn fs_child_loop(
     policy: crate::hostfs::SharedPatterns,
 ) {
     let mut malformed_reported = false;
+    let mut conn = FramedRead::new(
+        &mut stream,
+        LinesCodec::new_with_max_length(audit::FRAME_CAP),
+    );
     loop {
-        match line::read_frame_limited(&mut stream, audit::FRAME_CAP).await {
-            Ok(Some(frame)) => {
+        match conn.next().await {
+            Some(Ok(frame)) => {
                 let r = match serde_json::from_str::<UpdFrame>(&frame) {
                     Ok(parsed) => fs_apply(parsed.upd, &policy).await,
                     Err(e) => {
@@ -1336,8 +1342,8 @@ pub(crate) async fn fs_child_loop(
                 write_reply(&reply, r).await;
             }
             // Clean EOF: the launcher said "the run is ending".
-            Ok(None) => return,
-            Err(e) => {
+            None => return,
+            Some(Err(e)) => {
                 if !malformed_reported {
                     eprintln!("warning: control channel error: {e}");
                 }

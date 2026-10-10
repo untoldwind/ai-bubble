@@ -40,7 +40,7 @@ mod cli;
 mod connlimit;
 mod hostfs;
 mod ipc;
-mod line;
+
 mod proxy;
 mod sandbox;
 mod spec;

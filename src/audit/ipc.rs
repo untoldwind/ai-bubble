@@ -36,6 +36,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::Sender;
+use tokio_util::codec::{FramedRead, LinesCodec};
+
+use futures_util::StreamExt;
 
 use super::Event;
 
@@ -348,6 +351,10 @@ pub(crate) async fn hub_reader(
     reply_tx: Sender<UpdReply>,
 ) {
     let mut malformed_reported = false;
+    let mut conn = FramedRead::new(
+        &mut stream,
+        LinesCodec::new_with_max_length(FRAME_CAP),
+    );
     let warn = |e: &str, reported: &mut bool| {
         if !*reported {
             *reported = true;
@@ -357,8 +364,8 @@ pub(crate) async fn hub_reader(
         }
     };
     loop {
-        match crate::line::read_frame_limited(&mut stream, FRAME_CAP).await {
-            Ok(Some(line)) => {
+        match conn.next().await {
+            Some(Ok(line)) => {
                 match serde_json::from_str::<Event>(&line) {
                     Ok(mut event) => {
                         stamp_source(&mut event, role);
@@ -391,8 +398,8 @@ pub(crate) async fn hub_reader(
                 }
             }
             // Clean EOF: the child flushed its queue and closed.
-            Ok(None) => return,
-            Err(e) => {
+            None => return,
+            Some(Err(e)) => {
                 warn(&e.to_string(), &mut malformed_reported);
                 return;
             }
