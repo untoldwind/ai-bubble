@@ -125,8 +125,16 @@ pub(crate) unsafe fn open() -> Pty {
         let path = std::ffi::CStr::from_ptr(buf.as_ptr())
             .to_string_lossy()
             .into_owned();
+        // The slave path must be passed to open(2) as a proper C string:
+        // a `String`'s `as_ptr()` is not NUL-terminated, and `open` would
+        // read past the end of it (heap-layout-dependent ENOENT — the bug
+        // that only fired for some specs' allocation patterns).
+        let path_c = match std::ffi::CString::new(path.clone()) {
+            Ok(c) => c,
+            Err(_) => die_with_error("Can't open the pseudo-terminal slave: NUL in the path"),
+        };
         let slave = libc::open(
-            path.as_ptr() as *const libc::c_char,
+            path_c.as_ptr(),
             libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
         );
         if slave < 0 {

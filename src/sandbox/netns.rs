@@ -38,10 +38,10 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::Path;
 
-use crate::proxy::{PROXY_ADDR, PROXY_URL};
+use crate::proxy::PROXY_URL;
 use crate::sandbox::{
     die, die_with_error, exit_with_status, handle_die_with_parent, pidns_and_exec, userns_id,
     write_id_map,
@@ -313,24 +313,17 @@ fn isolated_parent(
         // at 127.0.0.2 are reachable.
         bring_up_loopback();
 
-        // Set up the mode's pre-fork state: the proxy's in-sandbox
-        // listener (on 127.0.0.2) and its environment. The waf services
-        // bind their own listeners (DNS on 127.0.0.2:53, HTTP/HTTPS on
-        // 127.0.0.2:80/443) later, once the mux handles exist (after the
-        // child fork, see the serving block below). Entries from the
-        // spec's `env` section are applied afterwards and so win over
-        // these: an explicit spec value is the user's authoritative
-        // choice.
-        let mut proxy_listener = None;
+        // Set up the mode's pre-fork environment. The proxy binds its
+        // in-sandbox listener (on 127.0.0.2) in `ProxyService::new`, the
+        // waf services bind their own listeners (DNS on 127.0.0.2:53,
+        // HTTP/HTTPS on 127.0.0.2:80/443) — all after the child fork,
+        // once the mux handles exist (see the serving block below).
+        // Entries from the spec's `env` section are applied afterwards
+        // and so win over these: an explicit spec value is the user's
+        // authoritative choice.
         let mut child_env: BTreeMap<String, String> = BTreeMap::new();
         match net.mode {
             NetMode::Proxy => {
-                let listener = match std::net::TcpListener::bind(PROXY_ADDR) {
-                    Ok(l) => l,
-                    Err(e) => die(&format!("Can't bind proxy listener on {PROXY_ADDR}: {e}")),
-                };
-                let _ = libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-                proxy_listener = Some(listener);
                 // Make standard tools (curl, wget, git, ...) use the proxy
                 // by adding the proxy variables to the sandbox's isolated
                 // environment.
@@ -354,11 +347,7 @@ fn isolated_parent(
                 );
             }
             NetMode::Waf => {
-                // No listeners to bind here: the waf services bind their
-                // own listeners (DNS on 127.0.0.2:53, HTTP/HTTPS on
-                // 127.0.0.2:80/443) once the mux handles exist, after the
-                // child fork (see the serving block below).
-                // No proxy variables either — the DNS server and the
+                // No proxy variables — the DNS server and the
                 // 127.0.0.2 servers take care of the redirection. The waf
                 // mode injects its MITM CA as the sandbox's trust anchor
                 // (see `main`); point OpenSSL-based clients at it
@@ -410,21 +399,18 @@ fn isolated_parent(
             crate::audit::init_channel_sink();
             let status = match net.mode {
                 NetMode::Proxy => {
-                    let Some(listener) = proxy_listener else {
-                        unreachable!("proxy mode binds a listener")
-                    };
-                    let _ = listener.set_nonblocking(true);
-                    let l = tokio::net::TcpListener::from_std(listener)
-                        .unwrap_or_else(|e| die(&format!("Can't register proxy listener: {e}")));
+                    // The proxy service owns the mux handle and binds
+                    // its listener (HTTP CONNECT on 127.0.0.2:3128)
+                    // here, like the waf services; the accept loop
+                    // never ends, so the service lives until
+                    // `wait_status` below reports the child's exit.
                     let mux =
                         crate::ipc::netmux::MuxHandle::<crate::proxy::ProxySpec>::client(net_pair);
-                    tokio::select! {
-                        st = wait_status(child_pid) => st,
-                        // The proxy accept loop never ends.
-                        _ = crate::proxy::serve_sandbox_proxy(l, mux) => {
-                            unreachable!("proxy accept loop never ends")
-                        }
-                    }
+                    let _proxy_service = crate::proxy::ProxyService::new(mux);
+                    let _loops = _proxy_service.spawn();
+                    // The accept loop keeps the runtime busy while
+                    // wait_status delivers the exit status.
+                    wait_status(child_pid).await
                 }
                 NetMode::Waf => {
                     // Both waf services own the mux handle (cloned off

@@ -22,7 +22,7 @@ pub mod ipfilter;
 pub mod sandbox;
 
 pub use self::connector::serve_connector;
-pub use self::sandbox::serve_sandbox_proxy;
+pub(crate) use self::sandbox::ProxyService;
 
 use crate::ipc::netmux::NetSpec;
 use serde::{Deserialize, Serialize};
@@ -117,12 +117,10 @@ mod tests {
         ));
 
         // Sandbox-side CONNECT proxy on the other end.
-        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
-        tokio::spawn(serve_sandbox_proxy(
-            proxy,
-            crate::ipc::netmux::MuxHandle::<ProxySpec>::client(b),
-        ));
+        let proxy = ProxyService::for_tests(crate::ipc::netmux::MuxHandle::<ProxySpec>::client(b));
+        let proxy_addr = proxy.addr();
+        // The loop is detached: its join handle is not needed here.
+        proxy.spawn();
 
         // Client: CONNECT, then echo through the tunnel.
         let mut c = TcpStream::connect(proxy_addr).await.unwrap();
