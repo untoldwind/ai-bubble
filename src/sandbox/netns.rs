@@ -313,13 +313,15 @@ fn isolated_parent(
         // at 127.0.0.2 are reachable.
         bring_up_loopback();
 
-        // Set up the mode's in-sandbox listeners (all on 127.0.0.2, the
-        // address the waf DNS server resolves to) and its environment
-        // before forking the child. Entries from the spec's `env` section
-        // are applied afterwards and so win over these: an explicit spec
-        // value is the user's authoritative choice.
+        // Set up the mode's pre-fork state: the proxy's in-sandbox
+        // listener (on 127.0.0.2) and its environment. The waf services
+        // bind their own listeners (DNS on 127.0.0.2:53, HTTP/HTTPS on
+        // 127.0.0.2:80/443) later, once the mux handles exist (after the
+        // child fork, see the serving block below). Entries from the
+        // spec's `env` section are applied afterwards and so win over
+        // these: an explicit spec value is the user's authoritative
+        // choice.
         let mut proxy_listener = None;
-        let mut waf_listeners = None;
         let mut child_env: BTreeMap<String, String> = BTreeMap::new();
         match net.mode {
             NetMode::Proxy => {
@@ -352,22 +354,11 @@ fn isolated_parent(
                 );
             }
             NetMode::Waf => {
-                let (tcp53, tcp80, tcp443) = (
-                    std::net::TcpListener::bind("127.0.0.2:53"),
-                    std::net::TcpListener::bind("127.0.0.2:80"),
-                    std::net::TcpListener::bind("127.0.0.2:443"),
-                );
-                let udp53 = std::net::UdpSocket::bind("127.0.0.2:53");
-                let (tcp53, tcp80, tcp443, udp53) = match (tcp53, tcp80, tcp443, udp53) {
-                    (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
-                    _ => die("Can't bind the waf listeners on 127.0.0.2 (ports 53, 80, 443)"),
-                };
-                for fd in [&tcp53, &tcp80, &tcp443] {
-                    let _ = libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-                }
-                let _ = libc::fcntl(udp53.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-                waf_listeners = Some((tcp53, tcp80, tcp443, udp53));
-                // No proxy variables here — the DNS server and the
+                // No listeners to bind here: the waf services bind their
+                // own listeners (DNS on 127.0.0.2:53, HTTP/HTTPS on
+                // 127.0.0.2:80/443) once the mux handles exist, after the
+                // child fork (see the serving block below).
+                // No proxy variables either — the DNS server and the
                 // 127.0.0.2 servers take care of the redirection. The waf
                 // mode injects its MITM CA as the sandbox's trust anchor
                 // (see `main`); point OpenSSL-based clients at it
@@ -417,8 +408,11 @@ fn isolated_parent(
             // is no P-side control loop any more (the allow-list is
             // A-local), so the channel's read half stays unused.
             crate::audit::init_channel_sink();
-            let status = match (net.mode, proxy_listener, waf_listeners) {
-                (NetMode::Proxy, Some(listener), _) => {
+            let status = match net.mode {
+                NetMode::Proxy => {
+                    let Some(listener) = proxy_listener else {
+                        unreachable!("proxy mode binds a listener")
+                    };
                     let _ = listener.set_nonblocking(true);
                     let l = tokio::net::TcpListener::from_std(listener)
                         .unwrap_or_else(|e| die(&format!("Can't register proxy listener: {e}")));
@@ -432,38 +426,23 @@ fn isolated_parent(
                         }
                     }
                 }
-                (NetMode::Waf, _, Some((tcp53, tcp80, tcp443, udp53))) => {
-                    let _ = tcp53.set_nonblocking(true);
-                    let _ = tcp80.set_nonblocking(true);
-                    let _ = tcp443.set_nonblocking(true);
-                    let _ = udp53.set_nonblocking(true);
-                    let tcp53 = tokio::net::TcpListener::from_std(tcp53)
-                        .unwrap_or_else(|e| die(&format!("Can't register DNS TCP listener: {e}")));
-                    let tcp80 = tokio::net::TcpListener::from_std(tcp80)
-                        .unwrap_or_else(|e| die(&format!("Can't register HTTP listener: {e}")));
-                    let tcp443 = tokio::net::TcpListener::from_std(tcp443)
-                        .unwrap_or_else(|e| die(&format!("Can't register HTTPS listener: {e}")));
-                    let udp53 = tokio::net::UdpSocket::from_std(udp53)
-                        .unwrap_or_else(|e| die(&format!("Can't register DNS UDP socket: {e}")));
+                NetMode::Waf => {
+                    // Both waf services own the mux handle (cloned off
+                    // the one client handle); each binds its own
+                    // listeners here and holds its accept loops' join
+                    // handles (and the DNS-over-TCP connection cap). The
+                    // loops never end, so the services live until
+                    // `wait_status` below reports the child's exit.
                     let mux =
                         crate::ipc::netmux::MuxHandle::<crate::waf::WafSpec>::client(net_pair);
-                    // The HTTP/HTTPS frontend service owns the mux handle; the DNS server
-                    // clones its handle off it. The service holds the accept loops' join
-                    // handles (and their shared connection cap); the loops never end, so
-                    // the service lives until the select! below.
+                    let _dns_service = waf::DnsService::new(mux.clone());
                     let _http_service = waf::HttpService::new(mux.clone());
-                    tokio::spawn(waf::dns::serve_tcp(tcp53, mux.clone()));
-                    let _http_loops = _http_service.spawn(tcp80, tcp443);
-                    tokio::select! {
-                        // The UDP DNS loop never ends; it keeps the runtime
-                        // busy while wait_status delivers the exit status.
-                        _ = waf::dns::serve_udp(udp53, mux) => {
-                            unreachable!("DNS accept loop never ends")
-                        }
-                        st = wait_status(child_pid) => st,
-                    }
+                    let _dns_loops = _dns_service.spawn();
+                    let _http_loops = _http_service.spawn();
+                    // The accept loops keep the runtime busy while
+                    // wait_status delivers the exit status.
+                    wait_status(child_pid).await
                 }
-                _ => unreachable!("mode and listeners agree"),
             };
             // Flush the last batch into the connector's still-open channel
             // read end. When the writer task ends it closes the channel,

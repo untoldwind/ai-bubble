@@ -1,4 +1,7 @@
-//! The in-sandbox DNS server (127.0.0.2:53).
+//! The in-sandbox DNS server (127.0.0.2:53) as one service:
+//! [`DnsService`], DNS over UDP (the transport glibc and most resolvers
+//! use first) and DNS over TCP (the fallback transport resolvers use
+//! for larger replies), both on port 53.
 //!
 //! Runs inside the sandbox network namespace (process P of the waf mode,
 //! see `crate::sandbox::netns`). It answers every name-resolution question by
@@ -13,9 +16,17 @@
 //! A-queries about allowed names are answered with the redirect address;
 //! everything else is answered with NXDOMAIN, SERVFAIL (host unreachable)
 //! or FORMERR (unsupported query).
+//!
+//! Like [`super::http::HttpService`], the struct owns the mux
+//! handle the server forwards through and its own listeners, bound in
+//! [`DnsService::new`] and spawned by [`DnsService::spawn`]; the
+//! connection cap bounds the DNS-over-TCP accept loop (AUDIT.md,
+//! resource limits on the frontends; UDP is connectionless and needs
+//! no such guard).
 
 use simple_dns::rdata::{A, RData};
 use simple_dns::{CLASS, OPCODE, Packet, PacketFlag, QCLASS, QTYPE, RCODE, ResourceRecord};
+use std::os::fd::AsRawFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -39,41 +50,173 @@ fn redirect_addr() -> std::net::Ipv4Addr {
         .expect("redirect address")
 }
 
-/// Serve DNS over UDP on `socket`: the transport glibc and most resolvers
-/// use first. Runs until the socket errors out.
-pub async fn serve_udp(socket: UdpSocket, mux: MuxHandle<WafSpec>) {
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
-            return;
-        };
-        let response = reply(&mux, &buf[..len]).await;
-        if socket.send_to(&response, peer).await.is_err() {
-            return;
+/// The DNS transport address: the in-sandbox loopback alias the waf
+/// DNS server is authoritative for.
+const DNS_ADDR: &str = "127.0.0.2:53";
+
+/// The in-sandbox DNS server as one service: the mux handle it forwards
+/// through, the connection cap of the DNS-over-TCP accept loop and its
+/// own UDP socket and TCP listener on 127.0.0.2:53, bound by
+/// [`DnsService::new`].
+pub(crate) struct DnsService {
+    mux: MuxHandle<WafSpec>,
+    limit: std::sync::Arc<ConnLimit>,
+    /// The std listener and socket bound in [`DnsService::new`];
+    /// [`DnsService::spawn`] registers clones of them with P's tokio
+    /// runtime.
+    tcp: std::net::TcpListener,
+    udp: std::net::UdpSocket,
+}
+
+impl Clone for DnsService {
+    fn clone(&self) -> Self {
+        DnsService {
+            mux: self.mux.clone(),
+            limit: std::sync::Arc::clone(&self.limit),
+            // `dup`s of the same sockets: the loop clones are cheap and
+            // never bind or close the port.
+            tcp: clone_socket(&self.tcp),
+            udp: clone_socket(&self.udp),
         }
     }
 }
 
-/// Serve DNS over TCP (2-byte length-prefixed messages): the fallback
-/// transport resolvers use for larger replies. Runs until the listener
-/// errors out. Concurrent connections are capped (see
-/// [`crate::connlimit`]); at capacity the newly accepted connection is
-/// dropped immediately instead of spawning a task for it.
-pub async fn serve_tcp(listener: TcpListener, mux: MuxHandle<WafSpec>) {
-    let limit = ConnLimit::new();
-    loop {
-        let Ok((tcp, _)) = listener.accept().await else {
-            return;
-        };
-        let Some(guard) = limit.try_acquire() else {
-            continue; // at capacity: drop the connection
-        };
-        let mux = mux.clone();
-        tokio::spawn(async move {
-            let _guard = guard;
-            let _ = serve_tcp_conn(tcp, &mux).await;
-        });
+/// `dup` a socket; a failed dup is a broken sandbox, not a per-connection
+/// condition.
+fn clone_socket<S>(socket: &S) -> S
+where
+    S: std::os::fd::AsFd + From<std::os::fd::OwnedFd>,
+{
+    let owned = socket
+        .as_fd()
+        .try_clone_to_owned()
+        .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't clone a waf DNS socket: {e}")));
+    S::from(owned)
+}
+
+/// Bind a DNS listener/socket on port 53, `SOCK_CLOEXEC` (the exec'd
+/// sandboxed command must never see it).
+fn bind_dns_tcp() -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind(DNS_ADDR).unwrap_or_else(|e| {
+        crate::sandbox::die(&format!(
+            "Can't bind waf DNS TCP listener on {DNS_ADDR}: {e}"
+        ))
+    });
+    let _ = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    listener
+}
+
+fn bind_dns_udp() -> std::net::UdpSocket {
+    let socket = std::net::UdpSocket::bind(DNS_ADDR).unwrap_or_else(|e| {
+        crate::sandbox::die(&format!("Can't bind waf DNS UDP socket on {DNS_ADDR}: {e}"))
+    });
+    let _ = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    socket
+}
+
+impl DnsService {
+    /// A service forwarding through the given mux handle, with the
+    /// default connection cap and its own UDP + TCP listeners on
+    /// 127.0.0.2:53 already bound. Runs in process P, inside the sandbox
+    /// network namespace.
+    pub(crate) fn new(mux: MuxHandle<WafSpec>) -> Self {
+        DnsService {
+            mux,
+            limit: ConnLimit::new(),
+            tcp: bind_dns_tcp(),
+            udp: bind_dns_udp(),
+        }
     }
+
+    /// Test-only construction: the unit tests must not claim
+    /// 127.0.0.2:53 (they run unprivileged, and parallel test runs
+    /// would collide anyway); they bind ephemeral ports instead.
+    #[cfg(test)]
+    fn for_tests(mux: MuxHandle<WafSpec>) -> Self {
+        DnsService {
+            mux,
+            limit: ConnLimit::new(),
+            tcp: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            udp: std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        }
+    }
+
+    /// The test server's UDP address (the tests bind ephemeral ports).
+    #[cfg(test)]
+    fn udp_addr(&self) -> std::net::SocketAddr {
+        self.udp.local_addr().unwrap()
+    }
+
+    /// Spawn both serve loops over the service's own sockets (clones of
+    /// this service run them; the shared cap and mux come from `self`).
+    /// Returns the join handles of the two loops (they never end on
+    /// their own; the supervisor keeps them for the sandbox's whole
+    /// lifetime).
+    pub(crate) fn spawn(&self) -> [tokio::task::JoinHandle<()>; 2] {
+        let udp = register_udp(&self.udp);
+        let tcp = register_tcp(&self.tcp);
+        [
+            tokio::spawn(self.clone().serve_udp(udp)),
+            tokio::spawn(self.clone().serve_tcp(tcp)),
+        ]
+    }
+
+    /// Serve DNS over UDP: the transport glibc and most resolvers use
+    /// first. Runs until the socket errors out.
+    async fn serve_udp(self, socket: UdpSocket) {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            let response = reply(&self.mux, &buf[..len]).await;
+            if socket.send_to(&response, peer).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Serve DNS over TCP (2-byte length-prefixed messages): the
+    /// fallback transport resolvers use for larger replies. Runs until
+    /// the listener errors out. Concurrent connections are capped (see
+    /// [`crate::connlimit`]); at capacity the newly accepted connection
+    /// is dropped immediately instead of spawning a task for it.
+    async fn serve_tcp(self, listener: TcpListener) {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(guard) = self.limit.try_acquire() else {
+                continue; // at capacity: drop the connection
+            };
+            let mux = self.mux.clone();
+            tokio::spawn(async move {
+                let _guard = guard;
+                let _ = serve_tcp_conn(tcp, &mux).await;
+            });
+        }
+    }
+}
+
+/// Register the std UDP socket with the current tokio runtime
+/// (nonblocking, `SOCK_CLOEXEC` on the fresh fd). Dies on failure: the
+/// waf mode cannot serve without DNS.
+fn register_udp(socket: &std::net::UdpSocket) -> UdpSocket {
+    let fd = clone_socket(socket);
+    let _ = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = fd.set_nonblocking(true);
+    UdpSocket::from_std(fd)
+        .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't register DNS UDP socket: {e}")))
+}
+
+/// Register the std TCP listener with the current tokio runtime (see
+/// [`register_udp`]).
+fn register_tcp(listener: &std::net::TcpListener) -> TcpListener {
+    let fd = clone_socket(listener);
+    let _ = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = fd.set_nonblocking(true);
+    TcpListener::from_std(fd)
+        .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't register DNS TCP listener: {e}")))
 }
 
 /// `read_exact` with the per-message [`TCP_QUERY_TIMEOUT`]: a client that
@@ -281,21 +424,15 @@ mod tests {
     /// mux pair (denied by an empty allow list) -> NXDOMAIN.
     #[tokio::test]
     async fn end_to_end_denial() {
-        use crate::ipc::netmux::MuxHandle;
-
         let (a, b) = crate::ipc::netmux::pair().unwrap();
         tokio::spawn(host::serve_host(
             a,
             crate::proxy::allowlist::shared(vec![]),
             false,
         ));
-        let mux = MuxHandle::<WafSpec>::client(b);
-
-        // The server side of the "nameserver": a UDP socket the DNS
-        // server serves queries on.
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = server.local_addr().unwrap();
-        tokio::spawn(serve_udp(server, mux.clone()));
+        let service = DnsService::for_tests(MuxHandle::<WafSpec>::client(b));
+        let server_addr = service.udp_addr();
+        let _loops = service.spawn();
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let query = make_query("example.com");
@@ -313,10 +450,9 @@ mod tests {
             crate::proxy::allowlist::shared(vec!["example.com".to_string()]),
             false,
         ));
-        let mux = MuxHandle::<WafSpec>::client(b);
-        let server2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server2_addr = server2.local_addr().unwrap();
-        tokio::spawn(serve_udp(server2, mux));
+        let service = DnsService::for_tests(MuxHandle::<WafSpec>::client(b));
+        let server2_addr = service.udp_addr();
+        let _loops = service.spawn();
         client.send_to(&query, server2_addr).await.unwrap();
         let mut buf = vec![0u8; 1024];
         let (len, _) = client.recv_from(&mut buf).await.unwrap();

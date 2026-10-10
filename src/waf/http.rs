@@ -4,10 +4,12 @@
 //!
 //! Runs inside the sandbox network namespace (process P of the waf
 //! mode). The struct owns the mux handle both frontends forward through
-//! (and that the DNS server clones from it) and the connection cap
-//! shared by both listeners: one cap over ports 80 + 443 (AUDIT.md,
+//! (and that the DNS server clones from it), the connection cap
+//! shared by both listeners — one cap over ports 80 + 443 (AUDIT.md,
 //! resource limits on the frontends) instead of one per listener, so
-//! doubling up across both ports cannot double the footprint.
+//! doubling up across both ports cannot double the footprint — and the
+//! frontends' listeners themselves, bound in [`HttpService::new`] and
+//! spawned by [`HttpService::spawn`].
 //!
 //! Every mux interaction of the two frontends is a method here — the
 //! callers take the handle from `self` rather than passing one around.
@@ -57,6 +59,7 @@
 
 use std::future::Future;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -100,35 +103,103 @@ const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6
 /// initial reads; the tunneled traffic afterwards is never timed out.
 const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The plain-HTTP frontend's bind address: the in-sandbox loopback
+/// alias the waf DNS server resolves every allow-listed name to.
+const HTTP_ADDR: &str = "127.0.0.2:80";
+
+/// The HTTPS MITM's bind address (same alias).
+const HTTPS_ADDR: &str = "127.0.0.2:443";
+
 /// The plain-HTTP and HTTPS frontends of the waf mode as one service:
-/// the mux handle they forward through and the connection cap shared by
-/// both accept loops (see the module docs).
-#[derive(Clone)]
+/// the mux handle they forward through, the connection cap shared by
+/// both accept loops (see the module docs) and the frontends' own
+/// listeners, bound by [`HttpService::new`].
 pub(crate) struct HttpService {
     mux: MuxHandle<WafSpec>,
     limit: Arc<ConnLimit>,
+    /// The std listeners bound in [`HttpService::new`]; [`HttpService::spawn`]
+    /// registers clones of them with P's tokio runtime.
+    http: std::net::TcpListener,
+    https: std::net::TcpListener,
+}
+
+impl Clone for HttpService {
+    fn clone(&self) -> Self {
+        HttpService {
+            mux: self.mux.clone(),
+            limit: Arc::clone(&self.limit),
+            // `dup` of the same socket: the per-connection hyper service
+            // clones are cheap and never bind or close the port.
+            http: clone_listener(&self.http),
+            https: clone_listener(&self.https),
+        }
+    }
+}
+
+/// Bind a waf frontend listener on `addr`, `SOCK_CLOEXEC` (the exec'd
+/// sandboxed command must never see it).
+fn bind_frontend(addr: &str, what: &str) -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind(addr).unwrap_or_else(|e| {
+        crate::sandbox::die(&format!("Can't bind waf {what} listener on {addr}: {e}"))
+    });
+    let _ = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    listener
+}
+
+/// `dup` a listener; a failed dup is a broken sandbox, not a per-
+/// connection condition.
+fn clone_listener(listener: &std::net::TcpListener) -> std::net::TcpListener {
+    listener
+        .try_clone()
+        .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't clone a waf listener: {e}")))
+}
+
+/// Register a std listener with the current tokio runtime (nonblocking,
+/// `SOCK_CLOEXEC` on the fresh fd). Dies on failure: the waf mode
+/// cannot serve without its frontends.
+fn register_frontend(listener: &std::net::TcpListener, what: &str) -> TcpListener {
+    let fd = clone_listener(listener);
+    let _ = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    let _ = fd.set_nonblocking(true);
+    TcpListener::from_std(fd)
+        .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't register {what} listener: {e}")))
 }
 
 impl HttpService {
     /// A service forwarding through the given mux handle, with the
-    /// default connection cap (one cap over both frontends).
+    /// default connection cap (one cap over both frontends) and its
+    /// own listeners on 127.0.0.2:80/443 already bound. Runs in process
+    /// P, inside the sandbox network namespace.
     pub(crate) fn new(mux: MuxHandle<WafSpec>) -> Self {
         HttpService {
             mux,
             limit: ConnLimit::new(),
+            http: bind_frontend(HTTP_ADDR, "HTTP"),
+            https: bind_frontend(HTTPS_ADDR, "HTTPS"),
         }
     }
 
-    /// Spawn both accept loops over the given listeners (clones of this
-    /// service serve them; the shared cap and mux come from `self`).
-    /// Returns the join handles of the two loops (they never end on
-    /// their own; the supervisor keeps them for the sandbox's whole
-    /// lifetime).
-    pub(crate) fn spawn(
-        &self,
-        http: TcpListener,
-        https: TcpListener,
-    ) -> [tokio::task::JoinHandle<()>; 2] {
+    /// Test-only construction: the unit tests bind their own ephemeral
+    /// listeners and must not claim 127.0.0.2:80/443 (they run
+    /// unprivileged, and parallel test runs would collide anyway).
+    #[cfg(test)]
+    fn for_tests(mux: MuxHandle<WafSpec>) -> Self {
+        HttpService {
+            mux,
+            limit: ConnLimit::new(),
+            http: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+            https: std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+        }
+    }
+
+    /// Spawn both accept loops over the service's own listeners (clones
+    /// of this service serve them; the shared cap and mux come from
+    /// `self`). Returns the join handles of the two loops (they never
+    /// end on their own; the supervisor keeps them for the sandbox's
+    /// whole lifetime).
+    pub(crate) fn spawn(&self) -> [tokio::task::JoinHandle<()>; 2] {
+        let http = register_frontend(&self.http, "HTTP");
+        let https = register_frontend(&self.https, "HTTPS");
         [
             tokio::spawn(self.clone().serve_http(http)),
             tokio::spawn(self.clone().serve_https(https)),
@@ -629,7 +700,7 @@ mod tests {
             false,
         ));
 
-        let service = HttpService::new(MuxHandle::<WafSpec>::client(b));
+        let service = HttpService::for_tests(MuxHandle::<WafSpec>::client(b));
         let err = service.connect_target("example.com:443").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
@@ -763,7 +834,7 @@ mod tests {
             crate::proxy::allowlist::shared(vec![format!("127.0.0.1:{}", echo_addr.port())]),
             true,
         ));
-        let service = HttpService::new(MuxHandle::<WafSpec>::client(b));
+        let service = HttpService::for_tests(MuxHandle::<WafSpec>::client(b));
 
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = http.local_addr().unwrap();
@@ -824,7 +895,7 @@ mod tests {
             crate::proxy::allowlist::shared(vec![]),
             false,
         ));
-        let service = HttpService::new(MuxHandle::<WafSpec>::client(b));
+        let service = HttpService::for_tests(MuxHandle::<WafSpec>::client(b));
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = http.local_addr().unwrap();
         tokio::spawn(service.serve_http(http));
@@ -950,7 +1021,7 @@ mod tests {
 
         let (a, b) = crate::ipc::netmux::pair().unwrap();
         tokio::spawn(fake_host(a, echo_addr.port()));
-        let service = HttpService::new(MuxHandle::<WafSpec>::client(b));
+        let service = HttpService::for_tests(MuxHandle::<WafSpec>::client(b));
 
         let tls = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tls_addr = tls.local_addr().unwrap();

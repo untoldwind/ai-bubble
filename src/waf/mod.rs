@@ -42,17 +42,18 @@
 //! names fail in the DNS server, and non-listed `connect`/`tls-connect`
 //! targets are denied by the host.
 
-pub mod dns;
 pub mod host;
+
+mod dns;
+pub(crate) use dns::DnsService;
+pub(crate) mod http;
+pub(crate) use http::HttpService;
 
 use std::io;
 
 use serde::{Deserialize, Serialize};
 
 use crate::ipc::netmux::{MuxHandle, NetSpec};
-
-pub(crate) mod http_service;
-pub(crate) use http_service::HttpService;
 
 /// The waf mode's command set. Externally tagged (`deny_unknown_fields`
 /// is not supported on internally tagged enums): each frame names its
