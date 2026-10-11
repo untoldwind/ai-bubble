@@ -376,7 +376,7 @@ struct HostFs {
 /// reused, so a stale entry can only be memory, never a wrong listing
 /// (the stamp and generation checks re-list on change).
 struct DirNames {
-    stamp: (libc::time_t, libc::c_long, libc::time_t, libc::c_long),
+    stamp: (libc::time_t, u64, libc::time_t, u64),
     policy_gen: u64,
     names: Vec<std::ffi::OsString>,
 }
@@ -547,7 +547,7 @@ impl HostFs {
 
     /// The attributes of an empty file: the real metadata, but with no
     /// content (the host file is never read).
-    fn empty_file_attr(md: &libc::stat) -> FileAttr {
+    fn empty_file_attr(md: &rustix::fs::Stat) -> FileAttr {
         let mut attr = attr_from_stat(md);
         attr.size = 0;
         attr.blocks = 0;
@@ -588,12 +588,12 @@ impl HostFs {
     }
 
     /// Whether a raw `stat` result describes a directory.
-    fn stat_is_dir(st: &libc::stat) -> bool {
+    fn stat_is_dir(st: &rustix::fs::Stat) -> bool {
         st.st_mode & libc::S_IFMT == libc::S_IFDIR
     }
 
     /// Whether a raw `stat` result describes a symlink.
-    fn stat_is_symlink(st: &libc::stat) -> bool {
+    fn stat_is_symlink(st: &rustix::fs::Stat) -> bool {
         st.st_mode & libc::S_IFMT == libc::S_IFLNK
     }
 
@@ -603,7 +603,7 @@ impl HostFs {
     /// read/write into the sandbox, giving the command exactly the
     /// per-path host-device access the mirror exists to police. FIFOs
     /// remain deliberately allowed.
-    fn stat_is_special(st: &libc::stat) -> bool {
+    fn stat_is_special(st: &rustix::fs::Stat) -> bool {
         let f = st.st_mode & libc::S_IFMT;
         f == libc::S_IFCHR || f == libc::S_IFBLK || f == libc::S_IFSOCK
     }
@@ -619,7 +619,7 @@ impl HostFs {
 
     /// Anchored `lstat` of a real host path: every component no-follow
     /// (the anchored `symlink_metadata`).
-    fn real_lstat(&self, real: &Path) -> std::io::Result<libc::stat> {
+    fn real_lstat(&self, real: &Path) -> std::io::Result<rustix::fs::Stat> {
         self.root.lstat(real)
     }
 
@@ -717,7 +717,12 @@ impl HostFs {
                 // owns it), so it lists a *duplicate*; the original stays
                 // pinned below for the entries' attributes.
                 let stamp = match anchored::fstat(opened.as_fd()) {
-                    Ok(st) => (st.st_mtime, st.st_mtime_nsec, st.st_ctime, st.st_ctime_nsec),
+                    Ok(st) => (
+                        st.st_mtime,
+                        st.st_mtime_nsec,
+                        st.st_ctime,
+                        st.st_ctime_nsec,
+                    ),
                     Err(_) => (0, 0, 0, 0),
                 };
                 let mut cache = self.dir_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -849,19 +854,7 @@ impl HostFs {
             && base_real.join(name) == child;
         if plain && let Some(dir) = dir {
             let cname = cstring_of(Path::new(name))?;
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: valid descriptor, NUL-terminated name, writable buffer.
-            if unsafe {
-                libc::fstatat(
-                    dir.as_raw_fd(),
-                    cname.as_ptr(),
-                    &mut st,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
+            let st = anchored::statat_nofollow(dir, &cname)?;
             return Ok(attr_from_stat(&st));
         }
         self.attr(child)

@@ -29,7 +29,7 @@ fn self_groups() -> Vec<libc::gid_t> {
 
 /// [`attr_from_metadata`], for the dirfd-anchored stat results (see
 /// [`anchored`]). `ino` is filled in by the reply sites that know it.
-pub(super) fn attr_from_stat(st: &libc::stat) -> FileAttr {
+pub(super) fn attr_from_stat(st: &rustix::fs::Stat) -> FileAttr {
     let kind = match st.st_mode & libc::S_IFMT {
         libc::S_IFDIR => FileType::Directory,
         libc::S_IFLNK => FileType::Symlink,
@@ -45,13 +45,13 @@ pub(super) fn attr_from_stat(st: &libc::stat) -> FileAttr {
         size: st.st_size as u64,
         blocks: st.st_blocks as u64,
         atime: (SystemTime::UNIX_EPOCH
-            + Duration::new(st.st_atime.max(0) as u64, st.st_atime_nsec.max(0) as u32))
+            + Duration::new(st.st_atime.max(0) as u64, st.st_atime_nsec as u32))
         .into(),
         mtime: (SystemTime::UNIX_EPOCH
-            + Duration::new(st.st_mtime.max(0) as u64, st.st_mtime_nsec.max(0) as u32))
+            + Duration::new(st.st_mtime.max(0) as u64, st.st_mtime_nsec as u32))
         .into(),
         ctime: (SystemTime::UNIX_EPOCH
-            + Duration::new(st.st_ctime.max(0) as u64, st.st_ctime_nsec.max(0) as u32))
+            + Duration::new(st.st_ctime.max(0) as u64, st.st_ctime_nsec as u32))
         .into(),
         kind,
         perm: (st.st_mode & 0o7777) as u16,
@@ -69,16 +69,16 @@ pub(super) fn attr_from_stat(st: &libc::stat) -> FileAttr {
 /// functions used to duplicate it field-for-field).
 pub(super) fn attr_from_metadata(md: &std::fs::Metadata) -> FileAttr {
     use std::os::unix::fs::MetadataExt as _;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let mut st: rustix::fs::Stat = unsafe { std::mem::zeroed() };
     st.st_mode = md.mode();
     st.st_size = md.size() as libc::off_t;
     st.st_blocks = md.blocks() as libc::blkcnt_t;
     st.st_atime = md.atime();
-    st.st_atime_nsec = md.atime_nsec();
+    st.st_atime_nsec = md.atime_nsec() as _;
     st.st_mtime = md.mtime();
-    st.st_mtime_nsec = md.mtime_nsec();
+    st.st_mtime_nsec = md.mtime_nsec() as _;
     st.st_ctime = md.ctime();
-    st.st_ctime_nsec = md.ctime_nsec();
+    st.st_ctime_nsec = md.ctime_nsec() as _;
     st.st_nlink = md.nlink();
     st.st_uid = md.uid();
     st.st_gid = md.gid();

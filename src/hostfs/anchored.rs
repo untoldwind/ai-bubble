@@ -31,9 +31,11 @@
 
 use std::ffi::{CStr, CString, OsStr};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+
+use rustix::fs::{AtFlags, Mode, OFlags};
 
 /// The pinned host root directory: the anchor every host-path walk starts
 /// from. Opened once per FUSE server (after the fork, so it is the `/` of
@@ -44,17 +46,13 @@ impl RootDir {
     /// Pin `/` as an `O_PATH` descriptor (the descriptor is only ever used
     /// as the starting point of `openat` walks, never read or written).
     pub(crate) fn open() -> io::Result<Self> {
-        let fd = unsafe {
-            libc::open(
-                c"/".as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `fd` is a freshly opened, owned descriptor.
-        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            c"/",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        Ok(Self(fd))
     }
 
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -81,25 +79,18 @@ impl RootDir {
         }
         let mut dir: Option<OwnedFd> = None;
         for comp in comps {
-            let start = match &dir {
-                Some(d) => d.as_raw_fd(),
-                None if absolute => self.as_fd().as_raw_fd(),
-                None => libc::AT_FDCWD,
+            let start: BorrowedFd<'_> = match &dir {
+                Some(d) => d.as_fd(),
+                None if absolute => self.as_fd(),
+                None => rustix::fs::CWD,
             };
-            // SAFETY: `start` is a valid descriptor (or AT_FDCWD) and `comp`
-            // points to a NUL-terminated string outliving the call.
-            let fd = unsafe {
-                libc::openat(
-                    start,
-                    comp.as_ptr(),
-                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: `fd` is a freshly opened, owned descriptor.
-            dir = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+            let fd = rustix::fs::openat(
+                start,
+                comp,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            dir = Some(fd);
         }
         let dir = dir.expect("walk with non-empty components");
         Ok(dir)
@@ -142,22 +133,22 @@ impl RootDir {
             if !path.is_absolute() {
                 return Err(io::Error::from_raw_os_error(libc::ENOENT));
             }
-            // SAFETY: string literal outliving the call.
-            let fd = unsafe { libc::open(c"/".as_ptr(), flags | libc::O_CLOEXEC) };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: `fd` is a freshly opened, owned descriptor.
-            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+            return rustix::fs::openat(
+                rustix::fs::CWD,
+                c"/",
+                OFlags::from_bits_retain((flags | libc::O_CLOEXEC) as u32),
+                Mode::empty(),
+            )
+            .map_err(io::Error::from);
         };
         let dir = self.walk(path.is_absolute(), &comps)?;
-        // SAFETY: valid descriptor and NUL-terminated name.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `fd` is a freshly opened, owned descriptor.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        rustix::fs::openat(
+            dir,
+            name,
+            OFlags::from_bits_retain((flags | libc::O_CLOEXEC) as u32),
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)
     }
 
     /// Open (or create) the anchored final component relative to its pinned
@@ -182,56 +173,30 @@ impl RootDir {
     ) -> io::Result<std::fs::File> {
         let anchored = self.anchor_parent(path)?;
         flags |= libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
-        // SAFETY: valid descriptor and NUL-terminated name.
-        let fd = unsafe {
-            libc::openat(
-                anchored.dir().as_raw_fd(),
-                anchored.name().as_ptr(),
-                flags,
-                mode,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = rustix::fs::openat(
+            anchored.dir(),
+            anchored.name(),
+            OFlags::from_bits_retain(flags as u32),
+            Mode::from_raw_mode(mode),
+        )?;
         // Clear `O_NONBLOCK` again: only the *open* must not block, not the
         // subsequent I/O on the descriptor.
-        // SAFETY: `fd` is a freshly opened, owned descriptor we still hold.
-        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if fl >= 0 {
-            unsafe { libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK) };
+        if let Ok(fl) = rustix::fs::fcntl_getfl(&fd) {
+            let _ = rustix::fs::fcntl_setfl(&fd, fl & !OFlags::NONBLOCK);
         }
-        // SAFETY: `fd` is a freshly opened, owned descriptor.
-        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        Ok(std::fs::File::from(fd))
     }
 
     /// `fstatat(AT_SYMLINK_NOFOLLOW)` on the anchored path — the anchored
     /// equivalent of `symlink_metadata`: the final component is never followed,
     /// and (unlike the string-based call) neither is anything above it.
-    pub(crate) fn lstat(&self, path: &Path) -> io::Result<libc::stat> {
+    pub(crate) fn lstat(&self, path: &Path) -> io::Result<rustix::fs::Stat> {
         if path == Path::new("/") {
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: valid descriptor and a writable `stat` buffer.
-            if unsafe { libc::fstat(self.as_fd().as_raw_fd(), &mut st) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            return Ok(st);
+            return rustix::fs::fstat(self.as_fd()).map_err(io::Error::from);
         }
         let anchored = self.anchor_parent(path)?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: valid descriptor, NUL-terminated name, writable buffer.
-        if unsafe {
-            libc::fstatat(
-                anchored.dir().as_raw_fd(),
-                anchored.name().as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(st)
+        rustix::fs::statat(anchored.dir(), anchored.name(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)
     }
 
     /// Open the anchored path as a real (readable) directory descriptor —
@@ -248,23 +213,9 @@ impl RootDir {
         let mut size = 4096usize;
         loop {
             let mut buf = vec![0u8; size];
-            // SAFETY: valid descriptor, NUL-terminated name, `buf` writable for
-            // `size` bytes.
-            let n = unsafe {
-                libc::readlinkat(
-                    anchored.dir().as_raw_fd(),
-                    anchored.name().as_ptr(),
-                    buf.as_mut_ptr() as *mut libc::c_char,
-                    size,
-                )
-            };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let n = n as usize;
+            let n = rustix::fs::readlinkat_raw(anchored.dir(), anchored.name(), buf.as_mut_slice())?;
             if n < size {
-                buf.truncate(n);
-                return Ok(OsStr::from_bytes(&buf).to_os_string());
+                return Ok(OsStr::from_bytes(&buf[..n]).to_os_string());
             }
             // Truncated: retry with a larger buffer (a few rounds cover any
             // real target; give up far beyond `PATH_MAX`).
@@ -297,21 +248,8 @@ impl AnchoredParent {
 
     /// `fstatat(AT_SYMLINK_NOFOLLOW)` on the pinned parent + final name — the
     /// anchored "does this entry exist, and what is it" check.
-    pub(crate) fn stat_entry(&self) -> io::Result<libc::stat> {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: valid descriptor, NUL-terminated name, writable buffer.
-        if unsafe {
-            libc::fstatat(
-                self.dir().as_raw_fd(),
-                self.name().as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(st)
+    pub(crate) fn stat_entry(&self) -> io::Result<rustix::fs::Stat> {
+        rustix::fs::statat(self.dir(), self.name(), AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)
     }
 }
 
@@ -343,13 +281,18 @@ fn components_of(path: &Path) -> io::Result<Vec<CString>> {
 
 /// `fstat` of an already-open descriptor (used to stamp the pinned
 /// directory descriptor for the readdir cache).
-pub(crate) fn fstat(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<libc::stat> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: valid descriptor and a writable `stat` buffer.
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(st)
+pub(crate) fn fstat(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<rustix::fs::Stat> {
+    rustix::fs::fstat(fd).map_err(io::Error::from)
+}
+
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` on an already-pinned directory descriptor
+/// plus a component name — used where the caller holds a raw dirfd from the
+/// walk itself.
+pub(crate) fn statat_nofollow(
+    dir: std::os::fd::BorrowedFd<'_>,
+    name: &CStr,
+) -> io::Result<rustix::fs::Stat> {
+    rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)
 }
 
 /// The entry names of the anchored directory (excluding `.` and `..`), in
@@ -403,8 +346,8 @@ mod tests {
         // The descriptor is not left in non-blocking mode: the flag is
         // cleared after the open, so sandbox-side I/O keeps its normal
         // blocking semantics.
-        let fl = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
-        assert_eq!(fl & libc::O_NONBLOCK, 0);
+        let fl = rustix::fs::fcntl_getfl(&f).unwrap();
+        assert!(!fl.contains(rustix::fs::OFlags::NONBLOCK));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
