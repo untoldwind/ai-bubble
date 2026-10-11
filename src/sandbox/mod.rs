@@ -1252,12 +1252,11 @@ unsafe fn build_root(
                     let console_src: Option<String> = if new_session {
                         pty_slave_path.map(str::to_string)
                     } else {
-                        // ttyname(2) on fd 0; the borrow of the raw stdio fd
-                        // is safe here (and requires an `unsafe` block only
-                        // because we borrow a raw fd): fd 0 is
-                        // process-lifetime and this thread stays alive
-                        // across the call.
-                        let fd0 = std::os::unix::io::BorrowedFd::borrow_raw(0);
+                        // std::io::Stdin implements rustix::fd::AsFd (blanket impl over the
+                        // std trait), so this borrow is safe and needs no
+                        // `unsafe` block.
+                        let stdin = std::io::stdin();
+                        let fd0 = rustix::fd::AsFd::as_fd(&stdin);
                         rustix::termios::ttyname(fd0, Vec::new())
                             .ok()
                             .map(|tty| tty.to_string_lossy().into_owned())

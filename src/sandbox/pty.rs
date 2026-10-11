@@ -79,7 +79,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::exit;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use rustix::fd::BorrowedFd;
+use rustix::fd::AsFd;
 
 use crate::sandbox::{die, die_with_error, exit_with_status};
 
@@ -222,9 +222,11 @@ extern "C" fn restore_tty_atexit() {
     if let Ok(saved) = SAVED_TERMIOS.lock()
         && let Some(saved) = saved.as_ref()
     {
-        // The borrow of the raw stdio fd is safe here: fd 0 is
-        // process-lifetime and this thread stays alive across the call.
-        let fd0 = unsafe { BorrowedFd::borrow_raw(0) };
+        // std::io::Stdin implements rustix::fd::AsFd (blanket impl over
+        // the std trait), so this borrow is safe and needs no `unsafe`
+        // block. The binding keeps the handle alive for the tcsetattr.
+        let stdin = std::io::stdin();
+        let fd0 = stdin.as_fd();
         let _ = rustix::termios::tcsetattr(fd0, rustix::termios::OptionalActions::Now, saved);
     }
 }
@@ -271,9 +273,10 @@ extern "C" fn on_signal(sig: libc::c_int) {
 pub(crate) fn parent_relay(pty: &Pty, child_pid: libc::pid_t) {
     use rustix::process::{Pid, WaitOptions, waitpid};
     use rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
-    // The borrow of the raw stdio fd is safe here: fd 0 is
-    // process-lifetime and this thread stays alive across the calls.
-    let fd0 = unsafe { BorrowedFd::borrow_raw(0) };
+    // std::io::Stdin implements rustix::fd::AsFd (blanket impl over the
+    // std trait), so this borrow is safe and needs no `unsafe` block.
+    let stdin = std::io::stdin();
+    let fd0 = stdin.as_fd();
     // Raw mode on the *user's* terminal: its line discipline stops
     // echoing and editing, so every keystroke (including ^C and ^Z)
     // reaches the relay as a plain byte and is forwarded to the pty,
@@ -434,9 +437,10 @@ fn io_err() -> i32 {
 /// which raises SIGWINCH for the sandbox's foreground process group when
 /// the size changed).
 fn forward_winsize(master: &OwnedFd) {
-    // The borrow of the raw stdio fd is safe here: fd 0 is
-    // process-lifetime and this thread stays alive across the calls.
-    let fd0 = unsafe { BorrowedFd::borrow_raw(0) };
+    // std::io::Stdin implements rustix::fd::AsFd (blanket impl over the
+    // std trait), so this borrow is safe and needs no `unsafe` block.
+    let stdin = std::io::stdin();
+    let fd0 = stdin.as_fd();
     if let Ok(ws) = rustix::termios::tcgetwinsize(fd0) {
         let _ = rustix::termios::tcsetwinsize(master, ws);
     }
@@ -454,10 +458,13 @@ fn relay(pty: &Pty, pipe_r: &OwnedFd) -> RelayEnd {
     let master = pty.master.as_ref().unwrap();
     let master_raw = master.as_raw_fd();
     let pipe_raw = pipe_r.as_raw_fd();
-    // The borrows of the raw stdio fds are safe: fds 0/1 are
-    // process-lifetime and this thread stays alive across the calls.
-    let fd0 = unsafe { BorrowedFd::borrow_raw(0) };
-    let fd1 = unsafe { BorrowedFd::borrow_raw(1) };
+    // std::io::Stdin/Stdout implement rustix::fd::AsFd (blanket impl over
+    // the std trait), so these borrows are safe and need no `unsafe`
+    // block. The bindings keep the handles alive for the whole loop.
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let fd0 = stdin.as_fd();
+    let fd1 = stdout.as_fd();
     // Pending bytes: user's tty → master, and master → user's stdout.
     let mut to_master: Vec<u8> = Vec::new();
     let mut to_stdout: Vec<u8> = Vec::new();
