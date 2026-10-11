@@ -5,10 +5,12 @@
 use super::*;
 
 /// Read one rlimit as (soft, hard).
-fn get_rlimit(resource: libc::__rlimit_resource_t) -> (u64, u64) {
-    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::getrlimit(resource, &mut lim) }, 0);
-    (lim.rlim_cur, lim.rlim_max)
+fn get_rlimit(resource: rustix::process::Resource) -> (u64, u64) {
+    let lim = rustix::process::getrlimit(resource);
+    (
+        lim.current.unwrap_or(u64::MAX),
+        lim.maximum.unwrap_or(u64::MAX),
+    )
 }
 
 #[test]
@@ -25,9 +27,9 @@ fn rlimits_are_applied_to_the_process() {
             });
             // Soft == hard for every limit, so the command cannot
             // raise them again.
-            if get_rlimit(libc::RLIMIT_NPROC) == (256, 256)
-                && get_rlimit(libc::RLIMIT_NOFILE) == (128, 128)
-                && get_rlimit(libc::RLIMIT_AS) == (1 << 28, 1 << 28)
+            if get_rlimit(rustix::process::Resource::Nproc) == (256, 256)
+                && get_rlimit(rustix::process::Resource::Nofile) == (128, 128)
+                && get_rlimit(rustix::process::Resource::As) == (1 << 28, 1 << 28)
             {
                 libc::_exit(0);
             }
@@ -42,15 +44,15 @@ fn rlimits_absent_fields_leave_the_process_untouched() {
     let code = unsafe {
         run_in_child(|| {
             let before = (
-                get_rlimit(libc::RLIMIT_NPROC),
-                get_rlimit(libc::RLIMIT_NOFILE),
-                get_rlimit(libc::RLIMIT_AS),
+                get_rlimit(rustix::process::Resource::Nproc),
+                get_rlimit(rustix::process::Resource::Nofile),
+                get_rlimit(rustix::process::Resource::As),
             );
             apply_rlimits(&Rlimits::default());
             let after = (
-                get_rlimit(libc::RLIMIT_NPROC),
-                get_rlimit(libc::RLIMIT_NOFILE),
-                get_rlimit(libc::RLIMIT_AS),
+                get_rlimit(rustix::process::Resource::Nproc),
+                get_rlimit(rustix::process::Resource::Nofile),
+                get_rlimit(rustix::process::Resource::As),
             );
             if before == after {
                 libc::_exit(0);

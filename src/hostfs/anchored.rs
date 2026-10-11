@@ -356,32 +356,21 @@ pub(crate) fn fstat(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<libc::stat> {
 /// filesystem order — the `fd`-based equivalent of `std::fs::read_dir`'s
 /// name iterator. Consumes the descriptor (`closedir` closes it).
 pub(crate) fn readdir_names(dir: OwnedFd) -> Vec<std::ffi::OsString> {
-    // SAFETY: `dir` is a valid, open directory descriptor.
-    let stream = unsafe { libc::fdopendir(dir.as_raw_fd()) };
-    if stream.is_null() {
-        return Vec::new();
-    }
+    // `Dir::new` is the safe `fdopendir`: it consumes the descriptor and
+    // closes it when the iterator ends (no double-close juggling).
+    let mut stream = match rustix::fs::Dir::new(dir) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
     let mut names = Vec::new();
-    loop {
-        // SAFETY: `stream` is a valid DIR handle; `readdir` returns NULL at
-        // the end of the directory (errno is irrelevant here).
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        // SAFETY: `readdir` returned a valid dirent whose `d_name` is
-        // NUL-terminated and valid until the next `readdir` call.
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-        let bytes = name.to_bytes();
+    while let Some(entry) = stream.read() {
+        let Ok(entry) = entry else { break };
+        let bytes = entry.file_name().to_bytes();
         if bytes == b"." || bytes == b".." {
             continue;
         }
         names.push(OsStr::from_bytes(bytes).to_os_string());
     }
-    // SAFETY: `closedir` also closes the descriptor; the `OwnedFd` is
-    // forgotten so it is not closed a second time.
-    unsafe { libc::closedir(stream) };
-    std::mem::forget(dir);
     names
 }
 
@@ -399,8 +388,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("pipe");
-        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        if let Err(e) = rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        ) {
+            panic!("mkfifo failed: {e}");
+        }
 
         let root = RootDir::open().unwrap();
         // The FIFO has no writer; a plain blocking open would hang here.

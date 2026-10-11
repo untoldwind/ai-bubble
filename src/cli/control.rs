@@ -277,7 +277,7 @@ pub fn start(spec_dir: &Path) {
 
     // CLOEXEC: the exec'd sandboxed command (and everything it spawns)
     // must never inherit the listening socket.
-    unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    sandbox::set_cloexec(&listener);
     LISTENER_FD.store(listener.as_raw_fd(), Ordering::Relaxed);
 
     // Bind succeeded — this run owns the name and may write the token.
@@ -359,21 +359,20 @@ fn open_token_file(path: &Path) -> std::fs::File {
         .unwrap_or_else(|e| sandbox::die(&format!("Can't open {}: {e}", path.display())))
 }
 
-/// Fill a buffer with kernel randomness (getrandom(2), via libc; no
+/// Fill a buffer with kernel randomness (getrandom(2), via rustix; no
 /// `rand` dependency exists in this crate).
 fn fill_random(buf: &mut [u8]) {
+    use rustix::rand::{GetRandomFlags, getrandom};
     let mut filled = 0;
     while filled < buf.len() {
-        let n =
-            unsafe { libc::getrandom(buf[filled..].as_mut_ptr().cast(), buf.len() - filled, 0) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            sandbox::die(&format!("Can't generate the control token: {err}"));
+        match getrandom(&mut buf[filled..], GetRandomFlags::empty()) {
+            Ok(n) if n > 0 => filled += n,
+            // A zero return cannot happen for a nonzero buffer, but fail
+            // closed rather than loop forever.
+            Ok(_) => sandbox::die("Can't generate the control token: short read"),
+            Err(e) if e == rustix::io::Errno::INTR => continue,
+            Err(e) => sandbox::die(&format!("Can't generate the control token: {e}")),
         }
-        filled += n as usize;
     }
 }
 

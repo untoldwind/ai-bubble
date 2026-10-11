@@ -81,7 +81,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -108,7 +108,7 @@ pub(crate) type StreamLimit = ConnLimit;
 /// and any envelope above [`FRAME_MAX`] kills the connection (a hard
 /// `Err`, not a silent skip — the audit channel's discipline for
 /// protocol violations).
-pub(crate) const PAYLOAD_CAP: usize = 256 * 1024;
+pub(crate) const PAYLOAD_CAP: usize = 1024 * 1024;
 /// The envelope size cap enforced by the codec (payload cap + headers
 /// + slack).
 const FRAME_MAX: usize = PAYLOAD_CAP + 64;
@@ -536,49 +536,35 @@ where
 /// trusted. This runs before the first frame is read; the credentials
 /// are immutable per socket, so one check pins the whole connection.
 fn check_peer(pair: &UnixStream) -> io::Result<()> {
-    let cred = peer_cred(pair.as_raw_fd())?;
+    let cred = peer_cred(pair)?;
     if peer_credentials_ok(&cred) {
         Ok(())
     } else {
         Err(io::Error::other(format!(
             "peer is pid {}, uid {}, gid {} (expected pid {}, uid {}, gid {})",
-            cred.pid,
-            cred.uid,
-            cred.gid,
+            cred.pid.as_raw_pid(),
+            cred.uid.as_raw(),
+            cred.gid.as_raw(),
             std::process::id(),
-            unsafe { libc::geteuid() },
-            unsafe { libc::getegid() },
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
         )))
     }
 }
 
-/// Fetch a connected AF_UNIX socket's `SO_PEERCRED` credentials (Linux).
-/// `ucred` is a plain POD struct, so a direct `getsockopt` keeps this
-/// independent of the (still unstable) `UCred` std API.
-fn peer_cred(fd: RawFd) -> io::Result<libc::ucred> {
-    unsafe {
-        let mut cred: libc::ucred = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        if libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut libc::ucred as *mut libc::c_void,
-            &mut len,
-        ) != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(cred)
-    }
+/// Fetch a connected AF_UNIX socket's `SO_PEERCRED` credentials (Linux)
+/// via `rustix::net::sockopt::socket_peercred`, which returns a fully
+/// initialized `UCred` (no `mem::zeroed` buffer involved).
+fn peer_cred<Fd: rustix::fd::AsFd>(fd: Fd) -> io::Result<rustix::net::UCred> {
+    rustix::net::sockopt::socket_peercred(fd).map_err(std::io::Error::from)
 }
 
 /// The credential comparison of [`check_peer`], split out for a direct
 /// test: a mismatch on any of pid/uid/gid fails.
-fn peer_credentials_ok(cred: &libc::ucred) -> bool {
+fn peer_credentials_ok(cred: &rustix::net::UCred) -> bool {
     // euid/egid have no std equivalent (AUDIT-unsafe.md); the pid does.
-    (unsafe { cred.uid == libc::geteuid() && cred.gid == libc::getegid() })
-        && cred.pid == std::process::id() as libc::pid_t
+    (cred.uid == rustix::process::geteuid() && cred.gid == rustix::process::getegid())
+        && cred.pid.as_raw_pid() == std::process::id() as libc::pid_t
 }
 
 /// The connector end of a pre-fork socketpair for mode `S`. Every `OPEN`
@@ -1251,30 +1237,36 @@ mod tests {
     /// on every field.
     #[tokio::test]
     async fn peer_credential_check() {
+        use rustix::net::UCred;
+        use rustix::process::{getegid, geteuid, getpid};
         let (a, _b) = pair();
         check_peer(&a).expect("the creator's own end passes");
 
-        unsafe {
-            let foreign = libc::ucred {
-                pid: libc::getpid() + 1,
-                uid: libc::geteuid(),
-                gid: libc::getegid(),
-            };
-            assert!(!peer_credentials_ok(&foreign), "foreign pid must fail");
+        let foreign = UCred {
+            pid: rustix::process::Pid::from_raw(getpid().as_raw_pid() + 1).unwrap(),
+            uid: geteuid(),
+            gid: getegid(),
+        };
+        assert!(!peer_credentials_ok(&foreign), "foreign pid must fail");
 
-            let uid_foreign = libc::ucred {
-                pid: libc::getpid(),
-                uid: libc::geteuid() + 1,
-                gid: libc::getegid(),
-            };
-            assert!(!peer_credentials_ok(&uid_foreign), "foreign uid must fail");
+        let uid_foreign = UCred {
+            pid: getpid(),
+            uid: geteuid(),
+            gid: getegid(),
+        };
+        // Bump the uid past the process's own (uids never wrap at these
+        // magnitudes in test environments).
+        let uid_foreign = UCred {
+            uid: rustix::process::Uid::from_raw(geteuid().as_raw() + 1),
+            ..uid_foreign
+        };
+        assert!(!peer_credentials_ok(&uid_foreign), "foreign uid must fail");
 
-            let gid_foreign = libc::ucred {
-                pid: libc::getpid(),
-                uid: libc::geteuid(),
-                gid: libc::getegid() + 1,
-            };
-            assert!(!peer_credentials_ok(&gid_foreign), "foreign gid must fail");
-        }
+        let gid_foreign = UCred {
+            pid: getpid(),
+            uid: geteuid(),
+            gid: rustix::process::Gid::from_raw(getegid().as_raw() + 1),
+        };
+        assert!(!peer_credentials_ok(&gid_foreign), "foreign gid must fail");
     }
 }

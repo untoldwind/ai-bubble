@@ -57,7 +57,7 @@ pub(crate) fn event(msg: &str) {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros())
             .unwrap_or(0);
-        let tid = unsafe { libc::gettid() };
+        let tid = rustix::thread::gettid().as_raw_pid();
         if let Ok(mut f) = file.lock() {
             let _ = writeln!(f, "{ts} [{tid}] {msg}");
         }
@@ -138,12 +138,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("fuse.log");
-        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes().to_vec()).unwrap();
-        assert_eq!(
-            unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) },
-            0,
-            "mkfifo failed"
-        );
+        if let Err(e) = rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+        ) {
+            panic!("mkfifo failed: {e}");
+        }
         unsafe { std::env::set_var("RS_BUBBLE_FUSE_LOG", &fifo) };
         super::init();
         unsafe { std::env::remove_var("RS_BUBBLE_FUSE_LOG") };

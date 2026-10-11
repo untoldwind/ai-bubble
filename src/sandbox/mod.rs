@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
+use std::io::IsTerminal;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
@@ -53,15 +54,26 @@ pub(crate) fn die_with_error(msg: &str) -> ! {
 /// fixed bound otherwise: `close()` on an unused fd is just an `EBADF`, so
 /// over-sweeping costs only a few microseconds per fd.
 fn fd_sweep_limit() -> u32 {
+    use rustix::process::Resource;
     const FALLBACK: u32 = 1 << 20;
-    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } == 0
-        && rlim.rlim_cur != libc::RLIM_INFINITY
-    {
-        (rlim.rlim_cur as u64).min(FALLBACK as u64) as u32
-    } else {
-        FALLBACK
+    let rlim = rustix::process::getrlimit(Resource::Nofile);
+    match rlim.current {
+        // `None` is `RLIM_INFINITY`.
+        Some(cur) => (cur.min(FALLBACK as u64)) as u32,
+        None => FALLBACK,
     }
+}
+
+/// Set `FD_CLOEXEC` on a file descriptor, so an `exec` never inherits it.
+/// A single audited wrapper over `rustix::io::fcntl_setfd`, shared by the
+/// control/waf/proxy listeners and sockets (std has no per-fd CLOEXEC
+/// setter, so this used to be copy-pasted at every call site). Best
+/// effort, like the raw `fcntl(F_SETFD, FD_CLOEXEC)` calls it replaces:
+/// a failure would only leak the fd across exec, never break the
+/// connection.
+pub(crate) fn set_cloexec<Fd: rustix::fd::AsFd>(fd: Fd) {
+    use rustix::io::FdFlags;
+    let _ = rustix::io::fcntl_setfd(fd, FdFlags::CLOEXEC);
 }
 
 /// Create a fresh directory under `/tmp` with `mkdtemp(3)`, like bwrap's
@@ -131,25 +143,26 @@ fn current_rlimits() -> Rlimits {
 /// never restricted by them, and the command inherits them across
 /// exec, covering everything it forks.
 pub(crate) fn apply_rlimits(rlimits: &Rlimits) {
+    use rustix::process::Resource;
     if let Some(value) = rlimits.nproc {
-        set_rlimit(libc::RLIMIT_NPROC, value, "RLIMIT_NPROC");
+        set_rlimit(Resource::Nproc, value, "RLIMIT_NPROC");
     }
     if let Some(value) = rlimits.nofile {
-        set_rlimit(libc::RLIMIT_NOFILE, value, "RLIMIT_NOFILE");
+        set_rlimit(Resource::Nofile, value, "RLIMIT_NOFILE");
     }
     if let Some(value) = rlimits.as_ {
-        set_rlimit(libc::RLIMIT_AS, value, "RLIMIT_AS");
+        set_rlimit(Resource::As, value, "RLIMIT_AS");
     }
 }
 
 /// Set one resource limit, soft == hard (see [`apply_rlimits`]).
-fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64, name: &str) {
-    let limit = libc::rlimit {
-        rlim_cur: value,
-        rlim_max: value,
+fn set_rlimit(resource: rustix::process::Resource, value: u64, name: &str) {
+    let limit = rustix::process::Rlimit {
+        current: Some(value),
+        maximum: Some(value),
     };
-    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-        die_with_error(&format!("Can't set {name} to {value}"));
+    if let Err(e) = rustix::process::setrlimit(resource, limit) {
+        die(&format!("Can't set {name} to {value}: {e}"));
     }
 }
 
@@ -174,11 +187,11 @@ where
 }
 
 /// Exit with the raw waitpid status of the sandboxed command.
-pub fn exit_with_status(status: libc::c_int) -> ! {
-    if libc::WIFEXITED(status) {
-        exit(libc::WEXITSTATUS(status));
-    } else if libc::WIFSIGNALED(status) {
-        exit(128 + libc::WTERMSIG(status));
+pub fn exit_with_status(status: rustix::process::WaitStatus) -> ! {
+    if let Some(code) = status.exit_status() {
+        exit(code);
+    } else if let Some(sig) = status.terminating_signal() {
+        exit(128 + sig);
     }
     exit(1);
 }
@@ -277,13 +290,14 @@ fn refuse_symlink_dest(newroot: &Path, dest: &Path) {
 /// Write a map file for the current process, following bwrap's order
 /// (uid_map, then setgroups, then gid_map) and semantics.
 pub(crate) fn write_id_map(file: &str, data: &str) {
+    use rustix::process::{getegid, geteuid, getgid, getuid};
     if fs::write(PathBuf::from(file), data).is_err() {
         die_with_error(&format!(
             "Can't write {file}; uid={}, euid={}, gid={}, egid={}",
-            unsafe { libc::getuid() },
-            unsafe { libc::geteuid() },
-            unsafe { libc::getgid() },
-            unsafe { libc::getegid() }
+            getuid().as_raw(),
+            geteuid().as_raw(),
+            getgid().as_raw(),
+            getegid().as_raw()
         ));
     }
 }
@@ -388,38 +402,38 @@ pub(crate) fn check_new_netns(old_netns: Option<(u64, u64)>) {
 /// `pidns_and_exec`). That way the death of ai-bubble's caller ripples down
 /// and kills the whole process tree including the exec'd command.
 pub(crate) fn handle_die_with_parent(enabled: bool) {
-    unsafe {
-        if enabled && libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-            die_with_error("Can't set PR_SET_PDEATHSIG");
-        }
-        // Close the classic fork→prctl race: if the parent died between the
-        // fork and the prctl above, the signal was armed against the *new*
-        // (re-parented) parent and will never fire. Every caller's parent is
-        // an ai-bubble process in the host PID namespace, so getppid() == 1
-        // unambiguously means the real parent is already gone — exit rather
-        // than linger. (In `pidns_and_exec`'s forked child the parent lives
-        // outside the new PID namespace, so getppid() returns 0 there, never
-        // a namespace-local 1.)
-        if enabled && libc::getppid() == 1 {
-            die("Parent died before PR_SET_PDEATHSIG was armed");
-        }
-        // AUDIT.md L1: in `pidns_and_exec`'s forked child the check above
-        // is ineffective — the child is the first process of its new PID
-        // namespace, so getppid() returns 0 (its parent lives outside the
-        // namespace), never 1. Detect the same fork→prctl race there by
-        // reading the *host-namespace* parent from /proc: the child runs
-        // this before `mount_and_exec` unshares the mount namespace and
-        // mounts a sandbox /proc, so /proc/self/stat still shows the host
-        // view and field 4 (PPid) is the real parent's host pid. A PPid of
-        // 1 means the launcher was re-parented to init, i.e. it died in
-        // the race window. If /proc is not readable (or the field cannot
-        // be parsed) the check is skipped — the PDEATHSIG arming above
-        // still covers the non-race case, and the residual (SIGKILL to the
-        // launcher inside the window leaves the fully confined command
-        // unsupervised) is accepted and documented in AUDIT.md L1.
-        if enabled && libc::getppid() == 0 && host_ppid_is_init() {
-            die("Parent died before PR_SET_PDEATHSIG was armed");
-        }
+    use rustix::process::{Signal, getppid, set_parent_process_death_signal};
+    if enabled && let Err(e) = set_parent_process_death_signal(Some(Signal::KILL)) {
+        die(&format!("Can't set PR_SET_PDEATHSIG: {e}"));
+    }
+    // Close the classic fork→prctl race: if the parent died between the
+    // fork and the prctl above, the signal was armed against the *new*
+    // (re-parented) parent and will never fire. Every caller's parent is
+    // an ai-bubble process in the host PID namespace, so getppid() == 1
+    // unambiguously means the real parent is already gone — exit rather
+    // than linger. (In `pidns_and_exec`'s forked child the parent lives
+    // outside the new PID namespace, so getppid() returns 0 there, never
+    // a namespace-local 1.)
+    if enabled && getppid().map(|p| p.as_raw_pid()) == Some(1) {
+        die("Parent died before PR_SET_PDEATHSIG was armed");
+    }
+    // AUDIT.md L1: in `pidns_and_exec`'s forked child the check above
+    // is ineffective — the child is the first process of its new PID
+    // namespace, so getppid() returns 0 (its parent lives outside the
+    // namespace), never 1. Detect the same fork→prctl race there by
+    // reading the *host-namespace* parent from /proc: the child runs
+    // this before `mount_and_exec` unshares the mount namespace and
+    // mounts a sandbox /proc, so /proc/self/stat still shows the host
+    // view and field 4 (PPid) is the real parent's host pid. A PPid of
+    // 1 means the launcher was re-parented to init, i.e. it died in
+    // the race window. If /proc is not readable (or the field cannot
+    // be parsed) the check is skipped — the PDEATHSIG arming above
+    // still covers the non-race case, and the residual (SIGKILL to the
+    // launcher inside the window leaves the fully confined command
+    // unsupervised) is accepted and documented in AUDIT.md L1.
+    // (`getppid() == None` is the raw getppid() == 0: no parent.)
+    if enabled && getppid().is_none() && host_ppid_is_init() {
+        die("Parent died before PR_SET_PDEATHSIG was armed");
     }
 }
 
@@ -506,6 +520,7 @@ pub fn setup_and_exec(
         handle_die_with_parent(die_with_parent);
 
         // Prevent gaining privileges via execve of setuid binaries.
+        // (No rustix wrapper on Linux — `set_no_new_privs` is FreeBSD-only.)
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             die_with_error("Can't set PR_SET_NO_NEW_PRIVS");
         }
@@ -514,7 +529,10 @@ pub fn setup_and_exec(
         // mapped in the new user namespace and getuid()/getgid() would return the
         // overflow id (65534), which must not be used in the map (bwrap captures
         // real_uid/real_gid the same way).
-        let (real_uid, real_gid) = (libc::getuid(), libc::getgid());
+        let (real_uid, real_gid) = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
 
         // Unshare the user namespace. After this we have CAP_SYS_ADMIN in the
         // new user namespace and can mount freely. (The mount namespace is
@@ -613,12 +631,11 @@ pub fn setup_and_exec(
 ///
 /// The corresponding mount-side change is in `mount_and_exec`: the host
 /// pts (`/dev/console`) and the `/dev/tty` bind are skipped in this mode.
-pub(crate) unsafe fn new_terminal_session() {
-    unsafe {
-        let _ = libc::ioctl(0, libc::TIOCNOTTY);
-        if libc::setsid() < 0 {
-            die_with_error("Can't start a new terminal session");
-        }
+pub(crate) fn new_terminal_session() {
+    // TIOCNOTTY has no safe wrapper; it is harmless when fd 0 is not a tty.
+    let _ = unsafe { libc::ioctl(0, libc::TIOCNOTTY) };
+    if rustix::process::setsid().is_err() {
+        die_with_error("Can't start a new terminal session");
     }
 }
 
@@ -669,12 +686,12 @@ pub(crate) unsafe fn pidns_and_exec(
                  Re-run with --no-control (or use a non-terminal stdin/stdout).",
             );
         }
-        let pty = if use_pty {
+        let mut pty = if use_pty {
             Some(crate::sandbox::pty::open())
         } else {
             None
         };
-        let stderr_is_tty = libc::isatty(2) == 1;
+        let stderr_is_tty = std::io::stderr().is_terminal();
         // SB-9: pre-create the tmpfs root's backing directory in the
         // launcher (hostfs-root mode needs none), so it can be removed
         // again after the run — see `build_root`.
@@ -701,7 +718,7 @@ pub(crate) unsafe fn pidns_and_exec(
             // Done in this forked child — which is never a process-group
             // leader, so setsid() cannot fail with EPERM — so both entry
             // points get it.
-            if let Some(p) = &pty {
+            if let Some(p) = pty.as_mut() {
                 crate::sandbox::pty::child_attach(p, stderr_is_tty);
             } else if new_session {
                 new_terminal_session();
@@ -720,7 +737,7 @@ pub(crate) unsafe fn pidns_and_exec(
 
         // Parent: the child must not keep the slave open, or the master
         // would never see EOF when the command exits.
-        if let Some(p) = &pty {
+        if let Some(p) = pty.as_mut() {
             crate::sandbox::pty::close_slave(p);
             // Relay stdio ⇄ master until the pty closes or a fatal
             // signal arrives; the terminal is restored before returning.
@@ -775,17 +792,21 @@ pub(crate) unsafe fn pidns_and_exec(
             }
             exit_with_status(status);
         }
-        let mut status: libc::c_int = 0;
         loop {
-            let r = libc::waitpid(pid, &mut status, 0);
-            if r == pid {
-                if let Some(p) = &root_backing {
-                    let _ = fs::remove_dir_all(p);
+            // The child pid is nonzero here (the child branch execs away),
+            // so `from_raw` always succeeds here.
+            let child_pid = rustix::process::Pid::from_raw(pid).unwrap();
+            match rustix::process::waitpid(Some(child_pid), rustix::process::WaitOptions::empty()) {
+                Ok(Some((_, st))) => {
+                    if let Some(p) = &root_backing {
+                        let _ = fs::remove_dir_all(p);
+                    }
+                    exit_with_status(st);
                 }
-                exit_with_status(status);
-            }
-            if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                die_with_error("Can't wait for sandboxed command");
+                // Not reachable without WAITNOHANG, but harmless to handle.
+                Ok(None) => continue,
+                Err(e) if e == rustix::io::Errno::INTR => continue,
+                Err(_) => die_with_error("Can't wait for sandboxed command"),
             }
         }
     }
@@ -888,6 +909,7 @@ pub(crate) unsafe fn mount_tmpfs(
     size: Option<u64>,
     display: &Path,
 ) {
+    use rustix::mount::{MountFlags, mount};
     let mut options = perms.mount_option();
     let bytes = match size {
         Some(bytes) => {
@@ -904,19 +926,15 @@ pub(crate) unsafe fn mount_tmpfs(
     options.push_str(&format!(",size={bytes}"));
     // SB-10: a NUL byte in a spec tmpfs destination panics here without
     // the clean `die()` every other path uses.
-    let dest_c = cstring(dest_abs.as_os_str());
     let options_c = CString::new(options).unwrap();
-    if unsafe {
-        libc::mount(
-            CString::new("tmpfs").unwrap().as_ptr(),
-            dest_c.as_ptr(),
-            CString::new("tmpfs").unwrap().as_ptr(),
-            libc::MS_NOSUID | libc::MS_NODEV,
-            options_c.as_ptr() as *const libc::c_void,
-        )
-    } != 0
-    {
-        die_with_error(&format!("Can't mount tmpfs on {}", display.display()));
+    if let Err(e) = mount(
+        "tmpfs",
+        dest_abs,
+        "tmpfs",
+        MountFlags::NOSUID | MountFlags::NODEV,
+        Some(options_c.as_c_str()),
+    ) {
+        die(&format!("Can't mount tmpfs on {}: {e}", display.display()));
     }
 }
 
@@ -955,16 +973,14 @@ unsafe fn build_root(
 
         // Make our mount tree a slave of the parent, so nothing we mount
         // propagates back to the host.
-        let root = CString::new("/").unwrap();
-        if libc::mount(
-            std::ptr::null(),
-            root.as_ptr(),
-            std::ptr::null(),
-            libc::MS_SLAVE | libc::MS_REC,
-            std::ptr::null(),
-        ) != 0
-        {
-            die_with_error("Can't make mount tree private");
+        use rustix::mount::{
+            MountFlags, MountPropagationFlags, mount, mount_bind, mount_change, mount_remount,
+        };
+        if let Err(e) = mount_change(
+            "/",
+            MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC,
+        ) {
+            die(&format!("Can't make mount tree private: {e}"));
         }
 
         // In hostfs-root mode the FUSE filesystem itself is the sandbox
@@ -992,10 +1008,10 @@ unsafe fn build_root(
             };
 
             let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
-            if libc::mount(
-                CString::new("tmpfs").unwrap().as_ptr(),
-                newroot_c.as_ptr(),
-                CString::new("tmpfs").unwrap().as_ptr(),
+            if let Err(e) = mount(
+                "tmpfs",
+                newroot_c.as_c_str(),
+                "tmpfs",
                 // NOSUID|NODEV like `mount_tmpfs` (AUDIT.md L5): the root is
                 // attacker-writable inside the sandbox, so it must not honor
                 // set-id bits or device nodes (unreachable today —
@@ -1004,11 +1020,14 @@ unsafe fn build_root(
                 // it the kernel default is ≈ half of host RAM and the
                 // command can fill it until the OOM killer fires (no
                 // cgroup, and RLIMIT_AS does not cover tmpfs).
-                libc::MS_NOSUID | libc::MS_NODEV,
-                format!("size={}", DEFAULT_TMPFS_SIZE).as_ptr() as *const libc::c_void,
-            ) != 0
-            {
-                die_with_error("Can't mount tmpfs sandbox root");
+                MountFlags::NOSUID | MountFlags::NODEV,
+                Some(
+                    CString::new(format!("size={}", DEFAULT_TMPFS_SIZE))
+                        .unwrap()
+                        .as_c_str(),
+                ),
+            ) {
+                die(&format!("Can't mount tmpfs sandbox root: {e}"));
             }
             // Root of the sandbox should be traversable by everyone.
             let _ = fs::set_permissions(&newroot, fs::Permissions::from_mode(0o755));
@@ -1027,15 +1046,8 @@ unsafe fn build_root(
             let dest_abs = sandbox_path(&newroot, Path::new(crate::hostfs::SANDBOX_MOUNT_POINT));
             let src_c = CString::new(host_mount.as_os_str().as_bytes()).unwrap();
             let dest_c = CString::new(dest_abs.as_os_str().as_bytes()).unwrap();
-            if libc::mount(
-                src_c.as_ptr(),
-                dest_c.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            ) != 0
-            {
-                die_with_error("Can't bind mount host filesystem to /host");
+            if let Err(e) = mount_bind(src_c.as_c_str(), dest_c.as_c_str()) {
+                die(&format!("Can't bind mount host filesystem to /host: {e}"));
             }
         }
 
@@ -1071,15 +1083,11 @@ unsafe fn build_root(
                     refuse_symlink_dest(&newroot, dest);
                     let src_c = cstring(OsStr::new(src));
                     let dest_c = cstring(dest_abs.as_os_str());
-                    if libc::mount(
-                        src_c.as_ptr(),
-                        dest_c.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND,
-                        std::ptr::null(),
-                    ) != 0
-                    {
-                        die_with_error(&format!("Can't bind mount {src} -> {}", dest.display()));
+                    if let Err(e) = mount_bind(src_c.as_c_str(), dest_c.as_c_str()) {
+                        die(&format!(
+                            "Can't bind mount {src} -> {}: {e}",
+                            dest.display()
+                        ));
                     }
                     // Bind mounts are read-only unless explicitly asked for
                     // (they bypass the FUSE mirror's write policy). The
@@ -1094,27 +1102,23 @@ unsafe fn build_root(
                     // of `/`) would stay openable per host DAC, and set-id
                     // binaries would keep their bit (mitigated by
                     // no_new_privs, but the flags cost nothing).
-                    let harden = libc::MS_BIND
-                        | libc::MS_REMOUNT
-                        | libc::MS_NOSUID
-                        | libc::MS_NODEV
-                        | if !rw { libc::MS_RDONLY } else { 0 };
-                    if libc::mount(
-                        std::ptr::null(),
-                        dest_c.as_ptr(),
-                        std::ptr::null(),
-                        harden,
-                        std::ptr::null(),
-                    ) != 0
-                    {
+                    let harden = MountFlags::BIND
+                        | MountFlags::NOSUID
+                        | MountFlags::NODEV
+                        | if !rw {
+                            MountFlags::RDONLY
+                        } else {
+                            MountFlags::empty()
+                        };
+                    if let Err(e) = mount_remount(dest_c.as_c_str(), harden, "") {
                         if !rw {
-                            die_with_error(&format!(
-                                "Can't make bind mount {src} -> {} read-only",
+                            die(&format!(
+                                "Can't make bind mount {src} -> {} read-only: {e}",
                                 dest.display()
                             ));
                         }
-                        die_with_error(&format!(
-                            "Can't harden bind mount {src} -> {} (NOSUID/NODEV)",
+                        die(&format!(
+                            "Can't harden bind mount {src} -> {} (NOSUID/NODEV): {e}",
                             dest.display()
                         ));
                     }
@@ -1129,7 +1133,6 @@ unsafe fn build_root(
                     ensure_dir(&newroot, dest);
                     refuse_symlink_dest(&newroot, dest);
                     let dest_abs = sandbox_path(&newroot, dest);
-                    let dest_c = cstring(dest_abs.as_os_str());
                     // Mount a *fresh* procfs, like bwrap's --proc does when a
                     // new PID namespace exists: this instance shows only the
                     // sandbox's processes. (We are inside the new PID
@@ -1144,15 +1147,14 @@ unsafe fn build_root(
                     // kernels; not done here because several real
                     // workloads read top-level files (`/proc/cpuinfo`,
                     // `/proc/meminfo`) that subset=pid hides.
-                    if libc::mount(
-                        CString::new("proc").unwrap().as_ptr(),
-                        dest_c.as_ptr(),
-                        CString::new("proc").unwrap().as_ptr(),
-                        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
-                        std::ptr::null(),
-                    ) != 0
-                    {
-                        die_with_error(&format!("Can't mount proc on {}", dest.display()));
+                    if let Err(e) = mount(
+                        "proc",
+                        dest_abs,
+                        "proc",
+                        MountFlags::NOSUID | MountFlags::NOEXEC | MountFlags::NODEV,
+                        None,
+                    ) {
+                        die(&format!("Can't mount proc on {}: {e}", dest.display()));
                     }
                 }
                 Op::Tmpfs { dest, perms, size } => {
@@ -1182,21 +1184,9 @@ unsafe fn build_root(
                     mount_tmpfs(&dev_abs, TmpfsPerms(0o755), None, dest);
 
                     /// Bind-mount a host path over `name` inside the dev tmpfs.
-                    unsafe fn bind_into_dev(src: &str, dest_abs: &Path, name: &str) {
-                        let src_c = CString::new(src).unwrap();
-                        let dest_c =
-                            CString::new(dest_abs.join(name).as_os_str().as_bytes()).unwrap();
-                        if unsafe {
-                            libc::mount(
-                                src_c.as_ptr(),
-                                dest_c.as_ptr(),
-                                std::ptr::null(),
-                                libc::MS_BIND,
-                                std::ptr::null(),
-                            )
-                        } != 0
-                        {
-                            die_with_error(&format!("Can't bind mount {src} to /{name}"));
+                    fn bind_into_dev(src: &str, dest_abs: &Path, name: &str) {
+                        if let Err(e) = rustix::mount::mount_bind(src, dest_abs.join(name)) {
+                            die(&format!("Can't bind mount {src} to /{name}: {e}"));
                         }
                     }
 
@@ -1253,17 +1243,18 @@ unsafe fn build_root(
                     // A fresh devpts instance on /dev/pts, with the ptmx
                     // symlink, exactly like bwrap's --dev.
                     let pts_c = CString::new(dev_abs.join("pts").as_os_str().as_bytes()).unwrap();
-                    if libc::mount(
-                        CString::new("devpts").unwrap().as_ptr(),
-                        pts_c.as_ptr(),
-                        CString::new("devpts").unwrap().as_ptr(),
-                        libc::MS_NOSUID | libc::MS_NOEXEC,
-                        CString::new("newinstance,ptmxmode=0666,mode=620")
-                            .unwrap()
-                            .as_ptr() as *const libc::c_void,
-                    ) != 0
-                    {
-                        die_with_error("Can't mount devpts on /dev/pts");
+                    if let Err(e) = mount(
+                        "devpts",
+                        pts_c.as_c_str(),
+                        "devpts",
+                        MountFlags::NOSUID | MountFlags::NOEXEC,
+                        Some(
+                            CString::new("newinstance,ptmxmode=0666,mode=620")
+                                .unwrap()
+                                .as_c_str(),
+                        ),
+                    ) {
+                        die(&format!("Can't mount devpts on /dev/pts: {e}"));
                     }
                     if std::os::unix::fs::symlink("pts/ptmx", dev_abs.join("ptmx")).is_err() {
                         die_with_error("Can't make symlink ptmx -> pts/ptmx");
@@ -1279,13 +1270,16 @@ unsafe fn build_root(
                     let console_src: Option<String> = if new_session {
                         pty_slave_path.map(str::to_string)
                     } else {
-                        let tty = libc::ttyname(0);
-                        if tty.is_null() {
-                            None
-                        } else {
-                            let host_tty = CStr::from_ptr(tty).to_string_lossy().into_owned();
-                            (!host_tty.is_empty()).then_some(host_tty)
-                        }
+                        // ttyname(2) on fd 0; the borrow of the raw stdio fd
+                        // is safe here (and requires an `unsafe` block only
+                        // because we borrow a raw fd): fd 0 is
+                        // process-lifetime and this thread stays alive
+                        // across the call.
+                        let fd0 = std::os::unix::io::BorrowedFd::borrow_raw(0);
+                        rustix::termios::ttyname(fd0, Vec::new())
+                            .ok()
+                            .map(|tty| tty.to_string_lossy().into_owned())
+                            .filter(|host_tty| !host_tty.is_empty())
                     };
                     if let Some(src) = console_src {
                         if fs::OpenOptions::new()
@@ -1397,12 +1391,13 @@ pub(crate) unsafe fn mount_and_exec(
     unsafe {
         let newroot = build_root(ops, new_session, pty_slave_path, pre_created_root);
         // Enter the sandbox and run the command.
-        let newroot_c = CString::new(newroot.as_os_str().as_bytes()).unwrap();
-        if libc::chdir(newroot_c.as_ptr()) != 0 {
-            die_with_error("Can't chdir to sandbox root");
+        if let Err(e) = rustix::process::chdir(newroot.as_os_str()) {
+            die(&format!("Can't chdir to sandbox root: {e}"));
         }
-        if libc::chroot(CString::new(".").unwrap().as_ptr()) != 0 {
-            die_with_error("Can't chroot into sandbox");
+        // rustix's `chroot` is a safe wrapper (it fails with EPERM when
+        // unauthorized); the chroot itself is the security backstop here.
+        if let Err(e) = rustix::process::chroot(".") {
+            die(&format!("Can't chroot into sandbox: {e}"));
         }
 
         // The command's working directory: the spec's `cwd` (already
@@ -1423,15 +1418,15 @@ pub(crate) unsafe fn mount_and_exec(
             }
             None => PathBuf::from("/"),
         };
-        if libc::chdir(cstring(workdir.as_os_str()).as_ptr()) != 0 {
+        if let Err(e) = rustix::process::chdir(cstring(workdir.as_os_str())) {
             let hint = if crate::hostfs::root_mode() {
                 " (the hostfs root only exposes mirrored paths; add a mapping for it \
                  or a parent directory to hostfs.mappings)"
             } else {
                 " (create it with a hostfs mapping or mount it, e.g. with a tmpfs mapping)"
             };
-            die_with_error(&format!(
-                "Can't chdir to working directory {}{hint}",
+            die(&format!(
+                "Can't chdir to working directory {}{hint}: {e}",
                 workdir.display()
             ));
         }

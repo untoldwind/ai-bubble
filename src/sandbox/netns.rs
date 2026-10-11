@@ -38,8 +38,10 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::path::Path;
+
+use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 
 use crate::proxy::PROXY_URL;
 use crate::sandbox::{
@@ -77,40 +79,36 @@ pub fn run(
         // numbered stream — no filesystem name, nothing to bind-mount,
         // nothing the sandboxed command can reach. `SOCK_CLOEXEC` on
         // both ends; the forks below close the end they do not use.
-        // `sv[0]` stays with the connector (it serves the mux), `sv[1]`
-        // goes to P.
-        let mut net_sv: [libc::c_int; 2] = [0; 2];
-        if libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            net_sv.as_mut_ptr(),
-        ) != 0
-        {
-            die_with_error("Can't create the net mux channel");
-        }
+        // `net_conn` stays with the connector (it serves the mux),
+        // `net_p` goes to P.
+        let (net_conn, net_p) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap_or_else(|e| die(&format!("Can't create the net mux channel: {e}")));
 
         // Audit channel (single-writer refactor): P's events go to the
         // connector over this pre-fork socketpair. `SOCK_CLOEXEC` on
         // both ends — the exec'd sandboxed command never sees either
-        // side. `sv[0]` stays with the connector (its hub reads it),
-        // `sv[1]` goes to P. The pair carries only P's upstream audit
+        // side. `audit_conn` stays with the connector (its hub reads it),
+        // `audit_p` goes to P. The pair carries only P's upstream audit
         // events: P holds no control state, so nothing is ever pushed
         // downstream over it.
-        let mut audit_pair: Option<[libc::c_int; 2]> = None;
-        if crate::audit::ipc_channel_wanted() {
-            let mut sv: [libc::c_int; 2] = [0; 2];
-            if libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                0,
-                sv.as_mut_ptr(),
-            ) != 0
-            {
-                die_with_error("Can't create audit channel");
-            }
-            audit_pair = Some(sv);
-        }
+        let audit_pair: Option<(OwnedFd, OwnedFd)> = if crate::audit::ipc_channel_wanted() {
+            Some(
+                socketpair(
+                    AddressFamily::UNIX,
+                    SocketType::STREAM,
+                    SocketFlags::CLOEXEC,
+                    None,
+                )
+                .unwrap_or_else(|e| die(&format!("Can't create audit channel: {e}"))),
+            )
+        } else {
+            None
+        };
 
         // Fork P. This must happen before any runtime or proxy task exists.
         let pid = libc::fork();
@@ -121,7 +119,7 @@ pub fn run(
             // P must not hold the connector's mux end (a lingering copy
             // would keep the connector's reader from ever seeing EOF —
             // same reasoning as the audit pair below).
-            libc::close(net_sv[0]);
+            drop(net_conn);
             // Audit first, before any other work: P inherited the
             // connector's A↔FS hub peer across this fork and must not
             // hold it (a lingering copy would keep the FS hub reader
@@ -132,9 +130,9 @@ pub fn run(
             // namespace would not even see the abstract name).
             crate::audit::close_inherited();
             crate::cli::control::close_inherited_listener();
-            if let Some(sv) = audit_pair {
-                libc::close(sv[0]);
-                crate::audit::set_channel(OwnedFd::from_raw_fd(sv[1]));
+            if let Some((audit_conn, audit_p)) = audit_pair {
+                drop(audit_conn);
+                crate::audit::set_channel(audit_p);
                 crate::audit::drop_log_fd();
             }
             // P only relays `tls-cert` requests to the connector; the CA
@@ -142,7 +140,7 @@ pub fn run(
             // here (AUDIT.md, TLS MITM key hygiene).
             waf::host::wipe_after_fork();
             isolated_parent(
-                net_sv[1],
+                net_p,
                 net,
                 ops,
                 command,
@@ -157,10 +155,10 @@ pub fn run(
         // Connector: close P's mux end, register our end of the audit
         // channel for the hub, then serve proxy/waf requests from the
         // host side and watch for P's exit.
-        libc::close(net_sv[1]);
-        if let Some(sv) = audit_pair {
-            libc::close(sv[1]);
-            crate::audit::add_peer(crate::audit::PeerRole::Network, OwnedFd::from_raw_fd(sv[0]));
+        drop(net_p);
+        if let Some((audit_conn, audit_p)) = audit_pair {
+            drop(audit_p);
+            crate::audit::add_peer(crate::audit::PeerRole::Network, audit_conn);
         }
         // The shared allow-list: the launcher keeps this authoritative
         // handle (the control plane's `net-set` swaps it at runtime), the
@@ -184,7 +182,7 @@ pub fn run(
             // io driver sees the mux EOF before the blocking waitpid's
             // result makes it back here).
             let mode = net.mode;
-            let pair = crate::ipc::netmux::stream_from_raw_fd(net_sv[0]);
+            let pair = crate::ipc::netmux::stream_from_raw_fd(net_conn.into_raw_fd());
             let serve = tokio::spawn(async move {
                 match mode {
                     NetMode::Proxy => {
@@ -251,7 +249,7 @@ pub fn run(
 // default limit is fine here.
 #[allow(clippy::too_many_arguments)]
 fn isolated_parent(
-    net_fd: libc::c_int,
+    net_fd: OwnedFd,
     net: &Net,
     ops: &[Op],
     command: &[String],
@@ -274,7 +272,10 @@ fn isolated_parent(
         }
 
         // Capture the real uid/gid BEFORE unsharing (see sandbox::setup_and_exec).
-        let (real_uid, real_gid) = (libc::getuid(), libc::getgid());
+        let (real_uid, real_gid) = (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw(),
+        );
 
         // P and C share this user namespace, so the maps must be set up exactly
         // once, here. C unshares only the mount namespace and inherits the
@@ -392,7 +393,7 @@ fn isolated_parent(
             // The P end of the net mux channel (PLAN.md Phase 2): the
             // frontends open their host-side requests as mux streams on
             // it. Wrapped inside the runtime, like the audit channel.
-            let net_pair = crate::ipc::netmux::stream_from_raw_fd(net_fd);
+            let net_pair = crate::ipc::netmux::stream_from_raw_fd(net_fd.into_raw_fd());
             // The audit sink must exist before any `record` fires; there
             // is no P-side control loop any more (the allow-list is
             // A-local), so the channel's read half stays unused.
@@ -442,20 +443,21 @@ fn isolated_parent(
     }
 }
 
-/// Wait for `pid` on a blocking thread and return its raw waitpid status,
+/// Wait for `pid` on a blocking thread and return its waitpid status,
 /// so the async accept loops above are never stalled by waitpid. Also
 /// used by the non-isolated supervisor's control-serving branch (see
 /// `sandbox::pidns_and_exec`).
-pub(crate) async fn wait_status(pid: libc::pid_t) -> libc::c_int {
+pub(crate) async fn wait_status(pid: libc::pid_t) -> rustix::process::WaitStatus {
     tokio::task::spawn_blocking(move || {
-        let mut status: libc::c_int = 0;
+        // `pid` is a nonzero fork result here, so `from_raw` succeeds.
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
         loop {
-            let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if r == pid {
-                return status;
-            }
-            if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                die_with_error("Can't wait for sandboxed command");
+            match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty()) {
+                Ok(Some((_, st))) => return st,
+                // Not reachable without WAITNOHANG, but harmless to handle.
+                Ok(None) => continue,
+                Err(e) if e == rustix::io::Errno::INTR => continue,
+                Err(_) => die_with_error("Can't wait for sandboxed command"),
             }
         }
     })

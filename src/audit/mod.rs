@@ -888,9 +888,13 @@ mod tests {
 
     /// Create a FIFO for the refusal tests.
     fn nix_fifo(path: &Path) {
-        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-        let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
-        assert_eq!(ret, 0, "mkfifo failed");
+        if let Err(e) = rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::Mode::from_raw_mode(0o644),
+        ) {
+            panic!("mkfifo failed: {e}");
+        }
     }
 
     /// SP-2: a child cannot forge another component's source. An event

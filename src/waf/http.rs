@@ -59,7 +59,6 @@
 
 use std::future::Future;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -142,7 +141,7 @@ fn bind_frontend(addr: &str, what: &str) -> std::net::TcpListener {
     let listener = std::net::TcpListener::bind(addr).unwrap_or_else(|e| {
         crate::sandbox::die(&format!("Can't bind waf {what} listener on {addr}: {e}"))
     });
-    let _ = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    crate::sandbox::set_cloexec(&listener);
     listener
 }
 
@@ -159,7 +158,7 @@ fn clone_listener(listener: &std::net::TcpListener) -> std::net::TcpListener {
 /// cannot serve without its frontends.
 fn register_frontend(listener: &std::net::TcpListener, what: &str) -> TcpListener {
     let fd = clone_listener(listener);
-    let _ = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    crate::sandbox::set_cloexec(&fd);
     let _ = fd.set_nonblocking(true);
     TcpListener::from_std(fd)
         .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't register {what} listener: {e}")))

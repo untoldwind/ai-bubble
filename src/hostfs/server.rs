@@ -2,9 +2,8 @@
 //! readiness pipe and signal handling), mounting the mirror, serving the
 //! session, and the last-resort unmounts.
 
-use std::ffi::CString;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::OwnedFd;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -85,33 +84,29 @@ pub fn start_host_fs(patterns: &SharedPatterns) {
     HOST_PID.store(std::process::id() as i32, Ordering::SeqCst);
 
     // Readiness pipe: the server writes one byte after a successful mount.
-    let mut fds: [libc::c_int; 2] = [0; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        die_with_error("Can't create readiness pipe");
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
+    // Plain `pipe()` (no CLOEXEC), like before: the server child never
+    // execs, the descriptors cross the fork by design.
+    let (read_fd, write_fd) =
+        rustix::pipe::pipe().unwrap_or_else(|e| die(&format!("Can't create readiness pipe: {e}")));
 
     // Audit channel (single-writer refactor): on the isolated path the
     // server's events go to the launcher over this pre-fork socketpair.
     // `SOCK_CLOEXEC` on both ends — neither side may survive an `exec`.
-    // `sv[0]` stays with the launcher (its hub reads it), `sv[1]` goes
-    // to the server child.
-    let mut audit_pair: Option<[libc::c_int; 2]> = None;
-    if crate::audit::ipc_channel_wanted() {
-        let mut sv: [libc::c_int; 2] = [0; 2];
-        if unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                0,
-                sv.as_mut_ptr(),
+    // `audit_conn` stays with the launcher (its hub reads it), `audit_p`
+    // goes to the server child.
+    let audit_pair: Option<(OwnedFd, OwnedFd)> = if crate::audit::ipc_channel_wanted() {
+        Some(
+            rustix::net::socketpair(
+                rustix::net::AddressFamily::UNIX,
+                rustix::net::SocketType::STREAM,
+                rustix::net::SocketFlags::CLOEXEC,
+                None,
             )
-        } != 0
-        {
-            die_with_error("Can't create audit channel");
-        }
-        audit_pair = Some(sv);
-    }
+            .unwrap_or_else(|e| die(&format!("Can't create audit channel: {e}"))),
+        )
+    } else {
+        None
+    };
 
     // Block the signals that terminate ai-bubble (plus SIGPIPE) *around the
     // fork*: the server child inherits the blocked mask, so a SIGINT/SIGTERM
@@ -136,10 +131,8 @@ pub fn start_host_fs(patterns: &SharedPatterns) {
     }
     if pid == 0 {
         // Child: serve the FUSE filesystem forever (or until the host dies).
-        unsafe {
-            libc::close(read_fd);
-            disarm_signals();
-        }
+        drop(read_fd);
+        unsafe { disarm_signals() };
         // The FUSE server never signs certificates; drop the waf CA private
         // key fork-copied into this address space (AUDIT.md, TLS MITM key hygiene).
         crate::waf::host::wipe_after_fork();
@@ -151,9 +144,9 @@ pub fn start_host_fs(patterns: &SharedPatterns) {
         // control, and a lingering copy would keep the abstract socket
         // name bound after the launcher exits.
         crate::cli::control::close_inherited_listener();
-        if let Some(sv) = audit_pair {
-            unsafe { libc::close(sv[0]) };
-            crate::audit::set_channel(unsafe { OwnedFd::from_raw_fd(sv[1]) });
+        if let Some((audit_conn, audit_p)) = audit_pair {
+            drop(audit_conn);
+            crate::audit::set_channel(audit_p);
             crate::audit::drop_log_fd();
         }
         serve(patterns.clone(), mountpoint, write_fd);
@@ -163,17 +156,16 @@ pub fn start_host_fs(patterns: &SharedPatterns) {
 
     // Parent: register our end of the audit channel for the hub, then
     // wait for readiness.
-    if let Some(sv) = audit_pair {
-        unsafe { libc::close(sv[1]) };
-        crate::audit::add_peer(crate::audit::PeerRole::HostFs, unsafe {
-            OwnedFd::from_raw_fd(sv[0])
-        });
+    if let Some((audit_conn, audit_p)) = audit_pair {
+        drop(audit_p);
+        crate::audit::add_peer(crate::audit::PeerRole::HostFs, audit_conn);
     }
-    unsafe { libc::close(write_fd) };
+    drop(write_fd);
     let mut byte: u8 = 0;
-    let n = unsafe { libc::read(read_fd, (&mut byte) as *mut u8 as *mut libc::c_void, 1) };
-    unsafe { libc::close(read_fd) };
-    if n != 1 {
+    let n =
+        rustix::io::read(&read_fd, std::slice::from_mut(&mut byte)).map_err(std::io::Error::from);
+    drop(read_fd);
+    if !matches!(n, Ok(1)) {
         // The child printed a detailed error before exiting.
         let _ = std::fs::remove_dir(&mountpoint);
         crate::sandbox::die("Can't mount mirrored filesystem (is fusermount3 installed?)");
@@ -186,9 +178,9 @@ pub fn start_host_fs(patterns: &SharedPatterns) {
 /// loop is a spawned task, and a current-thread runtime only polls its tasks
 /// while `block_on` is running — returning early would silently stall the
 /// event loop and every filesystem access would hang.
-fn serve(policy: SharedPatterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> ! {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+fn serve(policy: SharedPatterns, mountpoint: PathBuf, ready_fd: OwnedFd) -> ! {
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -230,9 +222,8 @@ fn serve(policy: SharedPatterns, mountpoint: PathBuf, ready_fd: libc::c_int) -> 
 
             // Signal readiness to the parent.
             let byte: u8 = 1;
-            let _ =
-                unsafe { libc::write(ready_fd, (&byte) as *const u8 as *const libc::c_void, 1) };
-            unsafe { libc::close(ready_fd) };
+            let _ = rustix::io::write(&ready_fd, std::slice::from_ref(&byte));
+            drop(ready_fd);
 
             // Serve until the launcher says the run is ending, or until
             // the launcher process dies, then unmount cleanly. The
@@ -403,11 +394,10 @@ fn lazy_unmount(mountpoint: &Path) -> std::io::Result<()> {
         Err(e) => Err(e),
     };
     via_fusermount.or_else(|_| {
-        let c = CString::new(mountpoint.as_os_str().as_bytes()).expect("no NUL in mountpoint");
-        if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } == 0 {
-            Ok(())
+        if let Err(e) = rustix::mount::unmount(mountpoint, rustix::mount::UnmountFlags::DETACH) {
+            Err(std::io::Error::from(e))
         } else {
-            Err(std::io::Error::last_os_error())
+            Ok(())
         }
     })
 }

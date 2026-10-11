@@ -14,7 +14,6 @@
 //! bound in [`ProxyService::new`] and spawned by [`ProxyService::spawn`].
 
 use std::io::ErrorKind;
-use std::os::fd::AsRawFd;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -66,7 +65,7 @@ fn bind_proxy_listener() -> std::net::TcpListener {
             super::PROXY_ADDR
         ))
     });
-    let _ = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    crate::sandbox::set_cloexec(&listener);
     listener
 }
 
@@ -83,7 +82,7 @@ fn clone_listener(listener: &std::net::TcpListener) -> std::net::TcpListener {
 /// cannot serve without its listener.
 fn register_listener(listener: &std::net::TcpListener) -> TcpListener {
     let fd = clone_listener(listener);
-    let _ = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    crate::sandbox::set_cloexec(&fd);
     let _ = fd.set_nonblocking(true);
     TcpListener::from_std(fd)
         .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't register proxy listener: {e}")))

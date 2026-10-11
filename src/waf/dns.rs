@@ -26,7 +26,6 @@
 
 use simple_dns::rdata::{A, RData};
 use simple_dns::{CLASS, OPCODE, Packet, PacketFlag, QCLASS, QTYPE, RCODE, ResourceRecord};
-use std::os::fd::AsRawFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -102,7 +101,7 @@ fn bind_dns_tcp() -> std::net::TcpListener {
             "Can't bind waf DNS TCP listener on {DNS_ADDR}: {e}"
         ))
     });
-    let _ = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    crate::sandbox::set_cloexec(&listener);
     listener
 }
 
@@ -110,7 +109,7 @@ fn bind_dns_udp() -> std::net::UdpSocket {
     let socket = std::net::UdpSocket::bind(DNS_ADDR).unwrap_or_else(|e| {
         crate::sandbox::die(&format!("Can't bind waf DNS UDP socket on {DNS_ADDR}: {e}"))
     });
-    let _ = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    crate::sandbox::set_cloexec(&socket);
     socket
 }
 
@@ -203,7 +202,7 @@ impl DnsService {
 /// waf mode cannot serve without DNS.
 fn register_udp(socket: &std::net::UdpSocket) -> UdpSocket {
     let fd = clone_socket(socket);
-    let _ = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    crate::sandbox::set_cloexec(&fd);
     let _ = fd.set_nonblocking(true);
     UdpSocket::from_std(fd)
         .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't register DNS UDP socket: {e}")))
@@ -213,7 +212,7 @@ fn register_udp(socket: &std::net::UdpSocket) -> UdpSocket {
 /// [`register_udp`]).
 fn register_tcp(listener: &std::net::TcpListener) -> TcpListener {
     let fd = clone_socket(listener);
-    let _ = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    crate::sandbox::set_cloexec(&fd);
     let _ = fd.set_nonblocking(true);
     TcpListener::from_std(fd)
         .unwrap_or_else(|e| crate::sandbox::die(&format!("Can't register DNS TCP listener: {e}")))

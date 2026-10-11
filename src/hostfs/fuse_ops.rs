@@ -19,15 +19,10 @@ pub(super) const SAFE_MODE: libc::mode_t = 0o7777 & !0o6000;
 /// the `setattr` chown clamp (AUDIT.md L2). An empty supplementary list
 /// (or a `getgroups` error) leaves only the primary gid — fail closed.
 fn self_groups() -> Vec<libc::gid_t> {
-    let mut gids = vec![unsafe { libc::getgid() }];
-    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if n > 0 {
-        let mut buf = vec![0 as libc::gid_t; n as usize];
-        let got = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
-        if got > 0 {
-            buf.truncate(got as usize);
-            gids.extend(buf);
-        }
+    use rustix::process::{getgid, getgroups};
+    let mut gids = vec![getgid().as_raw()];
+    if let Ok(groups) = getgroups() {
+        gids.extend(groups.iter().map(|g| g.as_raw()));
     }
     gids
 }
@@ -875,14 +870,11 @@ impl Filesystem for HostFs {
             Ok(fd) => fd,
             Err(e) => return Err(e.into()),
         };
-        let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: valid descriptor and a writable `statvfs` buffer.
-        let rc = unsafe { libc::fstatvfs(fd.as_raw_fd(), &mut vfs) };
-        let err = std::io::Error::last_os_error();
+        let vfs = match rustix::fs::fstatvfs(&fd) {
+            Ok(vfs) => vfs,
+            Err(e) => return Err(std::io::Error::from(e).into()),
+        };
         drop(fd);
-        if rc != 0 {
-            return Err(err.into());
-        }
         Ok(ReplyStatFs {
             blocks: vfs.f_blocks,
             bfree: vfs.f_bfree,
@@ -1243,7 +1235,7 @@ impl Filesystem for HostFs {
             // the process itself legitimately holds is allowed: its own
             // uid, and its own gid or one of its supplementary groups
             // (u32::MAX means "leave unchanged" — the kernel's -1).
-            let self_uid = unsafe { libc::getuid() };
+            let self_uid = rustix::process::getuid().as_raw();
             if uid != u32::MAX && uid != self_uid {
                 return Err(libc::EACCES.into());
             }
