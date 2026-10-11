@@ -703,14 +703,7 @@ async fn handle_command(value: Value) -> Reply {
         "net-set" => net_set(&value).await,
         "spec-reload" => match spec_reload_inner().await {
             Ok(()) => {
-                audit::record(
-                    "control",
-                    "policy-change",
-                    None,
-                    Some("ok"),
-                    Some("spec-reload".into()),
-                )
-                .await;
+                audit::record(audit::Event::policy_change("spec-reload".into())).await;
                 ok_reply()
             }
             Err(e) => err_reply(e),
@@ -765,14 +758,7 @@ async fn fs_set(value: &Value) -> Reply {
     };
     match fs_apply_list(mappings, true).await {
         Ok(()) => {
-            audit::record(
-                "control",
-                "policy-change",
-                None,
-                Some("ok"),
-                Some("fs-set".into()),
-            )
-            .await;
+            audit::record(audit::Event::policy_change("fs-set".into())).await;
             ok_reply()
         }
         Err(e) => err_reply(e),
@@ -893,14 +879,7 @@ async fn net_set(value: &Value) -> Reply {
     };
     match net_apply_list(list, true).await {
         Ok(()) => {
-            audit::record(
-                "control",
-                "policy-change",
-                None,
-                Some("ok"),
-                Some("net-set".into()),
-            )
-            .await;
+            audit::record(audit::Event::policy_change("net-set".into())).await;
             ok_reply()
         }
         Err(e) => err_reply(e),
@@ -1208,14 +1187,7 @@ pub async fn reload_task() {
         hup.recv().await;
         match spec_reload_inner().await {
             Ok(()) => {
-                audit::record(
-                    "control",
-                    "policy-change",
-                    None,
-                    Some("ok"),
-                    Some("spec-reload (SIGHUP)".into()),
-                )
-                .await;
+                audit::record(audit::Event::policy_change("spec-reload (SIGHUP)".into())).await;
                 eprintln!("ai-bubble: spec reloaded on SIGHUP");
             }
             Err(e) => eprintln!("ai-bubble: SIGHUP spec reload rejected: {e}"),

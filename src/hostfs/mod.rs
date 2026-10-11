@@ -121,6 +121,7 @@ pub use server::start_host_fs;
 #[allow(unused_imports)]
 pub use session::{new_session_cache_dir, session_cache_needed, set_session_cache_root};
 
+use crate::audit::{Event, FsOp, Outcome};
 use fuse_ops::{attr_from_stat, cstring_of};
 use inodes::InodeMap;
 use patterns::Patterns;
@@ -128,38 +129,40 @@ use patterns::Patterns;
 /// Log a failed FUSE op with the mirrored and the real host path (debug
 /// helper, only active with `RS_BUBBLE_FUSE_LOG` set) and turn it into an
 /// audit event.
-async fn log_op_err(op: &str, mirrored: &Path, real: Option<&Path>, err: &std::io::Error) {
+async fn log_op_err(op: FsOp, mirrored: &Path, real: Option<&Path>, err: &std::io::Error) {
     fuselog::event!(
-        "FS {op} err={err} mirrored={} real={}",
+        "FS {op:?} err={err} mirrored={} real={}",
         fuselog::path_string(mirrored.as_os_str()),
         real.map(|p| fuselog::path_string(p.as_os_str()))
             .unwrap_or_else(|| "-".into()),
     );
-    crate::audit::record(
-        "hostfs",
+    crate::audit::record(Event::hostfs(
         op,
-        Some(&mirrored.to_string_lossy()),
-        Some(&format!("err: {err}")),
+        &mirrored.to_string_lossy(),
+        Outcome::Err {
+            error: err.to_string(),
+        },
         real.map(|p| p.to_string_lossy().into_owned()),
-    )
+        None,
+    ))
     .await;
 }
 
 /// Log a successful structural op (create/mkdir/…) with its paths, and
 /// turn it into an audit event.
-async fn log_op_ok(op: &str, mirrored: &Path, real: &Path) {
+async fn log_op_ok(op: FsOp, mirrored: &Path, real: &Path) {
     fuselog::event!(
-        "FS {op} ok mirrored={} real={}",
+        "FS {op:?} ok mirrored={} real={}",
         fuselog::path_string(mirrored.as_os_str()),
         fuselog::path_string(real.as_os_str())
     );
-    crate::audit::record(
-        "hostfs",
+    crate::audit::record(Event::hostfs(
         op,
-        Some(&mirrored.to_string_lossy()),
-        Some("ok"),
+        &mirrored.to_string_lossy(),
+        Outcome::Ok,
         Some(real.to_string_lossy().into_owned()),
-    )
+        None,
+    ))
     .await;
 }
 
@@ -717,12 +720,7 @@ impl HostFs {
                 // owns it), so it lists a *duplicate*; the original stays
                 // pinned below for the entries' attributes.
                 let stamp = match anchored::fstat(opened.as_fd()) {
-                    Ok(st) => (
-                        st.st_mtime,
-                        st.st_mtime_nsec,
-                        st.st_ctime,
-                        st.st_ctime_nsec,
-                    ),
+                    Ok(st) => (st.st_mtime, st.st_mtime_nsec, st.st_ctime, st.st_ctime_nsec),
                     Err(_) => (0, 0, 0, 0),
                 };
                 let mut cache = self.dir_cache.lock().unwrap_or_else(|e| e.into_inner());

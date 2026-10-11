@@ -189,12 +189,24 @@ impl ProxyService {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("ai-bubble proxy: can't reach connector: {e}");
-                crate::audit::record("proxy", "CONNECT", Some(&target), Some("err"), None).await;
+                crate::audit::record(crate::audit::Event::proxy(
+                    crate::audit::ProxyOp::Connect,
+                    &target,
+                    crate::audit::Outcome::Err {
+                        error: "can't reach connector".into(),
+                    },
+                ))
+                .await;
                 let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 return;
             }
         };
-        crate::audit::record("proxy", "CONNECT", Some(&target), Some("ok"), None).await;
+        crate::audit::record(crate::audit::Event::proxy(
+            crate::audit::ProxyOp::Connect,
+            &target,
+            crate::audit::Outcome::Ok,
+        ))
+        .await;
         let _ = tcp
             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
             .await;

@@ -69,7 +69,12 @@ async fn handle_connector_conn(
             "ai-bubble proxy: connection to {} denied",
             super::log_target(&target)
         );
-        crate::audit::record("proxy", "connect", Some(&target), Some("denied"), None).await;
+        crate::audit::record(crate::audit::Event::proxy(
+            crate::audit::ProxyOp::Connect,
+            &target,
+            crate::audit::Outcome::Denied,
+        ))
+        .await;
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "target not on the allow list",
@@ -85,19 +90,23 @@ async fn handle_connector_conn(
                 "ai-bubble proxy: can't connect to {}: {e}",
                 super::log_target(&target)
             );
-            crate::audit::record(
-                "proxy",
-                "connect",
-                Some(&target),
-                Some("err"),
-                Some(format!("{e}")),
-            )
+            crate::audit::record(crate::audit::Event::proxy(
+                crate::audit::ProxyOp::Connect,
+                &target,
+                crate::audit::Outcome::Err {
+                    error: e.to_string(),
+                },
+            ))
             .await;
             return Err(io::Error::other(format!("can't connect: {e}")));
         }
     };
-    crate::audit::record("proxy", "connect", Some(&target), Some("ok"), None).await;
-    // The old flow's status byte: the ack tells the client the pipe is
+    crate::audit::record(crate::audit::Event::proxy(
+        crate::audit::ProxyOp::Connect,
+        &target,
+        crate::audit::Outcome::Ok,
+    ))
+    .await;
     // live, then the tunnel carries its payload.
     stream.ack(&ProxyReply {}).await?;
     let _ = tokio::io::copy_bidirectional(stream, &mut tcp).await;

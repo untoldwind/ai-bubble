@@ -28,6 +28,8 @@ use std::io;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::audit::{Event, Outcome, WafOp};
+
 use base64::Engine as _;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
@@ -86,14 +88,14 @@ async fn handle_host_req(
         WafReq::ResolveDns { name } => {
             if !valid_name(&name) || !host_allowed(&name, allow) {
                 eprintln!("ai-bubble waf: DNS lookup of {name} denied");
-                crate::audit::record("waf", "resolve-dns", Some(&name), Some("denied"), None).await;
+                crate::audit::record(Event::waf(WafOp::DnsResolve, &name, Outcome::Denied)).await;
                 return stream
                     .ack(&WafReply::Denied {
                         reason: "name not on the allow list".to_string(),
                     })
                     .await;
             }
-            crate::audit::record("waf", "resolve-dns", Some(&name), Some("ok"), None).await;
+            crate::audit::record(Event::waf(WafOp::DnsResolve, &name, Outcome::Ok)).await;
             stream
                 .ack(&WafReply::Dns {
                     addr: REDIRECT_ADDR.to_string(),
@@ -103,7 +105,7 @@ async fn handle_host_req(
         WafReq::Connect { target } => {
             if !valid_target(&target) || !target_allowed(&target, allow) {
                 eprintln!("ai-bubble waf: connection to {target} denied");
-                crate::audit::record("waf", "connect", Some(&target), Some("denied"), None).await;
+                crate::audit::record(Event::waf(WafOp::Connect, &target, Outcome::Denied)).await;
                 return stream
                     .ack(&WafReply::Denied {
                         reason: "target not on the allow list".to_string(),
@@ -117,13 +119,13 @@ async fn handle_host_req(
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("ai-bubble waf: can't connect to {target}: {e}");
-                    crate::audit::record(
-                        "waf",
-                        "connect",
-                        Some(&target),
-                        Some("err"),
-                        Some(format!("{e}")),
-                    )
+                    crate::audit::record(Event::waf(
+                        WafOp::Connect,
+                        &target,
+                        Outcome::Err {
+                            error: e.to_string(),
+                        },
+                    ))
                     .await;
                     return stream
                         .ack(&WafReply::Failed {
@@ -132,7 +134,7 @@ async fn handle_host_req(
                         .await;
                 }
             };
-            crate::audit::record("waf", "connect", Some(&target), Some("ok"), None).await;
+            crate::audit::record(Event::waf(WafOp::Connect, &target, Outcome::Ok)).await;
             stream.ack(&WafReply::Open).await?;
             let _ = tokio::io::copy_bidirectional(stream, &mut tcp).await;
             let _ = stream.close().await;
@@ -143,7 +145,7 @@ async fn handle_host_req(
             // waf CA, valid for exactly the SNI the client connected to.
             if !valid_name(&name) || !host_allowed(&name, allow) {
                 eprintln!("ai-bubble waf: TLS certificate for {name} denied");
-                crate::audit::record("waf", "tls-cert", Some(&name), Some("denied"), None).await;
+                crate::audit::record(Event::waf(WafOp::TlsCert, &name, Outcome::Denied)).await;
                 return stream
                     .ack(&WafReply::Denied {
                         reason: "name not on the allow list".to_string(),
@@ -165,14 +167,8 @@ async fn handle_host_req(
             } else {
                 if !take_keygen_token().await {
                     eprintln!("ai-bubble waf: tls-cert for {name} rate-limited");
-                    crate::audit::record(
-                        "waf",
-                        "tls-cert",
-                        Some(&name),
-                        Some("rate-limited"),
-                        None,
-                    )
-                    .await;
+                    crate::audit::record(Event::waf(WafOp::TlsCert, &name, Outcome::RateLimited))
+                        .await;
                     return stream
                         .ack(&WafReply::Denied {
                             reason: "too many certificate requests".to_string(),
@@ -183,13 +179,13 @@ async fn handle_host_req(
                     Ok(pair) => pair,
                     Err(e) => {
                         eprintln!("ai-bubble waf: can't sign a certificate for {name}: {e}");
-                        crate::audit::record(
-                            "waf",
-                            "tls-cert",
-                            Some(&name),
-                            Some("err"),
-                            Some(format!("{e}")),
-                        )
+                        crate::audit::record(Event::waf(
+                            WafOp::TlsCert,
+                            &name,
+                            Outcome::Err {
+                                error: e.to_string(),
+                            },
+                        ))
                         .await;
                         return stream
                             .ack(&WafReply::Failed {
@@ -201,7 +197,7 @@ async fn handle_host_req(
                 cached_cert_insert(&name, &pair);
                 pair
             };
-            crate::audit::record("waf", "tls-cert", Some(&name), Some("ok"), None).await;
+            crate::audit::record(Event::waf(WafOp::TlsCert, &name, Outcome::Ok)).await;
             // One frame: base64(DER cert) SP base64(DER PKCS#8 key).
             stream
                 .ack(&WafReply::Cert {
@@ -217,8 +213,7 @@ async fn handle_host_req(
             // server certificate is verified where the trust anchors live.
             if !valid_target(&target) || !target_allowed(&target, allow) {
                 eprintln!("ai-bubble waf: connection to {target} denied");
-                crate::audit::record("waf", "tls-connect", Some(&target), Some("denied"), None)
-                    .await;
+                crate::audit::record(Event::waf(WafOp::TlsConnect, &target, Outcome::Denied)).await;
                 return stream
                     .ack(&WafReply::Denied {
                         reason: "target not on the allow list".to_string(),
@@ -234,13 +229,13 @@ async fn handle_host_req(
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("ai-bubble waf: can't connect to {target}: {e}");
-                    crate::audit::record(
-                        "waf",
-                        "tls-connect",
-                        Some(&target),
-                        Some("err"),
-                        Some(format!("{e}")),
-                    )
+                    crate::audit::record(Event::waf(
+                        WafOp::TlsConnect,
+                        &target,
+                        Outcome::Err {
+                            error: e.to_string(),
+                        },
+                    ))
                     .await;
                     return stream
                         .ack(&WafReply::Failed {
@@ -269,13 +264,13 @@ async fn handle_host_req(
                 Err(_) => {
                     let e = io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out");
                     eprintln!("ai-bubble waf: TLS handshake with {target} failed: {e}");
-                    crate::audit::record(
-                        "waf",
-                        "tls-connect",
-                        Some(&target),
-                        Some("err"),
-                        Some(format!("{e}")),
-                    )
+                    crate::audit::record(Event::waf(
+                        WafOp::TlsConnect,
+                        &target,
+                        Outcome::Err {
+                            error: e.to_string(),
+                        },
+                    ))
                     .await;
                     return stream
                         .ack(&WafReply::Failed {
@@ -285,13 +280,13 @@ async fn handle_host_req(
                 }
                 Ok(Err(e)) => {
                     eprintln!("ai-bubble waf: TLS handshake with {target} failed: {e}");
-                    crate::audit::record(
-                        "waf",
-                        "tls-connect",
-                        Some(&target),
-                        Some("err"),
-                        Some(format!("{e}")),
-                    )
+                    crate::audit::record(Event::waf(
+                        WafOp::TlsConnect,
+                        &target,
+                        Outcome::Err {
+                            error: e.to_string(),
+                        },
+                    ))
                     .await;
                     return stream
                         .ack(&WafReply::Failed {
@@ -300,7 +295,7 @@ async fn handle_host_req(
                         .await;
                 }
             };
-            crate::audit::record("waf", "tls-connect", Some(&target), Some("ok"), None).await;
+            crate::audit::record(Event::waf(WafOp::TlsConnect, &target, Outcome::Ok)).await;
             stream.ack(&WafReply::Open).await?;
             // Both streams are full duplex; the pipe carries plaintext now.
             let _ = tokio::io::copy_bidirectional(stream, &mut tls).await;

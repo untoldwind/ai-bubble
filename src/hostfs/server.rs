@@ -356,7 +356,11 @@ async fn mount_with_fallback(
             use rustix::mount::{MountFlags, mount_remount};
             let flags = MountFlags::NODEV
                 | MountFlags::NOSUID
-                | if read_only { MountFlags::RDONLY } else { MountFlags::empty() };
+                | if read_only {
+                    MountFlags::RDONLY
+                } else {
+                    MountFlags::empty()
+                };
             if let Err(err) = mount_remount(mountpoint, flags, "") {
                 drop(handle);
                 return Err(std::io::Error::other(format!(

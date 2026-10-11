@@ -213,7 +213,8 @@ impl RootDir {
         let mut size = 4096usize;
         loop {
             let mut buf = vec![0u8; size];
-            let n = rustix::fs::readlinkat_raw(anchored.dir(), anchored.name(), buf.as_mut_slice())?;
+            let n =
+                rustix::fs::readlinkat_raw(anchored.dir(), anchored.name(), buf.as_mut_slice())?;
             if n < size {
                 return Ok(OsStr::from_bytes(&buf[..n]).to_os_string());
             }
@@ -249,7 +250,8 @@ impl AnchoredParent {
     /// `fstatat(AT_SYMLINK_NOFOLLOW)` on the pinned parent + final name — the
     /// anchored "does this entry exist, and what is it" check.
     pub(crate) fn stat_entry(&self) -> io::Result<rustix::fs::Stat> {
-        rustix::fs::statat(self.dir(), self.name(), AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)
+        rustix::fs::statat(self.dir(), self.name(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)
     }
 }
 

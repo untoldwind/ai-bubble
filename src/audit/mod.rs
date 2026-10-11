@@ -75,12 +75,14 @@
 //! * [`writer`] — the audit log *file*: startup configuration and path
 //!   validation, the safe open, the batching file writer and its
 //!   rotation.
+//! * [`event`] — the shared event type.
 //! * [`ipc`] — the *inter-process channels*: the pre-fork socketpairs,
 //!   the children's channel writer, the launcher's hub readers and the
 //!   shutdown choreography.
-//! * this module — the shared event type, the per-process queue, and
-//!   the dispatch between the two sinks (`record`/`setup`/`drain`).
+//! * this module — the per-process queue, and the dispatch between the
+//!   two sinks (`record`/`setup`/`drain`).
 
+mod event;
 mod ipc;
 pub(crate) mod writer;
 
@@ -88,7 +90,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, Sender};
 
 // The public API, unchanged for every caller outside this directory:
@@ -140,31 +141,48 @@ struct SenderCell {
 /// Record one audit event. When the buffer is full, the producing task
 /// is suspended until the writer catches up: audit events are never
 /// dropped. Inert without a configured log path.
-pub async fn record(
-    source: &str,
-    op: &str,
-    path: Option<&str>,
-    result: Option<&str>,
-    detail: Option<String>,
-) {
+///
+/// Stamps `ts`/`pid` (in the emitting process; relays forward them
+/// verbatim) and truncates over-long fields so the serialized frame
+/// always fits the hub readers' line cap.
+pub async fn record(mut event: Event) {
     let Some(sender) = queue_sender() else {
         return;
     };
+    fit_event(&mut event);
+    event.ts = now_micros();
+    event.pid = std::process::id();
     // A closed channel can only mean the writer task is gone (it dies
     // with the process anyway); there is nothing to audit to then.
-    let _ = sender
-        .send(Event {
-            // Stamped here, by the emitting process: a relay (the
-            // launcher's hub) forwards the frame verbatim.
-            ts: now_micros(),
-            pid: std::process::id(),
-            source: fit_field(source),
-            op: fit_field(op),
-            path: path.map(fit_field),
-            result: result.map(fit_field),
-            detail: detail.map(fit_detail),
-        })
-        .await;
+    let _ = sender.send(event).await;
+}
+
+/// Truncate the event's free-form strings so the serialized frame fits
+/// [`ipc::FRAME_CAP`]: the hostfs `detail` via [`fit_detail`], and every
+/// other unbounded string (`path`/`target`, the component payloads'
+/// host paths, errors and change notes) via [`fit_field`] — an over-cap
+/// frame would be treated as malformed by the hub readers and kill that
+/// child's whole audit channel, so `record` guarantees the fit instead.
+fn fit_event(event: &mut Event) {
+    match &mut event.kind {
+        Kind::Hostfs(HostfsEvent {
+            path, detail, real, ..
+        }) => {
+            *path = fit_field(path);
+            *detail = detail.take().map(fit_detail);
+            *real = real.take().map(|r| fit_field(&r));
+        }
+        Kind::Proxy(ProxyEvent { target, .. }) | Kind::Waf(WafEvent { target, .. }) => {
+            *target = fit_field(target);
+        }
+        Kind::Control(ControlEvent { change, detail, .. }) => {
+            *change = change.take().map(|c| fit_field(&c));
+            *detail = detail.take().map(|d| fit_field(&d));
+        }
+        Kind::Net(NetEvent { error, .. }) => {
+            *error = fit_field(error);
+        }
+    }
 }
 
 /// Microseconds since the Unix epoch (0 if the clock is before it).
@@ -188,11 +206,14 @@ fn fit_detail(mut detail: String) -> String {
         serde_json::json!({
             "ts": 0u64,
             "pid": 0u32,
-            "source": "",
-            "op": "",
-            "path": Option::<&str>::None,
-            "result": Option::<&str>::None,
-            "detail": d,
+            "kind": {
+                "source": "hostfs",
+                "op": "lookup",
+                "path": "",
+                "outcome": {"error": ""},
+                "real": "",
+                "detail": d,
+            },
         })
         .to_string()
         .len()
@@ -218,15 +239,16 @@ fn fit_detail(mut detail: String) -> String {
     detail
 }
 
-/// The per-field cap for `source`/`op`/`path`/`result` (SP-9): like
-/// `detail`, these arrive from code paths that could in principle carry
+/// The per-field cap for the event's free-form fields (`path`, host
+/// paths, errors, change notes; SP-9): like `detail`, these arrive from
+/// code paths that could in principle carry
 /// very long strings (a path with thousands of components), and an
 /// over-cap frame would be treated as malformed by the hub readers and
 /// kill that child's whole audit channel. Capped with the same
 /// truncation discipline as `detail`.
 const MAX_FIELD: usize = 4096;
 
-/// Truncate a `source`/`op`/`path`/`result` field to [`MAX_FIELD`] bytes
+/// Truncate a free-form event field to [`MAX_FIELD`] bytes
 /// at a UTF-8 character boundary.
 fn fit_field(s: &str) -> String {
     if s.len() <= MAX_FIELD {
@@ -342,49 +364,11 @@ pub async fn drain() {
     }
 }
 
-/// One audit event, as it flows through the channel — and, serialized,
-/// as one JSON line in the log and as one frame on the inter-process
-/// audit channels (the frame *is* the line: the launcher's hub
-/// deserializes and re-serializes it, so there is one code path and no
-/// format drift). `ts`/`pid` are stamped by the emitting process at
-/// `record` time and forwarded verbatim by relays. `source` is
-/// cross-checked by the launcher's hub against the channel's peer role
-/// (SP-2): a child cannot claim another component's source (e.g. a
-/// compromised FS emitting `source: "control"` with the launcher's pid).
-#[derive(Serialize, Deserialize)]
-// Unknown fields are rejected so a frame that is an event *plus* a
-// control-reply key (`"ack"`) cannot be diverted to the reply channel by
-// the hub's demultiplexer — an audit-suppression primitive for a
-// compromised child (SP-2). With this, such a frame fails the event
-// parse; the reply parse (which now refuses frames carrying event
-// fields) fails too, so the reader treats it as malformed and closes the
-// offending channel — fail-closed.
-#[serde(deny_unknown_fields)]
-pub(crate) struct Event {
-    ts: u64,
-    pid: u32,
-    source: String,
-    op: String,
-    path: Option<String>,
-    result: Option<String>,
-    detail: Option<String>,
-}
-
-impl Event {
-    /// The event as one JSON line — purely mechanical, no stamping.
-    pub(crate) fn to_line(&self) -> String {
-        serde_json::json!({
-            "ts": self.ts,
-            "pid": self.pid,
-            "source": self.source,
-            "op": self.op,
-            "path": self.path,
-            "result": self.result,
-            "detail": self.detail,
-        })
-        .to_string()
-    }
-}
+#[allow(unused_imports)]
+pub(crate) use event::{
+    ControlEvent, ControlOp, Event, FsOp, HostfsEvent, Kind, NetEvent, NetOp, Outcome, ProxyEvent,
+    ProxyOp, WafEvent, WafOp,
+};
 
 #[cfg(test)]
 mod tests {
@@ -398,10 +382,25 @@ mod tests {
     use ipc::FRAME_CAP;
     use writer::{rotate, validate_path};
 
+    /// A stamped hostfs event for the writer/hub tests.
+    fn test_event(ts: u64, pid: u32, op: FsOp) -> Event {
+        let mut event = Event::hostfs(op, "/x", Outcome::Ok, None, None);
+        event.ts = ts;
+        event.pid = pid;
+        event
+    }
+
+    /// The (serialized name, op) pairs the writer/hub tests cycle through.
+    const TEST_OPS: [(&str, FsOp); 3] = [
+        ("read", FsOp::Read),
+        ("write", FsOp::Write),
+        ("create", FsOp::Create),
+    ];
+
     /// Without a configured log path the whole subsystem is inert.
     #[tokio::test]
     async fn inert_without_config() {
-        record("test", "op", None, None, None).await;
+        record(test_event(0, 0, FsOp::Read)).await;
         assert!(SENDER.get_or_init(|| None).is_none());
     }
 
@@ -485,17 +484,7 @@ mod tests {
             .unwrap();
         let writer = tokio::spawn(writer::writer(log.clone(), file, rx));
 
-        tx.send(Event {
-            ts: 1,
-            pid: 2,
-            source: "test".into(),
-            op: "op".into(),
-            path: None,
-            result: None,
-            detail: None,
-        })
-        .await
-        .unwrap();
+        tx.send(test_event(1, 2, FsOp::Read)).await.unwrap();
         // Drop the sender exactly like `drain` does, then await the
         // writer; the event must already be flushed when the await ends.
         drop(tx);
@@ -553,18 +542,8 @@ mod tests {
         let path = log.clone();
         let handle = tokio::spawn(writer::writer(path, file, rx));
 
-        for i in 0..3 {
-            tx.send(Event {
-                ts: 1,
-                pid: 2,
-                source: "test".into(),
-                op: format!("op{i}"),
-                path: Some("/x".into()),
-                result: Some("ok".into()),
-                detail: None,
-            })
-            .await
-            .unwrap();
+        for (_, op) in TEST_OPS {
+            tx.send(test_event(1, 2, op)).await.unwrap();
         }
         // Dropping the sender ends the writer after a final flush.
         drop(tx);
@@ -580,11 +559,11 @@ mod tests {
         assert_eq!(lines.len(), 3);
         for (i, line) in lines.iter().enumerate() {
             let event: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(event["source"], "test");
-            assert_eq!(event["op"], format!("op{i}"));
-            assert_eq!(event["path"], "/x");
-            assert_eq!(event["result"], "ok");
-            assert!(event["detail"].is_null());
+            assert_eq!(event["kind"]["source"], "hostfs");
+            assert_eq!(event["kind"]["op"], TEST_OPS[i].0);
+            assert_eq!(event["kind"]["path"], "/x");
+            assert_eq!(event["kind"]["outcome"], "ok");
+            assert!(event["kind"]["detail"].is_null());
             assert!(event["ts"].is_u64());
             assert!(event["pid"].is_u64());
         }
@@ -674,41 +653,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An `Event` round-trips through its serialized line — the same
-    /// seven-field JSON shape as before the single-writer refactor (the
-    /// frame *is* the line, so the launcher's hub re-serialization keeps
-    /// the log format identical).
+    /// An `Event` round-trips through its serialized line — the
+    /// tagged-JSON shape with the component payload nested under `kind`
+    /// (the frame *is* the line, so the launcher's hub re-serialization
+    /// keeps the log format identical).
     #[test]
     fn event_round_trip_and_line_shape() {
-        let event = Event {
-            ts: 1728000000123456,
-            pid: 1234,
-            source: "hostfs".into(),
-            op: "write".into(),
-            path: Some("/work/x.rs".into()),
-            result: Some("ok".into()),
-            detail: None,
-        };
-        let line = event.to_line();
+        let mut event = Event::hostfs(
+            FsOp::Write,
+            "/work/x.rs",
+            Outcome::Ok,
+            Some("/real/x.rs".into()),
+            None,
+        );
+        event.ts = 1728000000123456;
+        event.pid = 1234;
+        let line = serde_json::to_string(&event).unwrap();
         let back: Event = serde_json::from_str(&line).unwrap();
         assert_eq!(back.ts, event.ts);
         assert_eq!(back.pid, event.pid);
-        assert_eq!(back.source, event.source);
-        assert_eq!(back.op, event.op);
-        assert_eq!(back.path, event.path);
-        assert_eq!(back.result, event.result);
-        assert_eq!(back.detail, event.detail);
+        match (&back.kind, &event.kind) {
+            (Kind::Hostfs(back), Kind::Hostfs(event)) => {
+                assert_eq!(back.op, event.op);
+                assert_eq!(back.outcome, event.outcome);
+                assert_eq!(back.path, event.path);
+                assert_eq!(back.real, event.real);
+                assert_eq!(back.detail, event.detail);
+            }
+            other => panic!("expected hostfs events, got {other:?}"),
+        }
         // Re-serializing the round-tripped event gives the same line.
-        assert_eq!(back.to_line(), line);
+        assert_eq!(serde_json::to_string(&back).unwrap(), line);
 
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["ts"], 1728000000123456u64);
         assert_eq!(v["pid"], 1234u64);
-        assert_eq!(v["source"], "hostfs");
-        assert_eq!(v["op"], "write");
-        assert_eq!(v["path"], "/work/x.rs");
-        assert_eq!(v["result"], "ok");
-        assert!(v["detail"].is_null());
+        assert_eq!(v["kind"]["source"], "hostfs");
+        assert_eq!(v["kind"]["op"], "write");
+        assert_eq!(v["kind"]["path"], "/work/x.rs");
+        assert_eq!(v["kind"]["outcome"], "ok");
+        assert_eq!(v["kind"]["real"], "/real/x.rs");
+        assert!(v["kind"]["detail"].is_null());
     }
 
     /// `fit_detail` truncates an oversized `detail` so the serialized frame
@@ -720,29 +705,19 @@ mod tests {
         assert!(fitted.ends_with(TRUNCATED));
         assert!(fitted.len() < huge.len());
         // The whole event frame must fit (worst-case escaping accounted).
-        let event = Event {
-            ts: 0,
-            pid: 0,
-            source: "hostfs".into(),
-            op: "write".into(),
-            path: Some("/x".into()),
-            result: Some("ok".into()),
-            detail: Some(fitted.clone()),
-        };
-        assert!(event.to_line().len() < FRAME_CAP);
+        let event = Event::hostfs(FsOp::Write, "/x", Outcome::Ok, None, Some(fitted.clone()));
+        assert!(serde_json::to_string(&event).unwrap().len() < FRAME_CAP);
 
         // Worst case for escaping: control bytes expand to `\u00XX`.
         let hostile: String = "\u{1}".repeat(4 * FRAME_CAP);
-        let event = Event {
-            ts: 0,
-            pid: 0,
-            source: "hostfs".into(),
-            op: "write".into(),
-            path: None,
-            result: None,
-            detail: Some(fit_detail(hostile)),
-        };
-        assert!(event.to_line().len() < FRAME_CAP);
+        let event = Event::hostfs(
+            FsOp::Write,
+            "/x",
+            Outcome::Ok,
+            None,
+            Some(fit_detail(hostile)),
+        );
+        assert!(serde_json::to_string(&event).unwrap().len() < FRAME_CAP);
         // Small details pass through untouched.
         assert_eq!(fit_detail("small".into()), "small");
     }
@@ -799,15 +774,7 @@ mod tests {
         // EOF), the file writer flushes and finishes.
         drop(file_tx);
 
-        let event = |i: usize| Event {
-            ts: 1000 + i as u64,
-            pid: 42,
-            source: "hostfs".into(),
-            op: format!("op{i}"),
-            path: Some("/x".into()),
-            result: Some("ok".into()),
-            detail: None,
-        };
+        let event = |i: usize| test_event(1000 + i as u64, 42, TEST_OPS[i % TEST_OPS.len()].1);
         for i in 0..3 {
             tx.send(event(i)).await.unwrap();
         }
@@ -833,7 +800,12 @@ mod tests {
             let back: Event = serde_json::from_str(line).unwrap();
             assert_eq!(back.ts, 1000 + i as u64);
             assert_eq!(back.pid, 42);
-            assert_eq!(back.op, format!("op{i}"));
+            match back.kind {
+                Kind::Hostfs(HostfsEvent { op, .. }) => {
+                    assert_eq!(op, TEST_OPS[i % TEST_OPS.len()].1)
+                }
+                other => panic!("expected a hostfs event, got {other:?}"),
+            }
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -859,17 +831,9 @@ mod tests {
         ));
 
         // Valid event first, then garbage.
-        let event = Event {
-            ts: 7,
-            pid: 8,
-            source: "hostfs".into(),
-            op: "op".into(),
-            path: None,
-            result: None,
-            detail: None,
-        };
+        let event = test_event(7, 8, FsOp::Read);
         a.write_all(&crate::ipc::framing::encode_frame(
-            event.to_line().as_bytes(),
+            serde_json::to_string(&event).unwrap().as_bytes(),
         ))
         .unwrap();
         a.write_all(&crate::ipc::framing::encode_frame(b"this is not json"))
@@ -901,9 +865,8 @@ mod tests {
     }
 
     /// SP-2: a child cannot forge another component's source. An event
-    /// claiming `source: "control"` on the FS channel is stamped back to
-    /// the channel's trusted label, with the claimed value preserved in
-    /// `detail`.
+    /// claiming the `control` component on the FS channel is replaced by
+    /// a forged-source note, with the claimed source label preserved.
     #[tokio::test]
     async fn hub_reader_overrides_a_forged_source() {
         let (mut a, b) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -917,36 +880,37 @@ mod tests {
             Some(file_tx),
             reply_tx,
         ));
-        let event = Event {
-            ts: 7,
-            pid: 8,
-            source: "control".into(),
-            op: "op".into(),
-            path: None,
-            result: None,
-            detail: None,
-        };
-        a.write_all(&crate::ipc::framing::encode_frame(
-            event.to_line().as_bytes(),
-        ))
-        .unwrap();
-        a.flush().unwrap();
-        let forwarded = file_rx.recv().await.unwrap();
-        assert_eq!(forwarded.source, "hostfs");
-        let detail = forwarded.detail.unwrap();
-        assert!(detail.contains("forged source"), "{detail}");
-        // A legit source passes through unchanged.
+        let event = Event::policy_change("net-set".into());
         let mut event = event;
-        event.source = "hostfs".into();
-        event.ts = 9;
+        event.ts = 7;
+        event.pid = 8;
         a.write_all(&crate::ipc::framing::encode_frame(
-            event.to_line().as_bytes(),
+            serde_json::to_string(&event).unwrap().as_bytes(),
         ))
         .unwrap();
         a.flush().unwrap();
         let forwarded = file_rx.recv().await.unwrap();
-        assert_eq!(forwarded.source, "hostfs");
-        assert!(forwarded.detail.is_none());
+        match forwarded.kind {
+            Kind::Control(ControlEvent {
+                op: ControlOp::ForgedSource,
+                change,
+                detail,
+            }) => {
+                assert_eq!(change.as_deref(), Some("control"));
+                let detail = detail.unwrap();
+                assert!(detail.contains("forged source"), "{detail}");
+            }
+            other => panic!("expected a forged-source note, got {other:?}"),
+        }
+        // A legit source passes through unchanged.
+        let event = test_event(9, 8, FsOp::Read);
+        a.write_all(&crate::ipc::framing::encode_frame(
+            serde_json::to_string(&event).unwrap().as_bytes(),
+        ))
+        .unwrap();
+        a.flush().unwrap();
+        let forwarded = file_rx.recv().await.unwrap();
+        assert!(matches!(forwarded.kind, Kind::Hostfs(_)));
         drop(a);
         tokio::time::timeout(std::time::Duration::from_secs(5), reader)
             .await
@@ -979,16 +943,8 @@ mod tests {
         a.flush().unwrap();
         assert_eq!(reply_rx.recv().await, Some(ipc::UpdReply::Ack));
         // The attack frame: event fields + a reply key.
-        let event = Event {
-            ts: 7,
-            pid: 8,
-            source: "hostfs".into(),
-            op: "op".into(),
-            path: None,
-            result: None,
-            detail: None,
-        };
-        let mut line = event.to_line();
+        let event = test_event(7, 8, FsOp::Read);
+        let mut line = serde_json::to_string(&event).unwrap();
         line.truncate(line.len() - 1); // drop the closing brace
         a.write_all(&crate::ipc::framing::encode_frame(
             format!("{line}, \"ack\": true}}").as_bytes(),

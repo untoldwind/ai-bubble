@@ -961,8 +961,7 @@ mod tests {
                                 .await;
                         };
                         stream.ack(&WafReply::Open).await?;
-                        let _ =
-                            tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
                         let _ = stream.close().await;
                         Ok(())
                     }

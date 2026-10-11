@@ -596,13 +596,9 @@ where
 {
     if let Err(e) = check_peer(&pair) {
         eprintln!("warning: netmux peer failed the credential check ({e}); closing the connection");
-        crate::audit::record(
-            "net",
-            "mux-peer",
-            None,
-            Some("denied"),
-            Some(format!("peer credential check failed: {e}")),
-        )
+        crate::audit::record(crate::audit::Event::mux_peer_denied(format!(
+            "peer credential check failed: {e}"
+        )))
         .await;
         // Dropping the pair closes both halves: the serve loop ends
         // here (like any other read-side end) and the caller falls
@@ -932,8 +928,6 @@ impl MuxStream {
         }
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

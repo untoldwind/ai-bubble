@@ -199,7 +199,7 @@ impl Filesystem for HostFs {
                 }
                 Err(e) => {
                     log_op_err(
-                        "lookup",
+                        FsOp::Lookup,
                         &mirrored,
                         Some(&self.patterns.load().redirect(&mirrored)),
                         &e,
@@ -219,7 +219,7 @@ impl Filesystem for HostFs {
             }
         }
         log_op_err(
-            "lookup",
+            FsOp::Lookup,
             &mirrored,
             None,
             &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -259,7 +259,7 @@ impl Filesystem for HostFs {
                 }
                 Err(e) => {
                     log_op_err(
-                        "getattr",
+                        FsOp::Getattr,
                         &mirrored,
                         Some(&self.patterns.load().redirect(&mirrored)),
                         &e,
@@ -270,7 +270,7 @@ impl Filesystem for HostFs {
             }
         }
         log_op_err(
-            "getattr",
+            FsOp::Getattr,
             &mirrored,
             None,
             &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -304,7 +304,7 @@ impl Filesystem for HostFs {
         // openable (a directory that merely leads to a match is not).
         if !self.patterns.load().exists(&mirrored) {
             log_op_err(
-                "open",
+                FsOp::Open,
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -318,7 +318,7 @@ impl Filesystem for HostFs {
             let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
             if write_flags {
                 log_op_err(
-                    "open",
+                    FsOp::Open,
                     &mirrored,
                     None,
                     &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -343,7 +343,7 @@ impl Filesystem for HostFs {
             let write_flags = flags & (libc::O_WRONLY as u32 | libc::O_RDWR as u32) != 0;
             if write_flags {
                 log_op_err(
-                    "open",
+                    FsOp::Open,
                     &mirrored,
                     None,
                     &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -367,7 +367,7 @@ impl Filesystem for HostFs {
         let md_stat = match self.real_lstat(&real) {
             Ok(st) => st,
             Err(e) => {
-                log_op_err("open", &mirrored, Some(&real), &e).await;
+                log_op_err(FsOp::Open, &mirrored, Some(&real), &e).await;
                 // A purely virtual directory (ancestor of an empty or
                 // injected path with no real counterpart) is not openable,
                 // exactly like a real one that `open` refuses: report it as
@@ -384,7 +384,7 @@ impl Filesystem for HostFs {
         };
         if Self::stat_is_symlink(&md_stat) {
             log_op_err(
-                "open",
+                FsOp::Open,
                 &mirrored,
                 Some(&real),
                 &std::io::Error::from_raw_os_error(libc::ELOOP),
@@ -394,7 +394,7 @@ impl Filesystem for HostFs {
         }
         if Self::stat_is_dir(&md_stat) {
             log_op_err(
-                "open",
+                FsOp::Open,
                 &mirrored,
                 Some(&real),
                 &std::io::Error::from_raw_os_error(libc::EISDIR),
@@ -409,7 +409,7 @@ impl Filesystem for HostFs {
         // host, not on the FUSE mount). FIFOs remain allowed.
         if Self::stat_is_special(&md_stat) {
             log_op_err(
-                "open",
+                FsOp::Open,
                 &mirrored,
                 Some(&real),
                 &std::io::Error::from_raw_os_error(libc::EPERM),
@@ -423,7 +423,7 @@ impl Filesystem for HostFs {
             // never writable; the real file permissions are checked by the
             // host filesystem on the actual write.
             log_op_err(
-                "open",
+                FsOp::Open,
                 &mirrored,
                 Some(&real),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -456,7 +456,7 @@ impl Filesystem for HostFs {
         let file = match self.root.open_at(&real, oflags, 0) {
             Ok(f) => f,
             Err(e) => {
-                log_op_err("open", &mirrored, Some(&real), &e).await;
+                log_op_err(FsOp::Open, &mirrored, Some(&real), &e).await;
                 return Err(e.into());
             }
         };
@@ -467,7 +467,7 @@ impl Filesystem for HostFs {
         match file.metadata() {
             Ok(md) if Self::metadata_is_special(&md) => {
                 log_op_err(
-                    "open",
+                    FsOp::Open,
                     &mirrored,
                     Some(&real),
                     &std::io::Error::from_raw_os_error(libc::EPERM),
@@ -477,7 +477,7 @@ impl Filesystem for HostFs {
             }
             Ok(_) => {}
             Err(e) => {
-                log_op_err("open", &mirrored, Some(&real), &e).await;
+                log_op_err(FsOp::Open, &mirrored, Some(&real), &e).await;
                 return Err(e.into());
             }
         }
@@ -537,7 +537,7 @@ impl Filesystem for HostFs {
                 Ok(buf) => buf,
                 Err(e) => {
                     log_op_err(
-                        "read-io",
+                        FsOp::Read,
                         &handle.path,
                         Some(&self.patterns.load().redirect(&handle.path)),
                         &e,
@@ -552,7 +552,7 @@ impl Filesystem for HostFs {
             Ok(p) => p,
             Err(e) => {
                 log_op_err(
-                    "read",
+                    FsOp::Read,
                     Path::new("<none>"),
                     None,
                     &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -563,7 +563,7 @@ impl Filesystem for HostFs {
         };
         if !self.patterns.load().exists(&mirrored) {
             log_op_err(
-                "read",
+                FsOp::Read,
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -596,7 +596,7 @@ impl Filesystem for HostFs {
                 Ok(f) => f,
                 Err(e) => {
                     log_op_err(
-                        "read",
+                        FsOp::Read,
                         &mirrored,
                         Some(&self.patterns.load().redirect(&mirrored)),
                         &e,
@@ -610,7 +610,7 @@ impl Filesystem for HostFs {
         match file.metadata() {
             Ok(md) if Self::metadata_is_special(&md) => {
                 log_op_err(
-                    "read",
+                    FsOp::Read,
                     &mirrored,
                     Some(&self.patterns.load().redirect(&mirrored)),
                     &std::io::Error::from_raw_os_error(libc::EPERM),
@@ -627,7 +627,7 @@ impl Filesystem for HostFs {
             Ok(n) => n,
             Err(e) => {
                 log_op_err(
-                    "read-io",
+                    FsOp::Read,
                     &mirrored,
                     Some(&self.patterns.load().redirect(&mirrored)),
                     &e,
@@ -668,7 +668,7 @@ impl Filesystem for HostFs {
                 Ok(p) => p,
                 Err(e) => {
                     log_op_err(
-                        "write",
+                        FsOp::Write,
                         Path::new("<stale>"),
                         None,
                         &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -682,7 +682,7 @@ impl Filesystem for HostFs {
                 Ok(p) => p,
                 Err(e) => {
                     log_op_err(
-                        "write",
+                        FsOp::Write,
                         Path::new("<none>"),
                         None,
                         &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -705,7 +705,7 @@ impl Filesystem for HostFs {
         let writable = patterns.writable(&mirrored);
         if handle.is_none() && !patterns.exists(&mirrored) {
             log_op_err(
-                "write",
+                FsOp::Write,
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -717,7 +717,7 @@ impl Filesystem for HostFs {
             // The spec must say `rw`; the real file permissions are
             // enforced by the host filesystem on the open below.
             log_op_err(
-                "write",
+                FsOp::Write,
                 &mirrored,
                 Some(&patterns.redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -743,7 +743,7 @@ impl Filesystem for HostFs {
                 Ok(n) => n,
                 Err(e) => {
                     log_op_err(
-                        "write-io",
+                        FsOp::Write,
                         &mirrored,
                         Some(&self.patterns.load().redirect(&mirrored)),
                         &e,
@@ -752,13 +752,13 @@ impl Filesystem for HostFs {
                     return Err(e.into());
                 }
             };
-            crate::audit::record(
-                "hostfs",
-                "write",
-                Some(&mirrored.to_string_lossy()),
-                Some("ok"),
+            crate::audit::record(Event::hostfs(
+                FsOp::Write,
+                &mirrored.to_string_lossy(),
+                Outcome::Ok,
+                None,
                 Some(format!("{} bytes at offset {}", n, offset)),
-            )
+            ))
             .await;
             return Ok(ReplyWrite { written: n as u32 });
         }
@@ -774,7 +774,7 @@ impl Filesystem for HostFs {
             Ok(f) => f,
             Err(e) => {
                 log_op_err(
-                    "write",
+                    FsOp::Write,
                     &mirrored,
                     Some(&self.patterns.load().redirect(&mirrored)),
                     &e,
@@ -788,7 +788,7 @@ impl Filesystem for HostFs {
         match file.metadata() {
             Ok(md) if Self::metadata_is_special(&md) => {
                 log_op_err(
-                    "write",
+                    FsOp::Write,
                     &mirrored,
                     Some(&self.patterns.load().redirect(&mirrored)),
                     &std::io::Error::from_raw_os_error(libc::EPERM),
@@ -806,7 +806,7 @@ impl Filesystem for HostFs {
             Ok(n) => n,
             Err(e) => {
                 log_op_err(
-                    "write-io",
+                    FsOp::Write,
                     &mirrored,
                     Some(&self.patterns.load().redirect(&mirrored)),
                     &e,
@@ -815,13 +815,13 @@ impl Filesystem for HostFs {
                 return Err(e.into());
             }
         };
-        crate::audit::record(
-            "hostfs",
-            "write",
-            Some(&mirrored.to_string_lossy()),
-            Some("ok"),
+        crate::audit::record(Event::hostfs(
+            FsOp::Write,
+            &mirrored.to_string_lossy(),
+            Outcome::Ok,
+            None,
             Some(format!("{} bytes at offset {}", n, offset)),
-        )
+        ))
         .await;
         Ok(ReplyWrite { written: n as u32 })
     }
@@ -1274,7 +1274,7 @@ impl Filesystem for HostFs {
         let mirrored = parent_path.join(name);
         if !self.patterns.load().writable(&mirrored) {
             log_op_err(
-                "mkdir",
+                FsOp::Mkdir,
                 &mirrored,
                 Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1287,7 +1287,7 @@ impl Filesystem for HostFs {
         // no symlink is followed anywhere on the host path.)
         if self.real_exists(&self.patterns.load().redirect(&mirrored)) {
             log_op_err(
-                "mkdir",
+                FsOp::Mkdir,
                 &mirrored,
                 Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EEXIST),
@@ -1316,7 +1316,7 @@ impl Filesystem for HostFs {
             // and any intervening call would clobber it).
             let e = std::io::Error::last_os_error();
             log_op_err(
-                "mkdir",
+                FsOp::Mkdir,
                 &mirrored,
                 Some(&self.patterns.load().redirect(&mirrored)),
                 &e,
@@ -1325,7 +1325,7 @@ impl Filesystem for HostFs {
             return Err(fuse3::Errno::from(e));
         }
         log_op_ok(
-            "mkdir",
+            FsOp::Mkdir,
             &mirrored,
             &self.patterns.load().redirect(&mirrored),
         )
@@ -1353,7 +1353,7 @@ impl Filesystem for HostFs {
         }
         if !self.patterns.load().exists(&mirrored) {
             log_op_err(
-                "unlink",
+                FsOp::Unlink,
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -1363,7 +1363,7 @@ impl Filesystem for HostFs {
         }
         if !self.patterns.load().writable(&mirrored) {
             log_op_err(
-                "unlink",
+                FsOp::Unlink,
                 &mirrored,
                 Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1377,7 +1377,7 @@ impl Filesystem for HostFs {
         if unsafe { libc::unlinkat(anchored.dir().as_raw_fd(), anchored.name().as_ptr(), 0) } != 0 {
             let e = std::io::Error::last_os_error();
             log_op_err(
-                "unlink",
+                FsOp::Unlink,
                 &mirrored,
                 Some(&self.patterns.load().redirect(&mirrored)),
                 &e,
@@ -1400,7 +1400,7 @@ impl Filesystem for HostFs {
             return Err(e.into());
         }
         log_op_ok(
-            "unlink",
+            FsOp::Unlink,
             &mirrored,
             &self.patterns.load().redirect(&mirrored),
         )
@@ -1419,7 +1419,7 @@ impl Filesystem for HostFs {
         }
         if !self.patterns.load().exists(&mirrored) {
             log_op_err(
-                "rmdir",
+                FsOp::Rmdir,
                 &mirrored,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -1429,7 +1429,7 @@ impl Filesystem for HostFs {
         }
         if !self.patterns.load().writable(&mirrored) {
             log_op_err(
-                "rmdir",
+                FsOp::Rmdir,
                 &mirrored,
                 Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1450,7 +1450,7 @@ impl Filesystem for HostFs {
         {
             let e = std::io::Error::last_os_error();
             log_op_err(
-                "rmdir",
+                FsOp::Rmdir,
                 &mirrored,
                 Some(&self.patterns.load().redirect(&mirrored)),
                 &e,
@@ -1473,7 +1473,7 @@ impl Filesystem for HostFs {
             return Err(e.into());
         }
         log_op_ok(
-            "rmdir",
+            FsOp::Rmdir,
             &mirrored,
             &self.patterns.load().redirect(&mirrored),
         )
@@ -1502,7 +1502,7 @@ impl Filesystem for HostFs {
         }
         if !self.patterns.load().exists(&old) {
             log_op_err(
-                "rename",
+                FsOp::Rename,
                 &old,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -1512,7 +1512,7 @@ impl Filesystem for HostFs {
         }
         if !self.patterns.load().writable(&old) || !self.patterns.load().writable(&new) {
             log_op_err(
-                "rename",
+                FsOp::Rename,
                 &old,
                 Some(&self.patterns.load().redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1537,7 +1537,7 @@ impl Filesystem for HostFs {
                 || self.patterns.load().subtree_restricted(&new))
         {
             log_op_err(
-                "rename",
+                FsOp::Rename,
                 &old,
                 Some(&new_real),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1583,7 +1583,7 @@ impl Filesystem for HostFs {
                 || self.patterns.load().subtree_restricted(&new))
         {
             log_op_err(
-                "rename",
+                FsOp::Rename,
                 &old,
                 Some(&new_real),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1601,10 +1601,10 @@ impl Filesystem for HostFs {
         } != 0
         {
             let e = std::io::Error::last_os_error();
-            log_op_err("rename", &old, Some(&new_real), &e).await;
+            log_op_err(FsOp::Rename, &old, Some(&new_real), &e).await;
             return Err(e.into());
         }
-        log_op_ok("rename", &old, &new_real).await;
+        log_op_ok(FsOp::Rename, &old, &new_real).await;
 
         // The kernel moves the dentry on rename, re-hashing `old` as `new`
         // *keeping the source's nodeid*. Re-point the new path at the source
@@ -1644,7 +1644,7 @@ impl Filesystem for HostFs {
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
         log_op_err(
-            "symlink",
+            FsOp::Symlink,
             &mirrored,
             Some(&self.patterns.load().redirect(&mirrored)),
             &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1695,7 +1695,7 @@ impl Filesystem for HostFs {
         }
         if !self.patterns.load().exists(&old) {
             log_op_err(
-                "link",
+                FsOp::Link,
                 &old,
                 None,
                 &std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -1708,7 +1708,7 @@ impl Filesystem for HostFs {
         // inode and bypass the source path's `ro` permission).
         if !self.patterns.load().writable(&old) {
             log_op_err(
-                "link",
+                FsOp::Link,
                 &old,
                 Some(&self.patterns.load().redirect(&old)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1718,7 +1718,7 @@ impl Filesystem for HostFs {
         }
         if !self.patterns.load().writable(&new) {
             log_op_err(
-                "link",
+                FsOp::Link,
                 &new,
                 Some(&self.patterns.load().redirect(&new)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1754,7 +1754,7 @@ impl Filesystem for HostFs {
             // was low-impact — but the invariant is worth more than the
             // compatibility. Hard links to regular files are unaffected.
             log_op_err(
-                "link",
+                FsOp::Link,
                 &old,
                 Some(&self.patterns.load().redirect(&old)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1774,10 +1774,16 @@ impl Filesystem for HostFs {
         };
         if link_result != 0 {
             let e = std::io::Error::last_os_error();
-            log_op_err("link", &new, Some(&self.patterns.load().redirect(&new)), &e).await;
+            log_op_err(
+                FsOp::Link,
+                &new,
+                Some(&self.patterns.load().redirect(&new)),
+                &e,
+            )
+            .await;
             return Err(e.into());
         }
-        log_op_ok("link", &new, &self.patterns.load().redirect(&new)).await;
+        log_op_ok(FsOp::Link, &new, &self.patterns.load().redirect(&new)).await;
         let inode = self
             .inodes
             .write()
@@ -1805,7 +1811,7 @@ impl Filesystem for HostFs {
         let writable = self.patterns.load().writable(&mirrored);
         if !writable {
             log_op_err(
-                "create",
+                FsOp::Create,
                 &mirrored,
                 Some(&self.patterns.load().redirect(&mirrored)),
                 &std::io::Error::from_raw_os_error(libc::EACCES),
@@ -1829,7 +1835,7 @@ impl Filesystem for HostFs {
         if let Some(st) = existing {
             if Self::stat_is_symlink(&st) {
                 log_op_err(
-                    "create",
+                    FsOp::Create,
                     &mirrored,
                     Some(&real),
                     &std::io::Error::from_raw_os_error(libc::ELOOP),
@@ -1839,7 +1845,7 @@ impl Filesystem for HostFs {
             }
             if excl {
                 log_op_err(
-                    "create",
+                    FsOp::Create,
                     &mirrored,
                     Some(&real),
                     &std::io::Error::from_raw_os_error(libc::EEXIST),
@@ -1849,7 +1855,7 @@ impl Filesystem for HostFs {
             }
             if Self::stat_is_dir(&st) {
                 log_op_err(
-                    "create",
+                    FsOp::Create,
                     &mirrored,
                     Some(&real),
                     &std::io::Error::from_raw_os_error(libc::EISDIR),
@@ -1860,7 +1866,7 @@ impl Filesystem for HostFs {
             // HF-2: like `open`, refuse host device nodes and sockets.
             if Self::stat_is_special(&st) {
                 log_op_err(
-                    "create",
+                    FsOp::Create,
                     &mirrored,
                     Some(&real),
                     &std::io::Error::from_raw_os_error(libc::EPERM),
@@ -1878,7 +1884,7 @@ impl Filesystem for HostFs {
             let file = match self.root.open_at(&real, oflags, 0) {
                 Ok(f) => f,
                 Err(e) => {
-                    log_op_err("create", &mirrored, Some(&real), &e).await;
+                    log_op_err(FsOp::Create, &mirrored, Some(&real), &e).await;
                     return Err(e.into());
                 }
             };
@@ -1886,7 +1892,7 @@ impl Filesystem for HostFs {
             match file.metadata() {
                 Ok(md) if Self::metadata_is_special(&md) => {
                     log_op_err(
-                        "create",
+                        FsOp::Create,
                         &mirrored,
                         Some(&real),
                         &std::io::Error::from_raw_os_error(libc::EPERM),
@@ -1896,12 +1902,12 @@ impl Filesystem for HostFs {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    log_op_err("create", &mirrored, Some(&real), &e).await;
+                    log_op_err(FsOp::Create, &mirrored, Some(&real), &e).await;
                     return Err(e.into());
                 }
             }
             let md = file.metadata()?;
-            log_op_ok("create", &mirrored, &real).await;
+            log_op_ok(FsOp::Create, &mirrored, &real).await;
             let inode = self
                 .inodes
                 .write()
@@ -1948,13 +1954,13 @@ impl Filesystem for HostFs {
         {
             Ok(f) => f,
             Err(e) => {
-                log_op_err("create-new", &mirrored, Some(&real), &e).await;
+                log_op_err(FsOp::Create, &mirrored, Some(&real), &e).await;
                 return Err(e.into());
             }
         };
         let md = file.metadata()?;
         let mut attr = attr_from_metadata(&md);
-        log_op_ok("create-new", &mirrored, &real).await;
+        log_op_ok(FsOp::Create, &mirrored, &real).await;
         let inode = self
             .inodes
             .write()

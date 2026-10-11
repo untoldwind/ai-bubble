@@ -40,7 +40,7 @@ use tokio_util::codec::FramedRead;
 
 use futures_util::StreamExt;
 
-use super::Event;
+use super::{ControlEvent, ControlOp, Event, Kind};
 use crate::ipc::framing;
 
 /// The cap for one serialized event frame on an inter-process channel
@@ -62,7 +62,7 @@ pub enum PeerRole {
 /// A child's reply to a launcher-pushed update frame: `{"ack":true}` or
 /// `{"err":"..."}`. Demultiplexed from audit events by the hub reader —
 /// the two frame kinds are distinguishable by shape (an audit `Event`
-/// always carries `ts`/`pid`/`source`/`op`; a reply has exactly one of
+/// always carries `ts`/`pid`/`kind`; a reply has exactly one of
 /// `ack`/`err`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum UpdReply {
@@ -85,7 +85,7 @@ impl UpdReply {
     pub(crate) fn parse(line: &str) -> Option<UpdReply> {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         // Event fields present ⇒ not a reply, whatever else it says.
-        for field in ["ts", "pid", "source", "op"] {
+        for field in ["ts", "pid", "kind", "source"] {
             if value.get(field).is_some() {
                 return None;
             }
@@ -327,18 +327,18 @@ pub fn spawn_hub() -> Hub {
 /// control reply ([`UpdReply`], forwarded to the per-role receiver — a
 /// missing or gone receiver only means the control server is not
 /// running, never a reason to end the reader). The `Event` parse runs
-/// first (SP-2): an event always carries `ts`/`pid`/`source`/`op` and
-/// rejects unknown fields, so a reply-shaped frame is unambiguously
+/// first (SP-2): an event always carries `ts`/`pid`/`kind` and rejects
+/// unknown fields, so a reply-shaped frame is unambiguously
 /// distinguishable and a frame that is an event plus a reply key cannot
 //  be diverted to the reply channel (where it would be dropped from the
 //  log).
 ///
-/// The event's `source` is cross-checked against the channel's peer role
-/// (SP-2): each child is trusted to emit only its own component's source
-/// (`hostfs` for FS, `proxy`/`waf` for P), and a claimed source outside
-/// that set — e.g. a compromised FS claiming `source: "control"` with
-/// the launcher's pid to forge attribution — is overridden with the
-/// role's trusted label, with the claimed value preserved in `detail`.
+/// The event's kind is cross-checked against the channel's peer role
+/// (SP-2): each child is trusted to emit only its own component's events
+/// (hostfs for FS, proxy/waf for P), and a claimed kind outside that set
+/// — e.g. a compromised FS claiming a `control` event with the
+/// launcher's pid to forge attribution — is replaced by a forged-source
+/// note, with the claimed source label preserved.
 ///
 /// A malformed frame (over cap, non-UTF-8, NUL, neither reply nor event)
 /// is a bug in a trusted fork child, or an attack by a compromised child
@@ -409,21 +409,23 @@ pub(crate) async fn hub_reader(
     }
 }
 
-/// The `source` values each peer role may legitimately claim, and the
-/// trusted label a forgery is overridden with (SP-2).
+/// The event kinds each peer role may legitimately claim, and (SP-2):
+/// for a claimed kind outside that set, the whole event is replaced by a
+/// `control` forged-source note — the claimed payload is untrusted, so
+/// its fields are not forwarded.
 fn stamp_source(event: &mut Event, role: PeerRole) {
-    let (allowed, trusted): (&[&str], &str) = match role {
-        PeerRole::HostFs => (&["hostfs"], "hostfs"),
+    let allowed = match role {
+        PeerRole::HostFs => matches!(event.kind, Kind::Hostfs(_)),
         // P serves both the proxy frontends and the waf host.
-        PeerRole::Network => (&["proxy", "waf"], "proxy"),
+        PeerRole::Network => matches!(event.kind, Kind::Proxy(_) | Kind::Waf(_)),
     };
-    if !allowed.contains(&event.source.as_str()) {
-        let claimed = std::mem::take(&mut event.source);
-        event.source = trusted.to_string();
+    if !allowed {
+        let claimed = event.kind.source().to_string();
         let note = format!("forged source \"{claimed}\" overridden by hub");
-        event.detail = Some(match event.detail.take() {
-            Some(d) => format!("{d}; {note}"),
-            None => note,
+        event.kind = Kind::Control(ControlEvent {
+            op: ControlOp::ForgedSource,
+            change: Some(claimed),
+            detail: Some(note),
         });
     }
 }
@@ -551,7 +553,8 @@ async fn send_batch(stream: &Arc<tokio::sync::Mutex<UnixStream>>, batch: &mut Ve
     }
     let mut buf = Vec::new();
     for event in batch.drain(..) {
-        buf.extend_from_slice(&framing::encode_frame(event.to_line().as_bytes()));
+        let line = serde_json::to_string(&event).unwrap_or_default();
+        buf.extend_from_slice(&framing::encode_frame(line.as_bytes()));
     }
     let mut stream = stream.lock().await;
     if let Err(e) = stream.write_all(&buf).await

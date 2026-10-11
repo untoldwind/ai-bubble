@@ -278,7 +278,11 @@ async fn flush(path: &Path, file: &Arc<Mutex<std::fs::File>>, batch: Vec<Event>)
     let mut chunks: Vec<String> = Vec::new();
     let mut chunk = String::new();
     for event in batch {
-        chunk.push_str(&event.to_line());
+        // Serialization of this struct cannot fail (plain string/integer
+        // fields), so the value is rendered inline like the rest of the
+        // transport code — no bespoke serializer on the event type.
+        let line = serde_json::to_string(&event).unwrap_or_default();
+        chunk.push_str(&line);
         chunk.push('\n');
         if chunk.len() >= MAX_BYTES {
             chunks.push(std::mem::take(&mut chunk));
