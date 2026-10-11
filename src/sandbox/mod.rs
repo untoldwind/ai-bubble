@@ -824,6 +824,11 @@ pub(crate) unsafe fn drop_all_capabilities() {
     unsafe {
         // Remove every capability from the bounding set so it can never be
         // regained. EINVAL for caps the kernel doesn't know is tolerable.
+        // (AUDIT-unsafe.md: kept raw rather than `caps::clear(Bounding)` —
+        // the crate's `clear` walks only the caps compiled into the library,
+        // so a cap newer than its enum would silently survive. This loop
+        // walks 0..=cap_last() instead, the too-low-constant hazard that
+        // reading /proc/sys/kernel/cap_last_cap guards against.)
         let cap_last = cap_last();
         for cap in 0..=cap_last {
             if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0
@@ -834,58 +839,35 @@ pub(crate) unsafe fn drop_all_capabilities() {
         }
 
         // Clear ambient capabilities (they would otherwise survive exec).
-        if libc::prctl(
-            libc::PR_CAP_AMBIENT,
-            libc::PR_CAP_AMBIENT_CLEAR_ALL,
-            0,
-            0,
-            0,
-        ) != 0
-        {
-            let err = io::Error::last_os_error().raw_os_error();
-            if err != Some(libc::EINVAL) && err != Some(libc::ENOTSUP) {
-                die_with_error("Can't clear ambient capabilities");
+        // (AUDIT-unsafe.md: `caps::clear` replaces the raw
+        // PR_CAP_AMBIENT_CLEAR_ALL prctl.) Old kernels without ambient
+        // support answer EINVAL, very old ones ENOTSUP — both tolerated,
+        // as before. `CapsError` carries no errno field, only the os
+        // error's Display text ("... (os error N)"), so the tolerance
+        // matches that text (EINVAL = 22, ENOTSUP/EOPNOTSUPP = 95).
+        if let Err(e) = caps::clear(None, caps::CapSet::Ambient) {
+            let msg = e.to_string();
+            if !msg.contains("os error 22") && !msg.contains("os error 95") {
+                die_with_error(&format!("Can't clear ambient capabilities: {e}"));
             }
         }
 
-        // Explicitly empty permitted/effective/inheritable (caps v3: two
-        // 64-bit set pairs, covering all 41+ capability bits — v1 only
-        // covers caps 0-31, AUDIT.md L1), so nothing is left even before
-        // execve.
-        #[repr(C)]
-        struct CapHeader {
-            version: libc::c_int,
-            pid: libc::c_int,
-        }
-        #[repr(C)]
-        struct CapData {
-            effective: libc::c_uint,
-            permitted: libc::c_uint,
-            inheritable: libc::c_uint,
-        }
-        let hdr = CapHeader {
-            version: 0x20080522, // _LINUX_CAPABILITY_VERSION_3
-            pid: 0,
-        };
-        let data = [
-            CapData {
-                effective: 0,
-                permitted: 0,
-                inheritable: 0,
-            },
-            CapData {
-                effective: 0,
-                permitted: 0,
-                inheritable: 0,
-            },
-        ];
-        if libc::syscall(
-            libc::SYS_capset,
-            &hdr as *const CapHeader,
-            &data as *const [CapData; 2],
-        ) != 0
-        {
-            die_with_error("Can't clear capability sets");
+        // Explicitly empty permitted/effective/inheritable via capset(2)
+        // (AUDIT-unsafe.md: `caps::clear` replaces the hand-built v3
+        // CapHeader/CapData FFI — the most error-prone struct in the tree —
+        // while still issuing a v3 (two 64-bit set pair) capset covering all
+        // 41+ capability bits, where v1 covers only caps 0-31, AUDIT.md L1),
+        // so nothing is left even before execve. Clearing Permitted also
+        // clears Effective (kernel semantics; the crate sets both), but all
+        // three are cleared explicitly for clarity.
+        for set in [
+            caps::CapSet::Effective,
+            caps::CapSet::Permitted,
+            caps::CapSet::Inheritable,
+        ] {
+            if let Err(e) = caps::clear(None, set) {
+                die_with_error(&format!("Can't clear capability sets: {e}"));
+            }
         }
     }
 }

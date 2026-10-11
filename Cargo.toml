@@ -34,6 +34,10 @@ rustls-native-certs = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 base64 = "0.23"
 rustix = { version = "1.1.5", features = ["fs", "process", "termios", "event", "net", "mount", "pipe", "rand", "pty", "thread"] }
+# Safe wrappers around capset()/prctl(capbset drop)/prctl(ambient) for
+# drop_all_capabilities (AUDIT-unsafe.md: replaces the hand-built
+# SYS_capset v3 CapHeader/CapData FFI, the most error-prone struct in the tree).
+caps = "0.5"
 
 [profile.release]
 debug=true
