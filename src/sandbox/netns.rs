@@ -38,7 +38,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::path::Path;
 
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
@@ -476,16 +476,18 @@ where
 
 /// Bring up the loopback interface in the current network namespace.
 fn bring_up_loopback() {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        die_with_error("Can't create socket for loopback setup");
-    }
+    // Any datagram socket works as the ioctl transport for SIOCGIF*/SIOCSIF*;
+    // std creates it safely (the ioctls below stay raw).
+    let sock = match std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+        Ok(s) => s,
+        Err(e) => die_with_error(&format!("Can't create socket for loopback setup: {e}")),
+    };
+    let fd = sock.as_raw_fd();
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     ifr.ifr_name[0] = b'l' as libc::c_char;
     ifr.ifr_name[1] = b'o' as libc::c_char;
     if unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) } != 0 {
         let e = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
         die_with_error(&format!("Can't get loopback flags: {e}"));
     }
     // The flags live at offset 0 of the ifr_ifru union.
@@ -494,9 +496,7 @@ fn bring_up_loopback() {
         *flags_ptr |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         if libc::ioctl(fd, libc::SIOCSIFFLAGS, &mut ifr) != 0 {
             let e = io::Error::last_os_error();
-            libc::close(fd);
             die_with_error(&format!("Can't bring up loopback: {e}"));
         }
-        libc::close(fd);
     }
 }

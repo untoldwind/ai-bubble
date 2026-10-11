@@ -314,11 +314,11 @@ pub(crate) fn userns_id() -> Option<(u64, u64)> {
 /// namespace, so the sandboxed command does not see a copy of the
 /// operator's hostname. Best effort.
 fn set_neutral_hostname() {
-    const HOSTNAME: &[u8] = b"ai-bubble\0";
-    unsafe {
-        if libc::sethostname(HOSTNAME.as_ptr().cast(), HOSTNAME.len() - 1) != 0 {
-            eprintln!("warning: can't set a neutral hostname (keeping the inherited one)");
-        }
+    const HOSTNAME: &[u8] = b"ai-bubble";
+    // rustix::system::sethostname NUL-terminates internally; pass the name
+    // without the trailing NUL.
+    if rustix::system::sethostname(HOSTNAME).is_err() {
+        eprintln!("warning: can't set a neutral hostname (keeping the inherited one)");
     }
 }
 

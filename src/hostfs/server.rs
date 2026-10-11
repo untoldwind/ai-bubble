@@ -6,12 +6,13 @@ use std::os::fd::OwnedFd;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+
 use std::time::Duration;
 
 use fuse3::MountOptions;
 use fuse3::raw::Session;
 
-use super::{HOST_MOUNT_POINT, HOST_PID, HostFs, SharedPatterns, fuse_ops::cstring_of, fuselog};
+use super::{HOST_MOUNT_POINT, HOST_PID, HostFs, SharedPatterns, fuselog};
 use crate::sandbox::{die, die_with_error};
 
 /// The signals that must never kill the FUSE server child: the ones that
@@ -258,7 +259,9 @@ fn serve(policy: SharedPatterns, mountpoint: PathBuf, ready_fd: OwnedFd) -> ! {
                         }
                     } => break,
                     _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                        if unsafe { libc::getppid() } != HOST_PID.load(Ordering::SeqCst) {
+                        if rustix::process::Pid::as_raw(rustix::process::getppid())
+                            != HOST_PID.load(Ordering::SeqCst)
+                        {
                             break;
                         }
                         heartbeat += 1;
@@ -350,22 +353,11 @@ async fn mount_with_fallback(
             // flags (root-only, which is exactly the fallback's case).
             // `default_permissions` deliberately stays off (it would break
             // the uid-translation model).
-            let flags = libc::MS_REMOUNT
-                | libc::MS_NODEV
-                | libc::MS_NOSUID
-                | if read_only { libc::MS_RDONLY } else { 0 };
-            let path = cstring_of(mountpoint)?;
-            if unsafe {
-                libc::mount(
-                    std::ptr::null(),
-                    path.as_ptr(),
-                    std::ptr::null(),
-                    flags,
-                    std::ptr::null(),
-                )
-            } != 0
-            {
-                let err = std::io::Error::last_os_error();
+            use rustix::mount::{MountFlags, mount_remount};
+            let flags = MountFlags::NODEV
+                | MountFlags::NOSUID
+                | if read_only { MountFlags::RDONLY } else { MountFlags::empty() };
+            if let Err(err) = mount_remount(mountpoint, flags, "") {
                 drop(handle);
                 return Err(std::io::Error::other(format!(
                     "Can't apply nosuid/nodev to the privileged FUSE mount at {}: {err}",

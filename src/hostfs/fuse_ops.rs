@@ -1218,7 +1218,7 @@ impl Filesystem for HostFs {
                 }
                 // SAFETY: `fd` is a freshly opened, owned descriptor.
                 let f = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
-                if unsafe { libc::fchmod(f.as_raw_fd(), mode) } != 0 {
+                if rustix::fs::fchmod(&f, rustix::fs::Mode::from_raw_mode(mode)).is_err() {
                     return Err(std::io::Error::last_os_error().into());
                 }
             }

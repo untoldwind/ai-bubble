@@ -106,7 +106,7 @@
 //!   (`kill -HUP` on the launcher) runs the same reload as a shim.
 
 use std::io::Write as _;
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, IntoRawFd as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -558,11 +558,11 @@ pub async fn serve(replies: Replies) {
     // Duplicate the listener fd: the server keeps the original open (the
     // abstract name must live as long as the run); the tokio listener
     // owns the duplicate.
-    let raw = unsafe { libc::dup(server.listener.as_raw_fd()) };
-    if raw < 0 {
-        sandbox::die("Can't serve the control socket");
-    }
-    let dup = unsafe { std::os::unix::net::UnixListener::from_raw_fd(raw) };
+    let dup = match rustix::io::dup(server.listener.as_fd()) {
+        Ok(dup) => dup,
+        Err(_) => sandbox::die("Can't serve the control socket"),
+    };
+    let dup = unsafe { std::os::unix::net::UnixListener::from_raw_fd(dup.into_raw_fd()) };
     let _ = dup.set_nonblocking(true);
     let listener = match tokio::net::UnixListener::from_std(dup) {
         Ok(l) => l,

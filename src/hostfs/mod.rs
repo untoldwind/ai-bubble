@@ -420,8 +420,8 @@ impl HostFs {
     /// shared instance backs every decision and any later runtime swap.
     fn collect(patterns: &SharedPatterns) -> HostFs {
         HostFs {
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: rustix::process::getuid().as_raw(),
+            gid: rustix::process::getgid().as_raw(),
             patterns: patterns.clone(),
             root: anchored::RootDir::open()
                 .unwrap_or_else(|e| die(&format!("Can't pin the host root directory: {e}"))),

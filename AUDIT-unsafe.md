@@ -317,6 +317,61 @@ Acceptable as-is.
 
 ---
 
+---
+
+## Third pass, 2026-10-11: remaining raw sites vs rustix 1.1.5 (in-tree source)
+
+Verified against the vendored rustix 1.1.5 sources, not docs. Most of the
+✅ list from the first two passes has since been converted (`rustix::mount`,
+`waitpid`, PTY/termios, `caps`, rlimits, socketpair/pipe, `umount2`,
+`getrandom`, `mkfifoat`, `fstatvfs`). What remains, re-checked:
+
+### Newly replaceable (found in this pass) — **converted 2026-10-11**
+
+| Site | Was unsafe | Now |
+|---|---|---|
+| `hostfs/server.rs:356–366` | raw `libc::mount(NULL, path, NULL, MS_REMOUNT\|…)` | ✅ `rustix::mount::mount_remount(mountpoint, MountFlags…, "")` — last raw mount gone |
+| `sandbox/mod.rs:318` | `libc::sethostname` | ✅ `rustix::system::sethostname` (required adding the `system` rustix feature) |
+| `hostfs/fuse_ops.rs:1221` | `libc::fchmod(fd, mode)` | ✅ `rustix::fs::fchmod(&f, Mode::from_raw_mode(mode))` (the `fchmodat`/`fchownat`/`faccessat` *at()* heads still have **no** rustix wrapper — kept) |
+| `audit/ipc.rs:207` | `libc::dup` + errno juggling | ✅ `rustix::io::dup(BorrowedFd::borrow_raw(raw))` (the `from_raw_fd` adoption stays) |
+| `cli/control.rs:561` | `libc::dup` | ✅ `rustix::io::dup(server.listener.as_fd())` |
+| `hostfs/mod.rs:423–424` | `libc::getuid/getgid` | ✅ `rustix::process::{getuid, getgid}().as_raw()` |
+| `hostfs/server.rs:261` | `libc::getppid` | ✅ `Pid::as_raw(rustix::process::getppid())` (`as_raw` takes the `Option<Pid>` directly) |
+| `netns.rs:479–500` | `libc::socket` + `libc::close` around the IFFLAGS ioctls | ✅ `std::net::UdpSocket::bind("0.0.0.0:0")` — creation/close safe; only the two `ioctl` calls stay raw (already ❌) |
+
+Two notes from the conversion:
+
+- `pty.rs:393` `libc::kill(child_pid, sig)` **stays raw**: rustix 1.1.5
+  exposes `process::kill_process`, but its `Signal` argument has **no safe
+  in-tree `from_raw`** (only `from_raw_unchecked`, unsafe, or the external
+  `rustix-libc-wrappers` trait). Converting would trade one unsafe call for
+  another. The self-kill sites (`:248, :384`) remain raw per the
+  async-signal-safety discipline regardless.
+- `pty.rs:409–430` hand-rolls `cfmakeraw` "because rustix has no wrapper"
+  — that comment is stale: `rustix::termios::Termios::make_raw()` exists.
+  The hand-rolled helper is already **safe** code and matches glibc
+  flag-for-flag; swapping is optional (delete the helper, call
+  `t.make_raw()`). Left as-is: no unsafe involved.
+
+### Re-verified keep (no replacement exists in rustix 1.1.5 / nix / std)
+
+- `fork`, `execvp`, `unshare` (×6), `atexit` (×3), `close_range`,
+  `keyctl` syscall, raw seccomp probes, `TIOCNOTTY`, `SIOCSIFFLAGS`
+  (incl. the `mem::zeroed::<libc::ifreq>`), `sigaction`/`sigprocmask`
+  — unchanged verdicts.
+- `libc::_exit` (×16): rustix 1.1.5 exports **no** `process::exit`; keep.
+- `libc::close` co-ownership sites (`cli/control.rs:407,417`,
+  `audit/ipc.rs:233` on drained raw fds): design-inherent; the
+  `audit/ipc.rs:233` one becomes droppable `OwnedFd`s if the dup sites
+  above are converted.
+- `mem::zeroed::<rustix::fs::Stat>` ×2 (`fuse_ops.rs:72`,
+  `hostfs/mod.rs:586`): no safe `Stat` constructor in rustix; keep.
+- `shutdown(SHUT_WR)` on borrowed fd numbers: still ⚠️ (needs
+  `Arc<UnixStream>` sharing or `rustix::net::shutdown` on a `BorrowedFd`
+  — actually convertible without redesign: `rustix::net::shutdown`
+  takes `AsFd`, so `BorrowedFd::borrow_raw(fd)` works; only the test at
+  `audit/mod.rs:816` shares the design constraint).
+
 ## Priority if acting on this
 
 1. **High value / low risk**

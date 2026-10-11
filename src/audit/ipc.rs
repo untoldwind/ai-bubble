@@ -28,7 +28,7 @@
 //! The log file side lives in [`crate::audit::writer`]; the dispatch
 //! between the two sinks happens in [`crate::audit`] (`setup`).
 
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -204,9 +204,9 @@ pub fn peer_writer(role: PeerRole) -> Option<UnixStream> {
         .iter()
         .find(|(r, _)| *r == role)
         .map(|(_, fd)| *fd)?;
-    let dup = match unsafe { libc::dup(raw) } {
-        d if d >= 0 => unsafe { OwnedFd::from_raw_fd(d) },
-        _ => return None,
+    let dup = match rustix::io::dup(unsafe { BorrowedFd::borrow_raw(raw) }) {
+        Ok(dup) => dup,
+        Err(_) => return None,
     };
     let stream = unsafe { StdUnixStream::from_raw_fd(dup.into_raw_fd()) };
     if let Err(e) = stream.set_nonblocking(true) {
