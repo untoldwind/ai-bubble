@@ -104,11 +104,14 @@ use crate::connlimit::ConnLimit;
 /// `try_acquire` point) and released when the stream's handler task ends.
 pub(crate) type StreamLimit = ConnLimit;
 
-/// Payload cap for one frame: `DATA` writes are chunked to at most this,
-/// and any envelope above [`FRAME_MAX`] kills the connection (a hard
-/// `Err`, not a silent skip — the audit channel's discipline for
-/// protocol violations).
-pub(crate) const PAYLOAD_CAP: usize = 1024 * 1024;
+/// Payload cap for one frame (256 KiB, the yamux default receive-window
+/// scale): `DATA` writes are chunked to at most this
+/// (both per `poll_write` call and in `poll_flush`/`poll_shutdown`, which
+/// emit the write buffer as a sequence of capped frames), and any
+/// envelope above [`FRAME_MAX`] arriving from the peer kills the
+/// connection (a hard `Err`, not a silent skip — the audit channel's
+/// discipline for protocol violations).
+pub(crate) const PAYLOAD_CAP: usize = 256 * 1024;
 /// The envelope size cap enforced by the codec (payload cap + headers
 /// + slack).
 const FRAME_MAX: usize = PAYLOAD_CAP + 64;
@@ -626,9 +629,11 @@ where
 /// Implements [`AsyncRead`] + [`AsyncWrite`], so the tokio IO traits
 /// (`read_to_end`, `write_all`, `flush`, `shutdown`,
 /// [`copy_bidirectional`]) work on it directly. One departure from a
-/// Unix socket's semantics: `poll_write` only buffers (bounded by
-/// [`PAYLOAD_CAP`] per frame) — the `DATA` frame goes on the wire at
-/// `poll_flush` (or `poll_shutdown`). The copy loops and hyper flush as
+/// Unix socket's semantics: `poll_write` only buffers (at most
+/// [`PAYLOAD_CAP`] per call, never refusing), and `poll_flush` /
+/// `poll_shutdown` emit the buffer as a sequence of `PAYLOAD_CAP`-bounded
+/// `DATA` frames — so a single `write_all` larger than the cap still
+/// travels as well-formed frames. The copy loops and hyper flush as
 /// part of their write paths, so relays need no extra calls; a raw
 /// `write_all` must be followed by a `flush` for the peer to see the
 /// bytes (the mux's own tests do exactly that).
@@ -798,8 +803,8 @@ impl AsyncWrite for MuxStream {
                 "stream closed",
             )));
         }
-        // Chunk to the payload cap: the caller keeps writing, `poll_flush`
-        // emits exactly one bounded `DATA` frame per buffered chunk.
+        // Chunk to the payload cap per call (never refusing): the caller keeps
+        // writing, and `poll_flush` emits the buffer as capped `DATA` frames.
         let n = buf.len().min(PAYLOAD_CAP);
         this.wbuf.extend_from_slice(&buf[..n]);
         Poll::Ready(Ok(n))
@@ -816,8 +821,7 @@ impl AsyncWrite for MuxStream {
         if this.wbuf.is_empty() {
             return Poll::Ready(Ok(()));
         }
-        let wire = MuxCore::wire(TAG_DATA, this.id, 0, &this.wbuf);
-        Self::poll_out(this, cx, wire)
+        Self::poll_data_flush(this, cx)
     }
 
     fn poll_shutdown(
@@ -834,11 +838,8 @@ impl AsyncWrite for MuxStream {
             return Poll::Ready(Ok(()));
         }
         if !this.wbuf.is_empty() {
-            let wire = MuxCore::wire(TAG_DATA, this.id, 0, &this.wbuf);
-            match Self::poll_out(this, cx, wire) {
-                Poll::Ready(Ok(())) => {
-                    this.wbuf.clear();
-                }
+            match Self::poll_data_flush(this, cx) {
+                Poll::Ready(Ok(())) => {}
                 other => return other,
             }
         }
@@ -854,6 +855,34 @@ impl AsyncWrite for MuxStream {
 }
 
 impl MuxStream {
+    /// Emit everything in [`MuxStream::wbuf`] as a sequence of
+    /// `PAYLOAD_CAP`-bounded `DATA` frames. `poll_write` accepts at most
+    /// `PAYLOAD_CAP` bytes *per call* but never refuses, so a caller that
+    /// writes more than one cap's worth between flushes (e.g. one large
+    /// `write_all`) leaves `wbuf` larger than the cap — and a single
+    /// oversized frame would be cut off by the peer's codec cap, killing
+    /// the whole connection mid-transfer. Chunking here is what makes a
+    /// large download body survivable: the frame-size discipline holds no
+    /// matter how much the caller wrote at once.
+    fn poll_data_flush(
+        this: &mut MuxStream,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if this.wbuf.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            let end = this.wbuf.len().min(PAYLOAD_CAP);
+            let wire = MuxCore::wire(TAG_DATA, this.id, 0, &this.wbuf[..end]);
+            match Self::poll_out(this, cx, wire) {
+                // `poll_out` drained exactly the `end` bytes this frame
+                // carried; the loop continues with the remainder.
+                Poll::Ready(Ok(())) => continue,
+                other => return other,
+            }
+        }
+    }
+
     /// Drive one frame through the shared write half: acquire the tokio
     /// Mutex via `lock_owned` (an owned guard, so the future is
     /// `'static`), then `write_all` the frame — both boxed into
@@ -1200,6 +1229,49 @@ mod tests {
             msg.contains("connection closed") || msg.contains("Broken pipe"),
             "unexpected error: {msg}"
         );
+    }
+
+    /// One `write_all` larger than [`PAYLOAD_CAP`], flushed only once:
+    /// `poll_write` accepts at most the cap per call, so `wbuf` ends up
+    /// larger than the cap, and the flush must emit *multiple* capped
+    /// frames — not one oversized frame the peer's codec would reject,
+    /// killing the whole connection mid-download.
+    #[tokio::test]
+    async fn oversized_write_travels_as_chunked_frames() {
+        let (a, b) = pair();
+        tokio::spawn(serve_pair::<EchoSpec, _, _>(
+            b,
+            StreamLimit::new(),
+            |_req, mut stream| async move {
+                stream
+                    .ack(&EchoReply { msg: String::new() })
+                    .await?;
+                let mut got = Vec::new();
+                stream.read_to_end(&mut got).await?;
+                stream.write_all(&got).await?;
+                stream.flush().await?;
+                stream.close().await
+            },
+        ));
+        let handle = MuxHandle::<EchoSpec>::client(a);
+        let (_reply, mut stream) = handle
+            .open(&EchoReq { msg: String::new() })
+            .await
+            .expect("open");
+        // 2.5 caps in one write: more than the codec cap on the peer end,
+        // which is what the old single-frame flush turned into a cut
+        // connection.
+        let mut sent = Vec::with_capacity(2 * PAYLOAD_CAP + 500);
+        sent.extend(std::iter::repeat_n(b'x', PAYLOAD_CAP * 2 + 500));
+        stream.write_all(&sent).await.unwrap();
+        stream.flush().await.unwrap();
+        // Half-close: the handler's read_to_end ends on this FIN (without
+        // it, both sides sit in read_to_end forever).
+        stream.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got.len(), sent.len());
+        assert_eq!(got.as_slice(), sent.as_slice());
     }
 
     #[tokio::test]
