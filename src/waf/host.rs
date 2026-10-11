@@ -134,7 +134,7 @@ async fn handle_host_req(
             };
             crate::audit::record("waf", "connect", Some(&target), Some("ok"), None).await;
             stream.ack(&WafReply::Open).await?;
-            let _ = netmux::copy_bidirectional(stream, &mut tcp).await;
+            let _ = tokio::io::copy_bidirectional(stream, &mut tcp).await;
             let _ = stream.close().await;
             Ok(())
         }
@@ -303,7 +303,7 @@ async fn handle_host_req(
             crate::audit::record("waf", "tls-connect", Some(&target), Some("ok"), None).await;
             stream.ack(&WafReply::Open).await?;
             // Both streams are full duplex; the pipe carries plaintext now.
-            let _ = netmux::copy_bidirectional(stream, &mut tls).await;
+            let _ = tokio::io::copy_bidirectional(stream, &mut tls).await;
             let _ = stream.close().await;
             Ok(())
         }

@@ -100,7 +100,7 @@ async fn handle_connector_conn(
     // The old flow's status byte: the ack tells the client the pipe is
     // live, then the tunnel carries its payload.
     stream.ack(&ProxyReply {}).await?;
-    let _ = netmux::copy_bidirectional(stream, &mut tcp).await;
+    let _ = tokio::io::copy_bidirectional(stream, &mut tcp).await;
     let _ = stream.close().await;
     Ok(())
 }

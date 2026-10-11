@@ -911,7 +911,7 @@ mod tests {
     /// answered with really signed leaves, `tls-connect` streams (as if a
     /// TLS handshake had succeeded) pipe to a plain TCP echo server.
     async fn fake_host(pair: tokio::net::UnixStream, echo_port: u16) {
-        use crate::ipc::netmux::{StreamLimit, copy_bidirectional, serve_pair};
+        use crate::ipc::netmux::{StreamLimit, serve_pair};
         serve_pair::<WafSpec, _, _>(
             pair,
             StreamLimit::new(),
@@ -961,7 +961,8 @@ mod tests {
                                 .await;
                         };
                         stream.ack(&WafReply::Open).await?;
-                        let _ = copy_bidirectional(&mut stream, &mut tcp).await;
+                        let _ =
+                            tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
                         let _ = stream.close().await;
                         Ok(())
                     }

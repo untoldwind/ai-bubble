@@ -20,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::{ProxyReq, ProxySpec};
 use crate::connlimit::ConnLimit;
-use crate::ipc::netmux::{self, MuxHandle};
+use crate::ipc::netmux::MuxHandle;
 
 /// How long a client may take to deliver a complete HTTP CONNECT request
 /// head. A client that opens a connection but never sends (or trickles
@@ -198,7 +198,7 @@ impl ProxyService {
         let _ = tcp
             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
             .await;
-        let _ = netmux::copy_bidirectional(&mut stream, &mut tcp).await;
+        let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
         let _ = stream.close().await;
     }
 }
@@ -295,7 +295,7 @@ mod tests {
     /// proxy relays the failure as a 502.
     #[tokio::test]
     async fn connect_denied_by_connector() {
-        let (a, b) = netmux::pair().unwrap();
+        let (a, b) = crate::ipc::netmux::pair().unwrap();
         tokio::spawn(crate::proxy::serve_connector(
             a,
             crate::proxy::allowlist::shared(vec![]),

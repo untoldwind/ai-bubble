@@ -585,8 +585,9 @@ fn peer_credentials_ok(cred: &rustix::net::UCred) -> bool {
 /// surviving.
 ///
 /// The handler owns the stream for its whole lifetime: it relays through
-/// it ([`copy_bidirectional`]) and should [`MuxStream::close`] it when
-/// done — dropping without `close` releases the local routing entry only.
+/// it (tokio's [`copy_bidirectional`](tokio::io::copy_bidirectional)) and
+/// should [`MuxStream::close`] it when done — dropping without `close`
+/// releases the local routing entry only.
 pub(crate) async fn serve_pair<S, F, Fut>(pair: UnixStream, limit: Arc<StreamLimit>, handler: F)
 where
     S: NetSpec,
@@ -628,7 +629,8 @@ where
 ///
 /// Implements [`AsyncRead`] + [`AsyncWrite`], so the tokio IO traits
 /// (`read_to_end`, `write_all`, `flush`, `shutdown`,
-/// [`copy_bidirectional`]) work on it directly. One departure from a
+/// tokio's [`copy_bidirectional`](tokio::io::copy_bidirectional)) work on
+/// it directly. One departure from a
 /// Unix socket's semantics: `poll_write` only buffers (at most
 /// [`PAYLOAD_CAP`] per call, never refusing), and `poll_flush` /
 /// `poll_shutdown` emit the buffer as a sequence of `PAYLOAD_CAP`-bounded
@@ -931,21 +933,7 @@ impl MuxStream {
     }
 }
 
-/// Bidirectional relay between a [`MuxStream`] and a real socket — the
-/// framed replacement for `tokio::io::copy_bidirectional` in the
-/// connector/P handlers. Half-closes propagate: the socket's read EOF
-/// `shutdown`s the stream (`FIN`), the stream's `FIN` `shutdown`s the
-/// socket's write side. The caller ends the stream with
-/// [`MuxStream::close`] when the relay is fully done.
-pub(crate) async fn copy_bidirectional<T>(
-    stream: &mut MuxStream,
-    sock: &mut T,
-) -> io::Result<(u64, u64)>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    tokio::io::copy_bidirectional(stream, sock).await
-}
+
 
 #[cfg(test)]
 mod tests {
