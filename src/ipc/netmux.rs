@@ -1243,9 +1243,7 @@ mod tests {
             b,
             StreamLimit::new(),
             |_req, mut stream| async move {
-                stream
-                    .ack(&EchoReply { msg: String::new() })
-                    .await?;
+                stream.ack(&EchoReply { msg: String::new() }).await?;
                 let mut got = Vec::new();
                 stream.read_to_end(&mut got).await?;
                 stream.write_all(&got).await?;

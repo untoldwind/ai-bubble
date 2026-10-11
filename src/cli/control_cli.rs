@@ -4,15 +4,14 @@
 //! The socket name is recomputed from `--spec-dir` (both sides realpath
 //! the directory first, so relative and absolute spellings agree), the
 //! token is read from `<spec-dir>/run/control-token`, and one command is
-//! sent over the token-preamble + JSON-line protocol with exactly one
-//! reply — see [`crate::cli::control`] for the protocol and its security
-//! properties.
+//! sent over the token-preamble + length-prefixed JSON-frame protocol
+//! ([`crate::ipc::framing`]) with exactly one reply — see
+//! [`crate::cli::control`] for the protocol and its security properties.
 
 use clap::Args;
-use std::io::{Read as _, Write as _};
 use std::path::Path;
 
-use crate::{cli::control, sandbox};
+use crate::{cli::control, ipc::framing, sandbox};
 
 /// Talk to a running instance's control socket (see the CLI docs for the
 /// full behaviour and the actions).
@@ -232,7 +231,7 @@ fn request(spec_dir: &Path, command: &serde_json::Value) -> serde_json::Value {
         ))
     });
 
-    // The token preamble: 32 lowercase hex characters, one line.
+    // The token preamble: 32 lowercase hex characters, one frame.
     let token_path = control::token_path_for(spec_dir);
     let token = std::fs::read_to_string(&token_path)
         .unwrap_or_else(|e| sandbox::die(&format!("Can't read {}: {e}", token_path.display())));
@@ -243,29 +242,16 @@ fn request(spec_dir: &Path, command: &serde_json::Value) -> serde_json::Value {
             token_path.display()
         ));
     }
-    write_line(&mut stream, token);
+    write_frame(&mut stream, token);
 
     // One command, one reply.
-    write_line(&mut stream, &command.to_string());
-    let mut reply = String::new();
-    // The reply is a single line; read exactly one (the server closes
+    write_frame(&mut stream, &command.to_string());
+    // The reply is a single frame; read exactly one (the server closes
     // after it or on any error).
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => break,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                reply.push(byte[0] as char);
-                if reply.len() > control::FRAME_CAP {
-                    sandbox::die("control reply over the size cap");
-                }
-            }
-            Err(e) => sandbox::die(&format!("Can't read the control reply: {e}")),
-        }
-    }
+    let frame = framing::read_blocking_frame(&mut stream, control::FRAME_CAP)
+        .unwrap_or_else(|e| sandbox::die(&format!("Can't read the control reply: {e}")));
+    let reply = String::from_utf8(frame)
+        .unwrap_or_else(|_| sandbox::die("control reply is not valid UTF-8"));
     if reply.is_empty() {
         sandbox::die("the control server closed the connection without a reply");
     }
@@ -273,8 +259,7 @@ fn request(spec_dir: &Path, command: &serde_json::Value) -> serde_json::Value {
         .unwrap_or_else(|e| sandbox::die(&format!("control reply is not valid JSON: {e}")))
 }
 
-fn write_line(stream: &mut std::os::unix::net::UnixStream, line: &str) {
-    stream
-        .write_all(format!("{line}\n").as_bytes())
+fn write_frame(stream: &mut std::os::unix::net::UnixStream, payload: &str) {
+    framing::write_blocking_frame(stream, payload.as_bytes())
         .unwrap_or_else(|e| sandbox::die(&format!("Can't write to the control socket: {e}")));
 }

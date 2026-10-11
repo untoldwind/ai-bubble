@@ -36,11 +36,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::Sender;
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::FramedRead;
 
 use futures_util::StreamExt;
 
 use super::Event;
+use crate::ipc::framing;
 
 /// The cap for one serialized event frame on an inter-process channel
 /// (the `waf/mod.rs` `MAX_REPLY` precedent). `record` truncates `detail`
@@ -351,7 +352,7 @@ pub(crate) async fn hub_reader(
     reply_tx: Sender<UpdReply>,
 ) {
     let mut malformed_reported = false;
-    let mut conn = FramedRead::new(&mut stream, LinesCodec::new_with_max_length(FRAME_CAP));
+    let mut conn = FramedRead::new(&mut stream, framing::decoder(FRAME_CAP));
     let warn = |e: &str, reported: &mut bool| {
         if !*reported {
             *reported = true;
@@ -362,8 +363,12 @@ pub(crate) async fn hub_reader(
     };
     loop {
         match conn.next().await {
-            Some(Ok(line)) => {
-                match serde_json::from_str::<Event>(&line) {
+            Some(Ok(frame)) => {
+                let Ok(line) = std::str::from_utf8(&frame) else {
+                    warn("frame is not UTF-8", &mut malformed_reported);
+                    return;
+                };
+                match serde_json::from_str::<Event>(line) {
                     Ok(mut event) => {
                         stamp_source(&mut event, role);
                         if let Some(tx) = &tx
@@ -376,7 +381,7 @@ pub(crate) async fn hub_reader(
                     }
                     // Not an event: a control reply (or malformed).
                     Err(_) => {
-                        if let Some(reply) = UpdReply::parse(&line) {
+                        if let Some(reply) = UpdReply::parse(line) {
                             // The control plane is not listening on this
                             // channel (or is gone): drop the reply, keep
                             // reading events.
@@ -537,20 +542,19 @@ pub(crate) async fn channel_writer(
     }
 }
 
-/// Serialize a batch as one JSON line per event and write it into the
-/// channel. A failed write is reported once per process and the batch
-/// dropped (see [`channel_writer`]).
+/// Serialize a batch as one length-prefixed JSON frame per event and
+/// write it into the channel. A failed write is reported once per
+/// process and the batch dropped (see [`channel_writer`]).
 async fn send_batch(stream: &Arc<tokio::sync::Mutex<UnixStream>>, batch: &mut Vec<Event>) {
     if batch.is_empty() {
         return;
     }
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     for event in batch.drain(..) {
-        buf.push_str(&event.to_line());
-        buf.push('\n');
+        buf.extend_from_slice(&framing::encode_frame(event.to_line().as_bytes()));
     }
     let mut stream = stream.lock().await;
-    if let Err(e) = stream.write_all(buf.as_bytes()).await
+    if let Err(e) = stream.write_all(&buf).await
         && !super::WRITE_ERROR_REPORTED.swap(true, Ordering::Relaxed)
     {
         eprintln!(

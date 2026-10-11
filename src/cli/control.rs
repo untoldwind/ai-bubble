@@ -23,25 +23,26 @@
 //!
 //! One connection, two phases:
 //!
-//! 1. a **token preamble**: the first line is the 128-bit token as 32
+//! 1. a **token preamble**: the first frame is the 128-bit token as 32
 //!    lowercase hex characters (read from `<spec-dir>/run/control-token`,
 //!    mode `0600`). A mismatched, over-long or malformed preamble closes
 //!    the connection with no hints.
-//! 2. JSON-line commands; each gets exactly one JSON-line reply. Lines are
-//!    capped at [`crate::audit`] frame cap (64 KiB) and read with
-//!    `tokio_util::codec::{FramedRead, LinesCodec}`; anything malformed
-//!    closes the connection.
+//! 2. JSON-frame commands; each gets exactly one JSON-frame reply.
+//!    Frames are length-prefixed ([`crate::ipc::framing`], the same wire
+//!    framing as every inter-process channel) and capped at the
+//!    [`crate::audit`] frame cap (64 KiB); anything malformed closes the
+//!    connection.
 //!
 //! ```text
-//! → <hex token>
-//! → { "cmd": "policy-get" }
-//! ← { "ok": true, "fs": {...}|null, "net": {...}|null }
-//! → { "cmd": "fs-set", "mappings": [ ...spec hostfs mapping objects... ] }
-//! ← { "ok": true }
-//! → { "cmd": "net-set", "allow": [ "example.com:443", ... ] }
-//! ← { "ok": true }
-//! → { "cmd": "spec-reload" }
-//! ← { "ok": false, "err": "immutable section changed: seccomp" }
+//! → <u32 BE len><hex token>
+//! → <u32 BE len>{ "cmd": "policy-get" }
+//! ← <u32 BE len>{ "ok": true, "fs": {...}|null, "net": {...}|null }
+//! → <u32 BE len>{ "cmd": "fs-set", "mappings": [ ...spec hostfs mapping objects... ] }
+//! ← <u32 BE len>{ "ok": true }
+//! → <u32 BE len>{ "cmd": "net-set", "allow": [ "example.com:443", ... ] }
+//! ← <u32 BE len>{ "ok": true }
+//! → <u32 BE len>{ "cmd": "spec-reload" }
+//! ← <u32 BE len>{ "ok": false, "err": "immutable section changed: seccomp" }
 //! ```
 //!
 //! Errors reply `{"ok": false, "err": "..."}`.
@@ -53,8 +54,8 @@
 //! `A` only — the connector/waf host serves from that same copy, and the
 //! in-sandbox proxy deliberately holds no list of its own, so no net
 //! update ever needs to travel to a child. The `fs-set` updates travel
-//! over the pre-fork `A`↔FS socketpair as tagged line-JSON frames:
-//! `{"upd": {...}}` downstream, `{"ack": true}` / `{"err": "..."}` upstream
+//! over the pre-fork `A`↔FS socketpair as length-prefixed tagged JSON
+//! frames: `{"upd": {...}}` downstream, `{"ack": true}` / `{"err": "..."}` upstream
 //! (audit events share the same pairs as `{"audit": {...}}` — see
 //! [`crate::audit::ipc`]).
 //!
@@ -115,10 +116,11 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::Receiver;
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::FramedRead;
 
 use futures_util::StreamExt;
 
+use crate::ipc::framing;
 use crate::spec::hostfs::Mapping;
 use crate::{audit, sandbox};
 
@@ -599,10 +601,13 @@ pub async fn serve(replies: Replies) {
 /// commands with one reply each. Close on any malformed input (no
 /// banner, no hints, no second chance).
 async fn handle_connection(mut stream: UnixStream, token: [u8; 16]) {
-    let mut conn = FramedRead::new(&mut stream, LinesCodec::new_with_max_length(FRAME_CAP));
+    let mut conn = FramedRead::new(&mut stream, framing::decoder(FRAME_CAP));
     // The token preamble, length-bounded. A mismatch closes silently.
     let preamble = match tokio::time::timeout(TOKEN_TIMEOUT, conn.next()).await {
-        Ok(Some(Ok(hex))) => hex,
+        Ok(Some(Ok(hex))) => match std::str::from_utf8(&hex) {
+            Ok(hex) => hex.to_string(),
+            Err(_) => return,
+        },
         _ => return,
     };
     if !ct_eq_hex(&preamble, &token) {
@@ -611,10 +616,13 @@ async fn handle_connection(mut stream: UnixStream, token: [u8; 16]) {
     loop {
         match conn.next().await {
             Some(Ok(cmd)) => {
+                let Ok(cmd) = std::str::from_utf8(&cmd) else {
+                    return;
+                };
                 // Malformed input (non-JSON, no "cmd") closes the
                 // connection without a reply; a well-formed command gets
                 // exactly one reply (errors included).
-                let value: Value = match serde_json::from_str(&cmd) {
+                let value: Value = match serde_json::from_str(cmd) {
                     Ok(value) => value,
                     Err(_) => return,
                 };
@@ -622,10 +630,14 @@ async fn handle_connection(mut stream: UnixStream, token: [u8; 16]) {
                     return;
                 }
                 let reply = handle_command(value).await;
-                let mut line = serde_json::to_string(&reply)
+                let line = serde_json::to_string(&reply)
                     .unwrap_or_else(|_| r#"{"ok":false,"err":"internal error"}"#.to_string());
-                line.push('\n');
-                if conn.get_mut().write_all(line.as_bytes()).await.is_err() {
+                if conn
+                    .get_mut()
+                    .write_all(&framing::encode_frame(line.as_bytes()))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -978,13 +990,16 @@ async fn push_upd(upd: Value) -> Result<(), String> {
     let Some(mut stream) = audit::peer_writer(audit::PeerRole::HostFs) else {
         return Err("the FUSE server is not reachable".to_string());
     };
-    let mut frame =
+    let frame =
         serde_json::to_string(&upd).map_err(|e| format!("can't serialize the update: {e}"))?;
     if frame.len() > FRAME_CAP {
         return Err("update too large".to_string());
     }
-    frame.push('\n');
-    if stream.write_all(frame.as_bytes()).await.is_err() {
+    if stream
+        .write_all(&framing::encode_frame(frame.as_bytes()))
+        .await
+        .is_err()
+    {
         return Err("can't send the update to the sandbox child".to_string());
     }
     let mut rx = FS_REPLIES.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1257,7 +1272,7 @@ pub(crate) type SharedWrite = std::sync::Arc<tokio::sync::Mutex<UnixStream>>;
 /// mutex keeps it from splitting a concurrent audit batch.
 pub(crate) async fn write_reply(stream: &SharedWrite, reply: Result<(), String>) {
     let line = match reply {
-        Ok(()) => "{\"ack\":true}\n".to_string(),
+        Ok(()) => "{\"ack\":true}".to_string(),
         Err(e) => {
             // Keep the frame under the cap no matter what the message is.
             let mut err = e;
@@ -1269,13 +1284,15 @@ pub(crate) async fn write_reply(stream: &SharedWrite, reply: Result<(), String>)
                 err.truncate(cut);
             }
             format!(
-                "{{\"err\":{}}}\n",
+                "{{\"err\":{}}}",
                 serde_json::to_string(&err).unwrap_or_else(|_| "\"error\"".into())
             )
         }
     };
     let mut stream = stream.lock().await;
-    let _ = stream.write_all(line.as_bytes()).await;
+    let _ = stream
+        .write_all(&framing::encode_frame(line.as_bytes()))
+        .await;
 }
 
 /// Parse and apply one downstream frame on the FUSE server side: swap
@@ -1315,14 +1332,15 @@ pub(crate) async fn fs_child_loop(
     policy: crate::hostfs::SharedPatterns,
 ) {
     let mut malformed_reported = false;
-    let mut conn = FramedRead::new(
-        &mut stream,
-        LinesCodec::new_with_max_length(audit::FRAME_CAP),
-    );
+    let mut conn = FramedRead::new(&mut stream, framing::decoder(audit::FRAME_CAP));
     loop {
         match conn.next().await {
             Some(Ok(frame)) => {
-                let r = match serde_json::from_str::<UpdFrame>(&frame) {
+                let r = match std::str::from_utf8(&frame)
+                    .map_err(|e| e.to_string())
+                    .and_then(|frame| {
+                        serde_json::from_str::<UpdFrame>(frame).map_err(|e| e.to_string())
+                    }) {
                     Ok(parsed) => fs_apply(parsed.upd, &policy).await,
                     Err(e) => {
                         // A bug in a trusted child's counterpart, not an
@@ -1543,7 +1561,10 @@ mod tests {
                 match child.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        if child.write_all(b"{\"ack\":true}\n").await.is_err()
+                        if child
+                            .write_all(&frame_bytes("{\"ack\":true}"))
+                            .await
+                            .is_err()
                             || tx.send(audit::UpdReply::Ack).await.is_err()
                         {
                             break;
@@ -1821,8 +1842,6 @@ mod tests {
         assert!(testing::fs_apply(parsed.upd, &policy).await.is_err());
     }
 
-    use tokio::io::AsyncReadExt as _;
-
     /// The FS loop applies a pattern swap and answers an error for a
     /// mapping list the spec parser would reject — without swapping
     /// anything.
@@ -1849,9 +1868,9 @@ mod tests {
             (*policy).clone(),
         ));
         launcher
-            .write_all(
-                b"{\"upd\":{\"fs\":{\"mappings\":[{\"type\":\"rw\",\"glob\":\"/work\"}]}}}\n",
-            )
+            .write_all(&frame_bytes(
+                "{\"upd\":{\"fs\":{\"mappings\":[{\"type\":\"rw\",\"glob\":\"/work\"}]}}}",
+            ))
             .await
             .unwrap();
         read_ack(&mut launcher).await;
@@ -1865,40 +1884,38 @@ mod tests {
 
         // A bad glob is an `err` reply; the patterns are untouched.
         launcher
-            .write_all(
-                b"{\"upd\":{\"fs\":{\"mappings\":[{\"type\":\"rw\",\"glob\":\"/work/[\"}]}}}\n",
-            )
+            .write_all(&frame_bytes(
+                "{\"upd\":{\"fs\":{\"mappings\":[{\"type\":\"rw\",\"glob\":\"/work/[\"}]}}}",
+            ))
             .await
             .unwrap();
-        let mut reply = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            let n = launcher.read(&mut byte).await.unwrap();
-            assert!(n > 0, "no reply");
-            if byte[0] == b'\n' {
-                break;
-            }
-            reply.push(byte[0] as char);
-        }
+        let reply = read_frame(&mut launcher).await;
         assert!(reply.starts_with("{\"err\":"), "{reply}");
         assert_eq!(policy.generation(), gen0 + 1);
         let _ = launcher.shutdown().await;
         let _ = loop_task.await;
     }
 
-    /// Read one line and assert it is the ack frame.
-    async fn read_ack(stream: &mut tokio::net::UnixStream) {
+    /// One length-prefixed frame's wire bytes (what every IPC peer
+    /// writes; the shared [`crate::ipc::framing`] format).
+    fn frame_bytes(payload: &str) -> Vec<u8> {
+        crate::ipc::framing::encode_frame(payload.as_bytes())
+    }
+
+    /// Read one length-prefixed frame (async, the tests' peers).
+    async fn read_frame(stream: &mut tokio::net::UnixStream) -> String {
         use tokio::io::AsyncReadExt as _;
-        let mut reply = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            let n = stream.read(&mut byte).await.unwrap();
-            assert!(n > 0, "no reply");
-            if byte[0] == b'\n' {
-                break;
-            }
-            reply.push(byte[0] as char);
-        }
+        let mut header = [0u8; crate::ipc::framing::LENGTH_FIELD_LENGTH];
+        stream.read_exact(&mut header).await.unwrap();
+        let len = u32::from_be_bytes(header) as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await.unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Read one frame and assert it is the ack frame.
+    async fn read_ack(stream: &mut tokio::net::UnixStream) {
+        let reply = read_frame(stream).await;
         assert_eq!(reply, "{\"ack\":true}", "{reply}");
     }
 
@@ -1971,7 +1988,7 @@ mod tests {
 
             // Without the token: the connection is closed without a reply.
             let mut bad = connect();
-            bad.write_all(b"00000000000000000000000000000000\n")
+            bad.write_all(&frame_bytes("00000000000000000000000000000000"))
                 .unwrap();
             assert_eq!(bad.read(&mut [0u8; 1]).unwrap_or(0), 0, "no reply expected");
 
@@ -1981,8 +1998,9 @@ mod tests {
                 .trim()
                 .to_string();
             let mut conn = connect();
-            conn.write_all(format!("{token}\n").as_bytes()).unwrap();
-            conn.write_all(b"{\"cmd\":\"policy-get\"}\n").unwrap();
+            conn.write_all(&frame_bytes(&token)).unwrap();
+            conn.write_all(&frame_bytes("{\"cmd\":\"policy-get\"}"))
+                .unwrap();
             let reply: serde_json::Value = serde_json::from_str(&read_line(&mut conn)).unwrap();
             assert_eq!(reply["ok"], true);
             assert_eq!(reply["fs"]["mappings"][0]["type"], "ro");
@@ -1991,9 +2009,11 @@ mod tests {
             // net-set swaps the authoritative list (A-local: the connector
             // serves from this copy, and P holds no list of its own).
             let mut conn = connect();
-            conn.write_all(format!("{token}\n").as_bytes()).unwrap();
-            conn.write_all(b"{\"cmd\":\"net-set\",\"allow\":[\"api.example:443\"]}\n")
-                .unwrap();
+            conn.write_all(&frame_bytes(&token)).unwrap();
+            conn.write_all(&frame_bytes(
+                "{\"cmd\":\"net-set\",\"allow\":[\"api.example:443\"]}",
+            ))
+            .unwrap();
             let reply: serde_json::Value = serde_json::from_str(&read_line(&mut conn)).unwrap();
             assert_eq!(reply["ok"], true, "{reply}");
             assert_eq!(*shared.read().unwrap(), vec!["api.example:443".to_string()]);
@@ -2009,16 +2029,16 @@ mod tests {
 
             // An fs-set without a live FS peer fails cleanly (the push errors).
             let mut conn = connect();
-            conn.write_all(format!("{token}\n").as_bytes()).unwrap();
-            conn.write_all(b"{\"cmd\":\"fs-set\",\"mappings\":[]}\n")
+            conn.write_all(&frame_bytes(&token)).unwrap();
+            conn.write_all(&frame_bytes("{\"cmd\":\"fs-set\",\"mappings\":[]}"))
                 .unwrap();
             let reply: serde_json::Value = serde_json::from_str(&read_line(&mut conn)).unwrap();
             assert_eq!(reply["ok"], false);
 
-            // A malformed command line closes the connection.
+            // A malformed command frame closes the connection.
             let mut conn = connect();
-            conn.write_all(format!("{token}\n").as_bytes()).unwrap();
-            conn.write_all(b"not json\n").unwrap();
+            conn.write_all(&frame_bytes(&token)).unwrap();
+            conn.write_all(&frame_bytes("not json")).unwrap();
             assert_eq!(conn.read(&mut [0u8; 1]).unwrap_or(0), 0);
         })
         .await
@@ -2030,20 +2050,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Read one reply line (blocking, the client's own loop).
+    /// Read one reply frame (blocking, the client's own loop).
     fn read_line(stream: &mut std::os::unix::net::UnixStream) -> String {
-        use std::io::Read as _;
-        let mut reply = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            let n = stream.read(&mut byte).unwrap();
-            assert!(n > 0, "connection closed without a reply");
-            if byte[0] == b'\n' {
-                break;
-            }
-            reply.push(byte[0] as char);
-        }
-        reply
+        let frame =
+            crate::ipc::framing::read_blocking_frame(stream, crate::cli::control::FRAME_CAP)
+                .expect("connection closed without a reply");
+        String::from_utf8(frame).expect("reply is not UTF-8")
     }
 
     /// `spec-reload` end to end against the real statics: an unchanged

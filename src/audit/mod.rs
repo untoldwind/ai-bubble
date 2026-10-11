@@ -868,9 +868,12 @@ mod tests {
             result: None,
             detail: None,
         };
-        a.write_all(format!("{}\n", event.to_line()).as_bytes())
+        a.write_all(&crate::ipc::framing::encode_frame(
+            event.to_line().as_bytes(),
+        ))
+        .unwrap();
+        a.write_all(&crate::ipc::framing::encode_frame(b"this is not json"))
             .unwrap();
-        a.write_all(b"this is not json\n").unwrap();
         a.flush().unwrap();
 
         // The valid event is forwarded; then the reader ends.
@@ -923,8 +926,10 @@ mod tests {
             result: None,
             detail: None,
         };
-        a.write_all(format!("{}\n", event.to_line()).as_bytes())
-            .unwrap();
+        a.write_all(&crate::ipc::framing::encode_frame(
+            event.to_line().as_bytes(),
+        ))
+        .unwrap();
         a.flush().unwrap();
         let forwarded = file_rx.recv().await.unwrap();
         assert_eq!(forwarded.source, "hostfs");
@@ -934,8 +939,10 @@ mod tests {
         let mut event = event;
         event.source = "hostfs".into();
         event.ts = 9;
-        a.write_all(format!("{}\n", event.to_line()).as_bytes())
-            .unwrap();
+        a.write_all(&crate::ipc::framing::encode_frame(
+            event.to_line().as_bytes(),
+        ))
+        .unwrap();
         a.flush().unwrap();
         let forwarded = file_rx.recv().await.unwrap();
         assert_eq!(forwarded.source, "hostfs");
@@ -967,7 +974,8 @@ mod tests {
             reply_tx,
         ));
         // A real reply still demultiplexes cleanly.
-        a.write_all(b"{\"ack\":true}\n").unwrap();
+        a.write_all(&crate::ipc::framing::encode_frame(b"{\"ack\":true}"))
+            .unwrap();
         a.flush().unwrap();
         assert_eq!(reply_rx.recv().await, Some(ipc::UpdReply::Ack));
         // The attack frame: event fields + a reply key.
@@ -982,8 +990,10 @@ mod tests {
         };
         let mut line = event.to_line();
         line.truncate(line.len() - 1); // drop the closing brace
-        a.write_all(format!("{line}, \"ack\": true}}\n").as_bytes())
-            .unwrap();
+        a.write_all(&crate::ipc::framing::encode_frame(
+            format!("{line}, \"ack\": true}}").as_bytes(),
+        ))
+        .unwrap();
         a.flush().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), reader)
             .await
