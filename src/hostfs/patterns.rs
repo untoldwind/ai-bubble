@@ -492,6 +492,62 @@ impl Patterns {
         mirrored.to_path_buf()
     }
 
+    /// The **mirrored path** that shows the given **real host path** — the
+    /// inverse of [`Patterns::redirect`], used to translate a host
+    /// symlink's target string into the sandbox.
+    ///
+    /// The mirror reproduces full host paths, so a host path that is
+    /// mirrored as itself maps to itself (identity). A host path below a
+    /// redirect's `source` maps back onto the redirect's `destination`
+    /// plus the remaining components. Every candidate is verified by
+    /// round-tripping it through [`Patterns::redirect`] (the candidate must
+    /// resolve back to exactly `host`), and a candidate that additionally
+    /// [`exists`](Patterns::exists) in the mirror is preferred; the most
+    /// specific (longest) matching source wins. When nothing matches, the
+    /// host path is returned unchanged: the symlink stays visible but does
+    /// not resolve (a broken link) — exactly the desired behavior for a
+    /// target that is not mounted into the sandbox.
+    pub fn host_to_mirror(&self, host: &Path) -> PathBuf {
+        let mut best: Option<(usize, bool, PathBuf)> = None;
+        for (pattern, permission) in &self.patterns {
+            let Permission::Redirect { source, .. } = permission else {
+                continue;
+            };
+            // The source must be an ancestor of (or equal to) the host
+            // path. Relative sources never match absolute host paths.
+            let Ok(rest) = host.strip_prefix(source) else {
+                continue;
+            };
+            let Some(dest) = pattern.literal_path() else {
+                continue;
+            };
+            let candidate = dest.join(rest);
+            // Accept a candidate only when it really resolves back to the
+            // host path — a redirect that is overridden by a later mapping
+            // (or shadowed) must not be used.
+            if self.redirect(&candidate) != host {
+                continue;
+            }
+            let exists = self.exists(&candidate);
+            let score = source.as_os_str().len();
+            let better = match &best {
+                None => true,
+                Some((best_score, best_exists, _)) => {
+                    (exists && !*best_exists) || (exists == *best_exists && score > *best_score)
+                }
+            };
+            if better {
+                best = Some((score, exists, candidate));
+            }
+        }
+        match best {
+            Some((_, _, candidate)) => candidate,
+            // Identity (or an unmapped host path — the caller decides how a
+            // non-resolving target is shown).
+            None => host.to_path_buf(),
+        }
+    }
+
     /// Whether some `hide`, `ro`, `empty` or `inject` pattern might apply
     /// to a path strictly below the given directory — without being
     /// uniformly shadowed there by a writable pattern that covers the
@@ -862,6 +918,65 @@ mod tests {
         assert_eq!(
             patterns.redirect(Path::new("/bla/other/x")),
             PathBuf::from("/otherdir/other/x")
+        );
+    }
+
+    #[test]
+    fn host_to_mirror_inverts_redirects_and_identity() {
+        let patterns = ps(&[
+            (
+                "/work",
+                Permission::Redirect {
+                    source: PathBuf::from("/home/u/work"),
+                    writable: true,
+                },
+            ),
+            ("/etc/passwd", Permission::Ro),
+        ]);
+        // Identity: a mirrored host path maps to itself.
+        assert_eq!(
+            patterns.host_to_mirror(Path::new("/etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        // A host path below a redirect source maps onto its destination...
+        assert_eq!(
+            patterns.host_to_mirror(Path::new("/home/u/work")),
+            PathBuf::from("/work")
+        );
+        assert_eq!(
+            patterns.host_to_mirror(Path::new("/home/u/work/sub")),
+            PathBuf::from("/work/sub")
+        );
+        // ...and anything unmapped stays itself (a broken target later).
+        assert_eq!(
+            patterns.host_to_mirror(Path::new("/elsewhere/x")),
+            PathBuf::from("/elsewhere/x")
+        );
+    }
+
+    #[test]
+    fn host_to_mirror_rejects_a_redirect_overridden_by_a_later_mapping() {
+        // `/bla/plain` is mirrored plainly by the later mapping, so the
+        // redirect no longer governs it: the host source below it must not
+        // map back onto `/bla/plain`.
+        let patterns = ps(&[
+            (
+                "/bla",
+                Permission::Redirect {
+                    source: PathBuf::from("/otherdir"),
+                    writable: false,
+                },
+            ),
+            ("/bla/plain", Permission::Ro),
+        ]);
+        assert_eq!(
+            patterns.host_to_mirror(Path::new("/otherdir/plain")),
+            PathBuf::from("/otherdir/plain")
+        );
+        // Everything else below the redirect still round-trips.
+        assert_eq!(
+            patterns.host_to_mirror(Path::new("/otherdir/other/x")),
+            PathBuf::from("/bla/other/x")
         );
     }
 

@@ -279,6 +279,31 @@ impl Pattern {
         }
     }
 
+    /// The pattern as a concrete path when every component is purely
+    /// literal (no `*`, `?`, `[...]` and no `**`), else `None`. Used to
+    /// recover a redirect mapping's destination path — redirects are
+    /// validated to be wildcard-free (see `spec::hostfs`), so their
+    /// patterns always yield a path here.
+    pub fn literal_path(&self) -> Option<std::path::PathBuf> {
+        let mut out = std::path::PathBuf::from("/");
+        for comp in &self.comps {
+            match comp {
+                Comp::Chars(tokens) => {
+                    let mut part = String::new();
+                    for token in tokens {
+                        match token {
+                            Token::Literal(c) => part.push(*c),
+                            _ => return None,
+                        }
+                    }
+                    out.push(part);
+                }
+                Comp::DoubleStar => return None,
+            }
+        }
+        Some(out)
+    }
+
     /// If walking `path` leaves the pattern with a next component that is
     /// purely literal (no wildcards), return that component. Used to
     /// enumerate the virtual directory entries of `empty` paths below a
@@ -560,6 +585,21 @@ mod tests {
         assert_eq!(p.walk(Path::new("/etc/passwd/x")), Walk::Ancestor);
         assert_eq!(p.walk(Path::new("/etc/passwd")), Walk::Exact);
         assert_eq!(p.walk(Path::new("/etc")), Walk::CouldReach);
+    }
+
+    #[test]
+    fn literal_path_recovers_wildcard_free_patterns() {
+        assert_eq!(
+            Pattern::new("/a/b").unwrap().literal_path(),
+            Some(std::path::PathBuf::from("/a/b"))
+        );
+        assert_eq!(
+            Pattern::new("/").unwrap().literal_path(),
+            Some(std::path::PathBuf::from("/"))
+        );
+        assert_eq!(Pattern::new("/a/*").unwrap().literal_path(), None);
+        assert_eq!(Pattern::new("/a/**").unwrap().literal_path(), None);
+        assert_eq!(Pattern::new("/a/b?").unwrap().literal_path(), None);
     }
 
     #[test]

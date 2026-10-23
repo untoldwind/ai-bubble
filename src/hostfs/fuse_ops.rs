@@ -281,20 +281,32 @@ impl Filesystem for HostFs {
 
     async fn readlink(&self, _req: Request, inode: Inode) -> Result<ReplyData> {
         let mirrored = self.resolve(inode)?;
-        if !self.patterns.load().exists(&mirrored) {
+        let patterns = self.patterns.load();
+        if !patterns.exists(&mirrored) {
             return Err(libc::ENOENT.into());
         }
         // HF-7: an `empty`-mapped path is purely synthetic — the host file
         // behind it is never read, and that includes the *target string*
         // of a symlink standing at the real host path. Reveal nothing.
-        if self.patterns.load().is_empty(&mirrored) {
+        if patterns.is_empty(&mirrored) {
             return Err(libc::ENOENT.into());
         }
-        let target = self
-            .root
-            .read_link(&self.patterns.load().redirect(&mirrored))?;
+        let real = patterns.redirect(&mirrored);
+        let target = self.root.read_link(&real)?;
+        // Translate the host target into the sandbox's path space: the
+        // kernel resolves the string we return *inside the sandbox*, so a
+        // raw host path would point at the wrong file (or nothing). A
+        // target that is not mounted anywhere stays visible but resolves
+        // to nothing — a broken link (see `symlink`).
+        let translated = symlink::host_to_sandbox_target(
+            &patterns,
+            &mirrored,
+            &real,
+            &target,
+            crate::hostfs::root_mode(),
+        );
         Ok(ReplyData::from(Bytes::copy_from_slice(
-            target.as_os_str().as_encoded_bytes(),
+            translated.as_os_str().as_encoded_bytes(),
         )))
     }
 
@@ -1628,29 +1640,73 @@ impl Filesystem for HostFs {
         Ok(())
     }
 
-    /// Create a symlink: always denied. A host symlink visible through the
-    /// mirror is only ever shown *as a symlink* (never followed), and
-    /// creating one in the sandbox could link outside the mirrored paths —
-    /// so the operation is refused outright. `EACCES` ("Permission denied")
-    /// reports this as the policy decision it is; the implicit `ENOSYS`
-    /// default would instead pretend the feature is missing.
+    /// Create a symlink in the mirror. The target the sandbox passes is
+    /// translated into the host path space and stored on the host (see
+    /// [`symlink`]): the link at the mirrored path points, *on the host*, at
+    /// the host path corresponding to the sandbox target — so a link that
+    /// works inside the sandbox works on the host too. Only `rw` paths may
+    /// create links (the real host permissions still apply), and the parent
+    /// is pinned no-follow, so the creation itself cannot be redirected
+    /// through a host symlink.
     async fn symlink(
         &self,
         _req: Request,
         parent: Inode,
         name: &OsStr,
-        _link: &std::ffi::OsStr,
+        link: &std::ffi::OsStr,
     ) -> Result<ReplyEntry> {
         let parent_path = self.resolve(parent)?;
         let mirrored = parent_path.join(name);
-        log_op_err(
-            FsOp::Symlink,
+        let patterns = self.patterns.load();
+        if patterns.is_empty(&mirrored) || !patterns.writable(&mirrored) {
+            log_op_err(
+                FsOp::Symlink,
+                &mirrored,
+                Some(&patterns.redirect(&mirrored)),
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+            )
+            .await;
+            return Err(libc::EACCES.into());
+        }
+        let real = patterns.redirect(&mirrored);
+        let anchored = self.root.anchor_parent(&real).map_err(|e| {
+            if e.raw_os_error() == Some(libc::EINVAL) {
+                return std::io::Error::from_raw_os_error(libc::ENOENT);
+            }
+            e
+        })?;
+        // Translate the sandbox target to the host target *before* creating
+        // anything: a target that cannot be translated is stored verbatim
+        // (best effort) rather than silently dropped.
+        let host_target = symlink::sandbox_to_host_target(
+            &patterns,
             &mirrored,
-            Some(&self.patterns.load().redirect(&mirrored)),
-            &std::io::Error::from_raw_os_error(libc::EACCES),
-        )
-        .await;
-        Err(libc::EACCES.into())
+            &real,
+            link,
+            crate::hostfs::root_mode(),
+        );
+        // `symlinkat` never resolves the target, and the parent is pinned
+        // no-follow: the link is created exactly at the mirrored location.
+        if let Err(err) =
+            rustix::fs::symlinkat(Path::new(&host_target), anchored.dir(), anchored.name())
+        {
+            let e = std::io::Error::from(err);
+            log_op_err(FsOp::Symlink, &mirrored, Some(&real), &e).await;
+            return Err(e.into());
+        }
+        log_op_ok(FsOp::Symlink, &mirrored, &real).await;
+        let inode = self
+            .inodes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(&mirrored, parent);
+        let mut attr = self.attr(&mirrored)?;
+        attr.ino = inode;
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr,
+            generation: 0,
+        })
     }
 
     /// Create a hard link: the new name points at the *same real host file*
@@ -1663,13 +1719,13 @@ impl Filesystem for HostFs {
     ///
     /// The source is **never followed**, and a host symlink at the source
     /// name is not linked at all: `linkat` without `AT_SYMLINK_FOLLOW`
-    /// would link the symlink inode itself — a name aliasing a symlink
-    /// through the mirror, whose target may not be mirrored at all;
-    /// following it would be a variant of the C1 escape the anchored
-    /// resolution closes (AUDIT.md M5; and re-creating the symlink — as
-    /// this used to do — would be a real symlink creation on the host,
-    /// which the unconditionally-denied `symlink` op forbids). A
-    /// symlink's target may also live outside every mapping.
+    /// would link the symlink inode itself — a second name aliasing a
+    /// symlink whose target may live outside every mapping, and whose
+    /// `readlink` translation the mirror would then have to keep consistent
+    /// across both names (AUDIT.md M5). Following the link instead would be
+    /// a variant of the C1 escape the anchored resolution closes. Symlinks
+    /// are created through the dedicated [`Filesystem::symlink`] op, not by
+    /// hard-linking; hard links remain the regular-file case.
     ///
     /// **Both** names must be writable. Checking only the new name would
     /// let the sandbox link a *read-only* mapped file (say, from
@@ -1744,15 +1800,13 @@ impl Filesystem for HostFs {
             .anchor_parent(&self.patterns.load().redirect(&new))?;
         let source_stat = old_anchored.stat_entry()?;
         if Self::stat_is_symlink(&source_stat) {
-            // AUDIT.md M5: linking a host symlink used to re-create it on
-            // the host (`symlinkat` with the server's credentials) — a
-            // real symlink creation at an arbitrary writable mapped
-            // location, defeating the absolute "the sandbox can never
-            // create symlinks" invariant (the `symlink` op is
-            // unconditionally EACCES). The target string is copied
-            // verbatim and symlinks are inert inside the mirror, so this
-            // was low-impact — but the invariant is worth more than the
-            // compatibility. Hard links to regular files are unaffected.
+            // AUDIT.md M5: a hard link to a host symlink would alias the
+            // symlink inode under a second name whose `readlink`
+            // translation (based on each name's own directory) must stay
+            // consistent — and `linkat` without `AT_SYMLINK_FOLLOW` links
+            // the symlink itself, while following it would be a C1-style
+            // escape. Symlinks are created through the dedicated `symlink`
+            // op; hard links stay the regular-file case.
             log_op_err(
                 FsOp::Link,
                 &old,

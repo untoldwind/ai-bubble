@@ -78,13 +78,24 @@
 //! operation runs `*at()`-relative to the pinned parent with
 //! `AT_SYMLINK_NOFOLLOW` / `O_NOFOLLOW`. Host paths are never resolved as
 //! strings through the kernel's path walking, so a host symlink is never
-//! followed — neither a *final* component (a mirrored symlink is visible
-//! only *as a symlink*: its target can be read with `readlink`, opening one
-//! for reading or writing fails with `ELOOP`) nor an *intermediate* one,
-//! which could otherwise re-point a mirrored path at content outside every
-//! mapping — deterministically, by swapping a symlink into place between
-//! two FUSE requests (audit finding C1). A link's target's content is not
-//! exposed unless the target itself matches a pattern.
+//! followed *on the host side*: a mirrored symlink is visible only *as a
+//! symlink* (its target can be read with `readlink`, opening one for reading
+//! or writing fails with `ELOOP`), and an *intermediate* host symlink could
+//! otherwise re-point a mirrored path at content outside every mapping —
+//! deterministically, by swapping a symlink into place between two FUSE
+//! requests (audit finding C1).
+//!
+//! Symlinks are, however, **translated at the mirror boundary** (see
+//! [`symlink`]): the kernel resolves symlinks *inside the sandbox*, so the
+//! target returned by `readlink` is rewritten from the host path space into
+//! the mirror's (inverse `redirect` plus identity) and, symmetrically, a
+//! target passed to `symlink` is rewritten into the host path space before
+//! the link is created on the host. A symlink that works in the sandbox thus
+//! works on the host and vice versa. A host target that is **not** mounted
+//! anywhere has no mirror path: the link stays visible but resolves to a
+//! path that does not exist — a *broken* link, which build tools tolerate far
+//! better than a vanishing entry. Symlink creation requires a `rw` path; the
+//! target's own content is never exposed unless it, too, matches a pattern.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, OsString};
@@ -113,6 +124,7 @@ pub(crate) mod pattern;
 pub(crate) mod patterns;
 mod server;
 mod session;
+mod symlink;
 
 pub use server::start_host_fs;
 

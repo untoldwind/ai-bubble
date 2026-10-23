@@ -622,11 +622,11 @@ fn intermediate_symlinks_are_never_followed_by_host_access() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
-/// Linking a host symlink is denied outright (AUDIT.md M5): the `symlink`
-/// op is unconditionally EACCES, and `link` used to re-create the symlink
-/// on the host with the server's credentials (`symlinkat`) — a real
-/// symlink creation at an arbitrary writable mapped location, defeating
-/// the "the sandbox can never create symlinks" invariant. Hard links to
+/// Linking a host symlink is denied outright (AUDIT.md M5): `link` used to
+/// re-create the symlink on the host with the server's credentials
+/// (`symlinkat`) — a second name aliasing a symlink whose target may live
+/// outside every mapping. Symlinks are created through the dedicated
+/// `symlink` op instead (which requires an `rw` path); hard links to
 /// regular files are unaffected (covered by the other link tests).
 #[test]
 fn link_of_a_symlink_is_denied() {
@@ -663,6 +663,219 @@ fn link_of_a_symlink_is_denied() {
         "no `copy` entry may be created"
     );
     assert_eq!(std::fs::read(&outside_file).unwrap(), b"HOST-SECRET");
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A host symlink visible through the mirror must surface its target in the
+/// **sandbox's** path space: the kernel resolves the target returned by
+/// `readlink` inside the mount, so a raw host path would land on the wrong
+/// file (or nothing). A target that is not mounted stays visible but points
+/// outside the mirror — a broken link, not a hidden entry.
+#[test]
+fn readlink_translates_the_host_target_into_the_mirror() {
+    let base =
+        std::env::temp_dir().join(format!("ai-bubble-hostfs-readlink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("target"), b"data").unwrap();
+    std::os::unix::fs::symlink("target", base.join("rel")).unwrap();
+    std::os::unix::fs::symlink(base.join("target"), base.join("abs")).unwrap();
+    std::os::unix::fs::symlink("/outside/secret", base.join("out")).unwrap();
+    let f = fs(&[(base.to_str().unwrap(), Permission::Ro)]);
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+
+    let read = |name: &str| -> Vec<u8> {
+        let ino = block(async {
+            f.lookup(Request::default(), base_ino, OsStr::new(name))
+                .await
+                .expect("lookup")
+                .attr
+                .ino
+        });
+        block(async {
+            f.readlink(Request::default(), ino)
+                .await
+                .expect("readlink")
+                .data
+        })
+        .to_vec()
+    };
+    // A relative host target stays relative — the sandbox resolves it
+    // against the link's directory, landing on the mirrored `target`.
+    assert_eq!(read("rel"), b"target");
+    // An absolute host target *within* the mirror is made relative, too.
+    assert_eq!(read("abs"), b"target");
+    // A target that is not mounted anywhere stays visible but points at the
+    // (non-root) mount-prefixed path, which resolves to nothing.
+    assert_eq!(read("out"), b"/mirrored/outside/secret");
+
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A host symlink inside a **redirected** tree translates through the
+/// redirect: the target is expressed at the redirect destination, not at the
+/// host source path.
+#[test]
+fn readlink_maps_a_redirected_source_target_onto_the_destination() {
+    let src = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-readlink-redir-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&src);
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("target"), b"data").unwrap();
+    std::os::unix::fs::symlink("target", src.join("link")).unwrap();
+    std::os::unix::fs::symlink(src.join("target"), src.join("abslink")).unwrap();
+
+    let f = fs(&[(
+        "/virtual",
+        Permission::Redirect {
+            source: src.clone(),
+            writable: false,
+        },
+    )]);
+    let root_ino = inodes::ROOT_INODE;
+    let virtual_ino = block(async {
+        f.lookup(Request::default(), root_ino, OsStr::new("virtual"))
+            .await
+            .expect("lookup virtual")
+            .attr
+            .ino
+    });
+    let read = |name: &str| -> Vec<u8> {
+        let ino = block(async {
+            f.lookup(Request::default(), virtual_ino, OsStr::new(name))
+                .await
+                .expect("lookup")
+                .attr
+                .ino
+        });
+        block(async {
+            f.readlink(Request::default(), ino)
+                .await
+                .expect("readlink")
+                .data
+        })
+        .to_vec()
+    };
+    // Both target forms map back to the link's directory, `target`.
+    assert_eq!(read("link"), b"target");
+    assert_eq!(read("abslink"), b"target");
+
+    std::fs::remove_dir_all(&src).unwrap();
+}
+
+/// Creating a symlink in the sandbox stores a **host** target: the sandbox
+/// target is translated into the host path space (through redirects and the
+/// mount prefix), so the link works on the host exactly as it does in the
+/// sandbox. Only `rw` paths may create links.
+#[test]
+fn symlink_creation_stores_a_translated_host_target() {
+    let base = std::env::temp_dir().join(format!(
+        "ai-bubble-hostfs-symlink-create-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let f = fs(&[(base.to_str().unwrap(), Permission::Rw)]);
+    let base_ino = f
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+
+    // A relative sandbox target is stored relative on the host.
+    block(async {
+        f.symlink(
+            Request::default(),
+            base_ino,
+            OsStr::new("rel"),
+            OsStr::new("target"),
+        )
+        .await
+        .expect("create relative symlink");
+    });
+    assert_eq!(
+        std::fs::read_link(base.join("rel")).unwrap(),
+        std::path::Path::new("target")
+    );
+
+    // An absolute sandbox path outside the mirror is stored verbatim.
+    block(async {
+        f.symlink(
+            Request::default(),
+            base_ino,
+            OsStr::new("abs"),
+            OsStr::new("/etc/hosts"),
+        )
+        .await
+        .expect("create absolute symlink");
+    });
+    assert_eq!(
+        std::fs::read_link(base.join("abs")).unwrap(),
+        std::path::Path::new("/etc/hosts")
+    );
+
+    // A sandbox path under the mount prefix loses it (the mirror is not the
+    // root in this build): the stored host target names the mirrored path.
+    block(async {
+        f.symlink(
+            Request::default(),
+            base_ino,
+            OsStr::new("mounted"),
+            OsStr::new("/mirrored/work/x"),
+        )
+        .await
+        .expect("create prefixed symlink");
+    });
+    assert_eq!(
+        std::fs::read_link(base.join("mounted")).unwrap(),
+        std::path::Path::new("/work/x")
+    );
+
+    // The created link reads back as its sandbox target: the mirror
+    // round-trips (create → readlink).
+    let rel_ino = block(async {
+        f.lookup(Request::default(), base_ino, OsStr::new("rel"))
+            .await
+            .expect("lookup rel")
+            .attr
+            .ino
+    });
+    let target = block(async {
+        f.readlink(Request::default(), rel_ino)
+            .await
+            .expect("readlink rel")
+            .data
+    });
+    assert_eq!(target.as_ref(), b"target");
+
+    // A read-only mapping cannot create links.
+    let ro = fs(&[(base.to_str().unwrap(), Permission::Ro)]);
+    let ro_ino = ro
+        .inodes
+        .write()
+        .expect("inode map poisoned")
+        .get_or_insert(&base, inodes::ROOT_INODE);
+    let res = block(async {
+        ro.symlink(
+            Request::default(),
+            ro_ino,
+            OsStr::new("nope"),
+            OsStr::new("target"),
+        )
+        .await
+    });
+    assert_eq!(
+        res.expect_err("symlink on a ro path must be denied"),
+        <fuse3::Errno>::from(libc::EACCES)
+    );
+    assert!(std::fs::symlink_metadata(base.join("nope")).is_err());
 
     std::fs::remove_dir_all(&base).unwrap();
 }

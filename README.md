@@ -416,11 +416,16 @@ command line.
 - The host tree is **not** crawled at startup: every FUSE operation
   matches the requested path against the patterns on the fly, so a large
   host tree costs nothing and only the accessed paths are touched.
-- Host **symlinks are never followed**: a mirrored symlink is visible only
-  as a symlink (`readlink` shows its target); opening it for reading or
-  writing fails with `ELOOP`, so a mirrored symlink can never expose the
-  content of a path the mappings do not select. The same holds for
-  directory listings, `statfs` and access checks.
+- Host **symlinks are never followed on the host side**: every host access
+  is dirfd-anchored and no-follow, so a mirrored symlink can never expose
+  the content of a path the mappings do not select. A mirrored symlink is
+  visible *as* a symlink, and its target is **translated** so the kernel
+  resolves it inside the sandbox: a target that is mounted appears at the
+  corresponding sandbox path, and a target that is **not** mounted stays
+  visible but resolves to nothing — a broken link (build tools tolerate
+  that far better than a vanishing entry). Creating a symlink (`symlink`,
+  requires an `rw` path) translates the target the other way, so a link
+  that works inside the sandbox works on the host too.
 - Writes only go through where a mapping says `rw` (or a redirect says
   `redirect-rw`): the last mapping naming the path (or its nearest
   mirrored ancestor — an exactly-named or `**`-covered directory is a
