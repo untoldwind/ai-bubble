@@ -122,9 +122,12 @@ impl RootDir {
     }
 
     /// Open `path` itself — every component walked no-follow, the final one
-    /// opened with the caller's `flags` (include `O_NOFOLLOW` where the caller
-    /// wants final-component no-follow semantics). Used for whole-path opens
-    /// (`O_PATH` for `statfs`, `O_RDONLY|O_DIRECTORY` for directory listings).
+    /// opened with the caller's `flags` **plus `O_NOFOLLOW`/`O_CLOEXEC`**: the
+    /// final component is *always* no-follow, exactly like [`RootDir::open_at`]
+    /// — a caller cannot opt out, so a symlink at the last component fails with
+    /// `ELOOP` instead of re-pointing the open at unmirrored content (C1).
+    /// Used for whole-path opens (`O_PATH` for `statfs`,
+    /// `O_RDONLY|O_DIRECTORY` for directory listings).
     pub(crate) fn open_full(&self, path: &Path, flags: libc::c_int) -> io::Result<OwnedFd> {
         let mut comps = components_of(path)?;
         let Some(name) = comps.pop() else {
@@ -136,7 +139,7 @@ impl RootDir {
             return rustix::fs::openat(
                 rustix::fs::CWD,
                 c"/",
-                OFlags::from_bits_retain((flags | libc::O_CLOEXEC) as u32),
+                OFlags::from_bits_retain((flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u32),
                 Mode::empty(),
             )
             .map_err(io::Error::from);
@@ -145,7 +148,7 @@ impl RootDir {
         rustix::fs::openat(
             dir,
             name,
-            OFlags::from_bits_retain((flags | libc::O_CLOEXEC) as u32),
+            OFlags::from_bits_retain((flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u32),
             Mode::empty(),
         )
         .map_err(io::Error::from)
@@ -350,6 +353,35 @@ mod tests {
         // blocking semantics.
         let fl = rustix::fs::fcntl_getfl(&f).unwrap();
         assert!(!fl.contains(rustix::fs::OFlags::NONBLOCK));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `open_full` must never follow a symlink at the final component, even
+    /// when the caller passes flags *without* `O_NOFOLLOW`: the no-follow
+    /// property is enforced by the helper, not by its call sites (C1).
+    /// Without the fix the open would follow `link` and hand out the target.
+    #[test]
+    fn open_full_never_follows_a_final_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-bubble-open-full-nofollow-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("target"), b"HOST-SECRET").unwrap();
+        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
+
+        let root = RootDir::open().unwrap();
+        // No `O_NOFOLLOW` from the caller: the helper must add it itself.
+        let err = root
+            .open_full(&dir.join("link"), libc::O_RDONLY)
+            .expect_err("open_full must not follow a final symlink");
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+
+        // A real file still opens normally.
+        root.open_full(&dir.join("target"), libc::O_RDONLY)
+            .expect("open_full of a regular file succeeds");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
